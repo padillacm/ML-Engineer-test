@@ -202,6 +202,41 @@ bash run_all.sh                                   # whole OCR benchmark (builds 
 bash scripts/timing.sh && ./dk.sh python -I scripts/timing_summary.py
 ```
 
+### 2.8 Adapter re-measurement (final adapter: pypdfium2 rendering + exact OpenCV-equivalent flattening)
+
+**Sample and method** (task 7.2 of `add-ocr-engine`). `TesseractOcrEngine` with the default `TesseractOcrConfig` (`workers=4`, `detect_max_pages=3`) run inside the `docintel-test` image (Tesseract 5.5.0, pypdfium2 5.14.0 / PDFium 156.0.8076.0, numpy flattening). Two sets: (a) the seed-0 stratified sample of 60 documents, 12 per language (5 clean / 4 medium / 3 hard), 102 pages, 844 mentions, run with the true language as hint and without hint; (b) 50 hard documents, 89 pages, 544 mentions (the 15 hard documents of the sample plus stage A3's 40), with hint. Words were scored with the benchmark's own `evaluate.py` (lines = Tesseract block/par/line keys of the kept words, as in the benchmark) and compared, **paired by document**, with the stage B default rows (200 / flat / 3 / single) for the same documents; 95 % bootstrap CIs over documents (1,000 reps, seed 0), as in `report.py`.
+
+| set | metric | benchmark, 600 docs | benchmark, same docs | adapter (hint) | paired diff, adapter - benchmark |
+|---|---|---|---|---|---|
+| 60 docs, all | NameExact | 90.5 [89.4-91.7] | 92.3 [89.4-94.9] | 91.8 [88.5-94.5] | -0.5 [-1.6, +0.2] |
+| 60 docs, all | NameNorm | 95.7 [94.7-96.5] | 97.3 [95.2-99.0] | 96.7 [94.1-98.6] | -0.6 [-1.8, +0.1] |
+| 60 docs, all | NameFuzzy | 97.6 [96.9-98.4] | 98.2 [96.4-99.6] | 98.1 [96.3-99.6] | -0.1 [-1.1, +0.7] |
+| 60 docs, all | IoU>=.5 | 96.2 [95.2-97.1] | 97.2 [94.8-98.8] | 96.8 [94.4-98.6] | -0.4 [-1.4, +0.5] |
+| 60 docs, all | CER | 5.4 [4.7-5.9] | 5.6 [3.9-7.7] | 5.5 [3.9-7.3] | -0.2 [-0.8, +0.5] |
+| clean (25 docs) | all name metrics / IoU>=.5 | 93.3-99.4 | 93.9-100.0 | identical | 0.0 [0.0, 0.0] |
+| medium (20 docs) | NameExact / NameFuzzy / IoU>=.5 | 93.0 / 99.0 / 98.4 | 95.3 / 99.7 / 99.7 | 95.3 / 99.7 / 99.1 | 0.0 / 0.0 / -0.6 [-1.7, 0.0] |
+| hard (15 docs) | NameExact | 78.5 [74.0-82.7] | 82.6 [73.9-90.9] | 80.1 [71.7-88.4] | -2.5 [-8.2, +1.5] |
+| hard (15 docs) | NameFuzzy | 90.3 [86.4-93.7] | 91.3 [85.1-97.4] | 90.7 [85.6-97.0] | -0.6 [-5.7, +4.0] |
+| hard (15 docs) | IoU>=.5 | 84.1 [79.9-87.9] | 86.3 [80.7-92.6] | 85.7 [82.1-90.8] | -0.6 [-6.2, +4.0] |
+| hard (15 docs) | CER | 14.9 [12.5-17.2] | 15.0 [9.8-19.6] | 13.5 [9.0-17.5] | -1.4 [-3.7, +0.1] |
+| **50 hard docs** | NameExact | 78.5 [74.0-82.7] | 75.0 [67.8-81.3] | 73.9 [66.5-80.8] | -1.1 [-2.9, +0.4] |
+| **50 hard docs** | NameNorm | 84.3 [80.1-88.2] | 82.5 [75.5-88.4] | 81.1 [73.8-87.1] | -1.5 [-3.3, 0.0] |
+| **50 hard docs** | NameFuzzy | 90.3 [86.4-93.7] | 88.6 [81.5-94.0] | 87.7 [80.8-93.3] | -0.9 [-2.7, +0.6] |
+| **50 hard docs** | IoU>=.5 | 84.1 [79.9-87.9] | 81.6 [74.6-87.8] | 80.9 [74.2-86.9] | -0.7 [-2.8, +1.1] |
+| **50 hard docs** | CER | 14.9 [12.5-17.2] | 16.3 [13.0-20.1] | 15.9 [13.0-19.5] | -0.4 [-1.6, +0.7] |
+
+(For the 50 hard documents the "600 docs" column is the benchmark's hard stratum.) Per language on the 60-document sample every paired NameFuzzy / IoU>=.5 CI includes 0 (en -0.6 / 0.0, es 0.0 / 0.0, pt -1.8 [-6.2, 0.0] / -2.4 [-7.2, 0.0], fr +1.3 / +1.3, de +0.7 / -0.7); on the 50 hard documents likewise (largest: pt NameFuzzy -3.7 [-11.7, 0.0], IoU>=.5 -4.9 [-12.7, +2.4]; fr +2.5 / +3.7).
+
+**Without a hint**, detection chose the true language for 60/60 documents (no fallback to the combined model) and the output equalled the hinted run word for word on 102/102 pages, so the no-hint table is identical to the one above.
+
+**Timing** (same container, 16-thread host, sequential documents, `workers=4`; render + flatten + OCR): with a hint 0.71 s/page (102 pages in 72.7 s; median one-page document 1.01 s; per-document s/page p95 1.24), 0.78 s/page on the 89 hard pages; without a hint 1.64 s/page (median one-page document 2.40 s), because of the extra combined-model pass.
+
+**Renderer differences** (89 hard pages; `render_cmp.py`). Every corpus page is one 150-DPI RGB (ICCBased) image upscaled to 200 DPI, with no text or annotations. PDFium and PyMuPDF produce the same raster size on 89/89 pages; 27.6 % of pixels differ, mean |diff| 0.34 grey levels, 0.42 % by more than 2 and none by more than 16, PDFium slightly darker (mean -0.18): image interpolation and RGB-to-grey conversion, not geometry. Rendering in RGB and converting with Rec.601 weights narrows it a little (23.9 %, mean |diff| 0.29). `no_smoothtext`, `draw_annots=False` and `optimize_mode="print"` change nothing (no text or annotations on these pages); `no_smoothimage` (nearest-neighbour upscaling) is much further away (87.8 % differ, 6 % by more than 16) and was not pursued. The residual paired differences above (point estimates -0.1 to -1.5 points, all CIs covering 0) are what this sub-grey-level interpolation difference leaves; closing it entirely would need MuPDF's image resampler, i.e. PyMuPDF, which the licence rules out.
+
+**Verdict.** Accepted. The final adapter matches the benchmark's default configuration: every paired NameFuzzy and IoU>=.5 CI includes 0, overall, per noise level, per language and on the 50 hard documents; clean pages are identical, and CER is equal or lower. Language detection was correct on 60/60 documents.
+
+**History.** The first adapter (PyMuPDF rendering, Pillow `GaussianBlur` flattening) lost 1-4 points of name recall on hard pages (paired NameFuzzy -4.3 [-8.6, -1.3] on the 15 hard sample documents), entirely because Pillow's blur is a box-blur approximation (13.4 % of flattened pixels differed from OpenCV). `preprocess.py` now reproduces OpenCV 5.0's 8-bit `GaussianBlur` bit-exactly (kernel `round(6 sigma + 1) | 1` with taps quantised to 1/256, integer fixed-point row / column passes with `BORDER_REFLECT_101`, done as exact float64 FFT convolutions), so flattened pixels equal OpenCV's on 89/89 hard pages and 20 synthetic cases (flatten 0.19 s per A4 page at 200 DPI, +141 MB on a 40 M pixel page); the renderer then moved from PyMuPDF to pypdfium2 for licensing, which is what is measured above.
+
 ---
 
 ## 3. NER on public data
