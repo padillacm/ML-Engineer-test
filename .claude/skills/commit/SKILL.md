@@ -2,7 +2,7 @@
 name: commit
 description: Create git commits from the current working-tree changes, with messages that follow Conventional Commits 1.0.0 (type(scope)!: description, body, footers). Groups unrelated changes into separate atomic commits, picks the type and scope from the diff, validates every message, and always shows the proposal for the user to approve or correct before committing. Use when the user asks to commit, make a commit, "haz commit", "crea el commit", split changes into commits, or write a commit message.
 argument-hint: "[optional hint: scope, intent or 'single' to force one commit]"
-allowed-tools: Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git branch:*), Bash(git add:*), Bash(git restore --staged:*), Bash(git commit:*), Bash(git show:*), Bash(uv run --no-sync python .claude/skills/commit/scripts/validate_commit_msg.py:*)
+allowed-tools: Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git branch:*), Bash(git add:*), Bash(git restore --staged:*), Bash(git commit:*), Bash(git stash push --keep-index --include-untracked:*), Bash(git stash pop:*), Bash(git stash list:*), Bash(git show:*), Bash(uv run --no-sync python .claude/skills/commit/scripts/validate_commit_msg.py:*)
 ---
 
 Turn the pending changes into one or more commits whose messages follow
@@ -56,6 +56,10 @@ Heuristics for this repo:
 - `.claude/` (skills, commands) → `chore(claude)`.
 - Pure formatting with no behaviour change → `style`; restructuring with no behaviour change →
   `refactor`.
+
+Order the commits so each one is valid on its own (dependencies before dependants, e.g. a
+domain module before the adapter that imports it), and put a change to
+`.pre-commit-config.yaml` first (see step 6).
 
 Staging granularity is whole files (interactive `git add -p` is unavailable). If one file mixes
 two concerns, keep it in the commit of its dominant change and say so in that commit's body.
@@ -151,16 +155,37 @@ again.
 
 ## 6. Stage and commit
 
+Two facts about this repo's hooks shape the order and the procedure:
+
+- **pre-commit refuses to run while `.pre-commit-config.yaml` has unstaged changes**
+  ("Your pre-commit configuration is unstaged"). If that file changed, its commit must be the
+  **first** one (or the file must be part of the first commit). Plan the order in step 3
+  accordingly and say so in the proposal.
+- **Some hooks check whole directories, not the staged files** (`mypy` runs on `app/... tests`,
+  `pytest` on push). Untracked or unstaged files that belong to a *later* commit would be
+  checked against an earlier commit's config and fail it, or hide a commit that is broken on
+  its own. So every commit is made on an isolated tree.
+
 For each approved commit, in order:
 
 1. Stage only that commit's files by explicit path: `git add -- <path> ...`.
    Never `git add -A`, `git add .` or `git commit -a`.
-2. `git commit -F <msg-file>`.
-3. If a pre-commit hook fails: read its output, fix the cause (ruff-format may have rewritten
-   files — re-stage them), and run `git commit -F <msg-file>` again. Never `--no-verify`, never
-   `--amend` an earlier commit to absorb the fix, never disable hooks. If fixing it required
-   changing code (not just re-staging formatter output), tell the user what changed before
-   retrying.
+2. If anything else is still pending (unstaged or untracked), set it aside so the working tree
+   equals exactly what is being committed:
+   `git stash push --keep-index --include-untracked -m "commit-skill: isolate <n>"`.
+3. `git commit -F <msg-file>`. Show its **complete** output and check its exit code; never pipe
+   it through `grep`/`tail` or chain the next commit without checking.
+4. If you stashed in step 2, run `git stash pop` **whether or not the commit succeeded**, and
+   confirm `git stash list` no longer holds the entry. If the pop conflicts, stop and tell the
+   user; never drop the stash.
+5. If the commit failed: **stop the sequence** (later commits would silently absorb this one's
+   staged files). Read the hook output and fix the cause (ruff-format may have rewritten files —
+   re-stage them), then retry the same commit. Never `--no-verify`, never `--amend` an earlier
+   commit to absorb the fix, never disable hooks. If fixing it required changing code, or
+   changing which files go in which commit or their order, show the updated proposal and ask
+   again (step 5) before retrying.
+6. After each commit, check `git show --name-only --format= HEAD` lists exactly the planned
+   files.
 
 Do not push, rebase, amend or reset unless the user asks for it explicitly.
 
