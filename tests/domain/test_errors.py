@@ -25,6 +25,8 @@ LeafError = Callable[[str, str], ServiceError]
 # (class, category, a code valid for it)
 CASES: list[tuple[LeafError, Category, str]] = [
     (InvalidInput, Category.INVALID_INPUT, "not_a_pdf"),
+    (InvalidInput, Category.INVALID_INPUT, "pdf_unreadable"),
+    (InvalidInput, Category.INVALID_INPUT, "unsupported_language"),
     (ProcessingFailed, Category.PROCESSING_FAILED, "ocr_failed"),
     (DependencyUnavailable, Category.DEPENDENCY_UNAVAILABLE, "llm_unavailable"),
     (DependencyTimeout, Category.DEPENDENCY_TIMEOUT, "vector_store_timeout"),
@@ -84,7 +86,23 @@ def test_subclasses_reject_unknown_codes(error_type: LeafError) -> None:
 
 
 def test_registry_is_closed_and_snake_case() -> None:
-    assert len(KNOWN_CODES) == 13
+    assert set(KNOWN_CODES) == {
+        "not_a_pdf",
+        "pdf_unreadable",
+        "empty_file",
+        "too_large",
+        "too_many_pages",
+        "invalid_names",
+        "unsupported_language",
+        "ocr_failed",
+        "llm_unavailable",
+        "llm_timeout",
+        "vector_store_unavailable",
+        "vector_store_timeout",
+        "incompatible_embedding",
+        "geometry_error",
+        "invalid_configuration",
+    }
     assert all(code.islower() and " " not in code for code in KNOWN_CODES)
 
 

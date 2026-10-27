@@ -13,10 +13,12 @@ from typing import ClassVar
 KNOWN_CODES: frozenset[str] = frozenset(
     {
         "not_a_pdf",
+        "pdf_unreadable",
         "empty_file",
         "too_large",
         "too_many_pages",
         "invalid_names",
+        "unsupported_language",
         "ocr_failed",
         "llm_unavailable",
         "llm_timeout",
