@@ -1,4 +1,4 @@
-"""Reusable contract tests for the ``Embedder`` and ``VectorStore`` ports.
+"""Reusable contract tests for the ``OcrEngine``, ``Embedder`` and ``VectorStore`` ports.
 
 A test module subclasses a contract and overrides its factory fixtures; every real adapter added
 in later blocks runs the same test bodies as the fakes. The classes are not named ``Test*`` so
@@ -11,9 +11,9 @@ from collections.abc import Sequence
 
 import pytest
 
-from app.application.ports import Embedder, VectorStore
+from app.application.ports import Embedder, OcrEngine, VectorStore
 from app.domain.errors import IncompatibleEmbedding
-from app.domain.types import Chunk, EmbeddingIdentity
+from app.domain.types import Chunk, EmbeddingIdentity, OcrPage
 
 _IDENTITY_384 = EmbeddingIdentity("contract-model", 384, "none", True, "cosine")
 _IDENTITY_768 = dataclasses.replace(_IDENTITY_384, dimension=768)
@@ -33,6 +33,55 @@ def make_chunks(*texts: str) -> list[Chunk]:
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b, strict=True))
     return dot / (math.hypot(*a) * math.hypot(*b))
+
+
+class OcrEngineContract:
+    """Behaviour every ``OcrEngine`` must show.
+
+    Override ``engine``, ``sample_pdf`` (a PDF whose first page holds text) and
+    ``expected_pages`` (its page count).
+    """
+
+    @pytest.fixture
+    def engine(self) -> OcrEngine:
+        raise NotImplementedError
+
+    @pytest.fixture
+    def sample_pdf(self) -> bytes:
+        raise NotImplementedError
+
+    @pytest.fixture
+    def expected_pages(self) -> int:
+        raise NotImplementedError
+
+    @pytest.fixture
+    def pages(self, engine: OcrEngine, sample_pdf: bytes) -> list[OcrPage]:
+        return engine.recognize(sample_pdf, "en")
+
+    def test_one_result_per_page_in_page_order(
+        self, pages: list[OcrPage], expected_pages: int
+    ) -> None:
+        assert [page.page for page in pages] == list(range(expected_pages))
+
+    def test_pages_have_a_positive_size(self, pages: list[OcrPage]) -> None:
+        assert all(page.width > 0 and page.height > 0 for page in pages)
+
+    def test_first_page_has_words(self, pages: list[OcrPage]) -> None:
+        assert pages[0].words
+
+    def test_word_boxes_lie_inside_their_page(self, pages: list[OcrPage]) -> None:
+        for page in pages:
+            for word in page.words:
+                box = word.box
+                assert box.page == page.page
+                assert word.text.strip()
+                assert 0.0 <= box.x <= box.right <= page.width
+                assert 0.0 <= box.y <= box.bottom <= page.height
+
+    def test_without_a_hint_the_page_count_is_the_same(
+        self, engine: OcrEngine, sample_pdf: bytes, expected_pages: int
+    ) -> None:
+        assert len(engine.recognize(sample_pdf)) == expected_pages
 
 
 class EmbedderContract:

@@ -6,11 +6,31 @@ parametrised factory) that overrides the same fixtures.
 
 import pytest
 
-from app.application.ports import Embedder, VectorStore
-from app.domain.types import EmbeddingIdentity
-from tests.application.contracts import EmbedderContract, VectorStoreContract
+from app.application.ports import Embedder, OcrEngine, VectorStore
+from app.domain.types import Box, EmbeddingIdentity, OcrPage, PageWord
+from tests.application.contracts import EmbedderContract, OcrEngineContract, VectorStoreContract
 from tests.fakes.embedder import FakeEmbedder
+from tests.fakes.ocr import FakeOcrEngine
 from tests.fakes.vector_store import FakeVectorStore
+
+
+class TestFakeOcrEngineContract(OcrEngineContract):
+    @pytest.fixture
+    def engine(self) -> OcrEngine:
+        return FakeOcrEngine(
+            [
+                OcrPage(0, 595.0, 842.0, (PageWord("Memo", Box(0, 72.0, 72.0, 40.0, 12.0)),)),
+                OcrPage(1, 842.0, 595.0, ()),
+            ]
+        )
+
+    @pytest.fixture
+    def sample_pdf(self) -> bytes:
+        return b"%PDF-1.7 two pages"
+
+    @pytest.fixture
+    def expected_pages(self) -> int:
+        return 2
 
 
 class TestFakeEmbedderContract(EmbedderContract):

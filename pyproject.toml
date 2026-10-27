@@ -12,6 +12,10 @@ dependencies = [
     "uvicorn[standard]",
     "pydantic",
     "rapidfuzz>=3",
+    # PDF rendering: PDFium (BSD-3/Apache-2.0). PyMuPDF is AGPL-3.0, so it is a test-only tool.
+    "pypdfium2>=5.14.0",
+    "pillow",
+    "numpy",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +25,10 @@ dev = [
     "ruff",
     "mypy",
     "pytest-cov",
+    # Test-only: builds PDFs and ground truth (search_for) in tests. AGPL-3.0, so never
+    # imported by app/ (tests/adapters/ocr/test_rendering.py). 2.0 bundles a layout
+    # model (onnxruntime, networkx, pymupdf4llm) that the tests do not use.
+    "pymupdf>=1.28,<2",
 ]
 
 [build-system]
@@ -33,6 +41,9 @@ packages = ["app"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "tesseract: needs the Tesseract executable (skipped when it is not on PATH)",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -70,6 +81,9 @@ python_version = "3.12"
 check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+# PyMuPDF (tests only) ships py.typed but leaves some constructors (e.g. ``Document``)
+# unannotated.
+untyped_calls_exclude = ["pymupdf"]
 # Original skeleton, to be replaced in later blocks.
 exclude = [
     '^app/services/',
@@ -80,11 +94,16 @@ exclude = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["app.domain.*", "app.application.*"]
+module = ["app.domain.*", "app.application.*", "app.adapters.*"]
 strict = true
 
+[[tool.mypy.overrides]]
+# pypdfium2 ships no py.typed marker; the adapter annotates the values it takes from it.
+module = ["pypdfium2", "pypdfium2.*"]
+ignore_missing_imports = true
+
 [tool.coverage.run]
-source = ["app/domain", "app/application"]
+source = ["app/domain", "app/application", "app/adapters"]
 branch = true
 
 [tool.coverage.report]
