@@ -181,6 +181,25 @@ Install the git hooks once with `uv run pre-commit install` (see `.pre-commit-co
 `tests/architecture` fails if the domain or application layers import a
 framework or vendor library.
 
+#### Tests in the production-like container
+
+The `Dockerfile` `test` stage (Python 3.12 on Debian 13, Tesseract 5.5 with
+eng/spa/por/fra/deu) runs the full suite, including the tests marked `tesseract`
+that are skipped on a host without the binary. With Docker running:
+
+```
+docker build --target test -t docintel-test .
+docker run --rm docintel-test
+```
+
+Append `pytest -q --cov` to the run command for a coverage report. The git-history
+cross-check in `tests/architecture` is skipped in the container (no `.git` in the image).
+The build needs BuildKit (the default in Docker Desktop): the uv cache is a build cache
+mount, so it is reused between builds but never stored in the image. Tesseract,
+Leptonica, the language packs and `tini` (the container's PID 1, which reaps orphaned
+processes) are pinned to exact Debian versions; the `Dockerfile` comment explains how
+to bump them.
+
 ## Use of AI tools
 
 Using AI assistants (Copilot, Claude, ChatGPT, agents) is **allowed and

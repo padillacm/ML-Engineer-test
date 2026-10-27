@@ -1,0 +1,31 @@
+# VCS, local environments and caches
+.git
+.gitignore
+.gitattributes
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+.coverage.*
+htmlcov
+*.egg-info
+
+# Not needed to build or test (sample_pdfs/ IS needed: integration tests read it)
+benchmarks
+docs
+openspec
+.claude
+.idea
+.vscode
+
+# Secrets
+.env
+.env.*
+
+# Docker files themselves
+Dockerfile
+.dockerignore
