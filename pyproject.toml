@@ -4,33 +4,23 @@ version = "0.1.0"
 description = "ML Engineer take-home — document extraction + RAG service (implement from scratch)."
 requires-python = ">=3.12"
 
-# Baseline dependencies — change/pin these as you see fit (justify in DECISIONS.md).
+# Only what the code imports or runs today. Each adapter block adds its own
+# dependencies (OCR, NER, embeddings, vector store, LLM client, settings, forms) together
+# with the adapter that uses them.
 dependencies = [
     "fastapi",
     "uvicorn[standard]",
-    "python-multipart",
     "pydantic",
-    "pydantic-settings",
-    # OCR / PDF
-    "pytesseract",
-    "pymupdf",
-    "pillow",
-    # NER  (after sync: `uv run python -m spacy download en_core_web_sm`)
-    "spacy",
-    # Fuzzy matching
-    "thefuzz",
-    "python-Levenshtein",
-    # Embeddings + vector store (Chroma is embedded/local; swap for qdrant-client if preferred)
-    "sentence-transformers",
-    "chromadb",
-    # LLM / HTTP
-    "httpx",
+    "rapidfuzz>=3",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "pytest-asyncio",
+    "pre-commit",
+    "ruff",
+    "mypy",
+    "pytest-cov",
 ]
 
 [build-system]
@@ -39,3 +29,64 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# app/services is the original skeleton, to be replaced (app/api and app/main.py lint clean).
+extend-exclude = ["app/services", "benchmarks", ".claude"]
+
+[tool.ruff.lint]
+# E722 bare except, BLE001 blind except, S110/S112 silent try-except-pass/continue.
+select = [
+    "E", "F", "I", "B", "E722", "BLE001", "S110", "S112",
+    "PL", "SIM", "UP", "C4", "RUF", "PT", "RET", "ARG", "PERF", "S", "C90",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 7
+max-branches = 12
+max-statements = 50
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # assert is how pytest tests assert
+    "PLR2004", # magic values are the expected values in tests
+    "ARG",     # fixtures and fakes must match protocol/fixture signatures
+    "S311",    # seeded random for reproducible test data, not cryptography
+    "S603",    # subprocess calls in tests run fixed, test-controlled arguments
+    "S607",    # ...and resolve git through PATH on purpose
+]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# Original skeleton, to be replaced in later blocks.
+exclude = [
+    '^app/services/',
+    '^app/api/',
+    '^app/main\.py$',
+    '^benchmarks/',
+    '^\.claude/',
+]
+
+[[tool.mypy.overrides]]
+module = ["app.domain.*", "app.application.*"]
+strict = true
+
+[tool.coverage.run]
+source = ["app/domain", "app/application"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true

@@ -1,0 +1,97 @@
+# All hooks are local: they run the project's own pinned tools through uv, so
+# installing them downloads nothing and the versions match uv.lock.
+#   uv run pre-commit install        # commit-time hooks and the pre-push test run
+#   uv run pre-commit run --all-files
+#   uv run pre-commit run --hook-stage pre-push --all-files   # tests with the coverage gate
+# The dependency audit queries the OSV database (network), so it is a manual-stage hook that
+# never blocks a commit or push:
+#   uv run pre-commit run --hook-stage manual uv-audit --all-files
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+exclude: ^(\.claude/|benchmarks/|uv\.lock$)
+
+repos:
+  - repo: local
+    hooks:
+      - id: no-commit-to-main
+        name: do not commit directly to main/master
+        language: system
+        entry: uv run --no-sync python -c "import subprocess, sys; b = subprocess.check_output(['git', 'branch', '--show-current'], text=True).strip(); sys.exit(1 if b in ('main', 'master') else 0)"
+        pass_filenames: false
+        always_run: true
+
+      - id: ruff-check
+        name: ruff check
+        language: system
+        entry: uv run --no-sync ruff check --force-exclude
+        types: [python]
+
+      - id: ruff-format
+        name: ruff format
+        language: system
+        entry: uv run --no-sync ruff format --force-exclude
+        types: [python]
+        exclude: ^app/services/
+
+      - id: mypy
+        name: mypy
+        language: system
+        entry: uv run --no-sync mypy app/domain app/application tests
+        files: ^(app|tests)/.*\.py$|^pyproject\.toml$
+        pass_filenames: false
+
+      - id: uv-lock-in-sync
+        name: uv.lock matches pyproject.toml
+        language: system
+        entry: uv lock --check
+        files: ^(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+
+      - id: openspec-validate
+        name: openspec validate (strict)
+        language: system
+        entry: openspec validate --all --strict --no-interactive
+        files: ^openspec/
+        pass_filenames: false
+
+      - id: no-merge-conflict-markers
+        name: no merge conflict markers
+        language: pygrep
+        entry: '^(<<<<<<< |>>>>>>> |=======$)'
+        types: [text]
+        exclude: \.md$
+
+      - id: no-secrets
+        name: no API keys or private keys
+        language: pygrep
+        entry: '(sk-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{10,})'
+        types: [text]
+
+      - id: no-local-user-paths
+        name: no absolute user-home paths
+        language: pygrep
+        entry: '(?i)\b[a-z]:[\\/]+users[\\/]+[^\\/\s"'']+'
+        types: [text]
+
+      - id: no-trailing-whitespace
+        name: no trailing whitespace
+        language: pygrep
+        entry: '[ \t]+\r?$'
+        types: [text]
+        exclude: \.(md|txt)$
+
+      - id: pytest-on-push
+        name: pytest
+        language: system
+        entry: uv run --no-sync pytest -q --cov
+        stages: [pre-push]
+        pass_filenames: false
+        always_run: true
+
+      - id: uv-audit
+        name: uv audit (known vulnerabilities in uv.lock)
+        language: system
+        entry: uv audit --locked
+        stages: [manual]
+        pass_filenames: false
+        always_run: true
