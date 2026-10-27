@@ -158,13 +158,28 @@ batching, or other production hardening. Not required — credited when present.
 
 ```bash
 uv sync --extra dev                          # create .venv and install deps from pyproject.toml
-uv run python -m spacy download en_core_web_sm
-# Vector DB: embedded Chroma needs nothing extra. Only if you choose Qdrant:
-#   docker run -p 6333:6333 qdrant/qdrant
+# Vector DB (planned): Qdrant, via docker compose; tests use an in-memory instance.
 uv run uvicorn app.main:app --reload
 ```
 
 Sample scanned PDFs are in `sample_pdfs/`.
+
+### Project layout (work in progress)
+
+```
+app/domain/       pure logic: geometry, name matching, chunking, errors (stdlib + rapidfuzz only)
+app/application/  ports (typing.Protocol) the use cases depend on
+app/adapters/     real OCR / NER / embedding / vector-store / LLM implementations
+app/api/, app/models/schemas.py   HTTP edge and the fixed API contract
+tests/            unit tests, in-memory fakes (tests/fakes), architecture guard
+docs/BENCHMARKS.md, benchmarks/   measurements behind the defaults and how to reproduce them
+openspec/         specs and change proposals the implementation follows
+```
+
+Run the tests and the linter with `uv run pytest -q` and `uv run ruff check app tests`.
+Install the git hooks once with `uv run pre-commit install` (see `.pre-commit-config.yaml`).
+`tests/architecture` fails if the domain or application layers import a
+framework or vendor library.
 
 ## Use of AI tools
 
