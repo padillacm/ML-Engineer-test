@@ -408,6 +408,27 @@ For XLM-R the recommended whole-page input is the fastest or equal-fastest of th
 
 **Reproduce** (from `benchmarks/ner_corpus/`, using the `ner_public` environment; rapidfuzz 3.14.6 in `pylib/`): `bash scripts/reproduce.sh` (raw predictions `scripts/run_ner.py MODEL VARIANT` ~20 min GPU, evaluation ~5 min, CPU timing ~10 min on RTX 4070 Ti + 16 cores); evaluation only: `bash scripts/run_eval_all.sh`; CPU timing only: `bash scripts/run_speed.sh`. Always `python -I -X utf8`.
 
+### 4.5 Implemented chain re-measurement (task 7.2 of `add-name-extraction`)
+
+**Method.** `ExtractNames` with the real adapters at their default configurations (`TesseractOcrEngine`, `TransformersNameRecognizer` on the baked model, `threads=2`) inside the `docintel-test` image, on the seed-0 sample of section 2.8 (60 documents, 102 pages, 844 mentions), language hint = document language. Every `NameMention` was scored with the benchmark's own `score_doc` (IoU >= 0.5, greedy one-to-one, trap rule) and compared **paired by document** with the default's per-document rows (`rows_default_xlmr_pagesp_tc.jsonl`); bootstrap over documents, 1,000 reps, seed 0. A control fed the benchmark's own OCR words (`stageB_flat200`) to the same use case, which isolates the NER runtime and span rules from OCR.
+
+| run (60 docs) | precision | recall | F1 | trapFP | persons (box) | paired dF1 vs default |
+|---|---|---|---|---|---|---|
+| benchmark default, same docs | 95.7 | 91.6 | 93.6 [91.9-95.1] | 6.6 | 93.5 | - |
+| **final chain, hint** | 95.7 [93.4-97.5] | 91.2 [88.6-93.7] | **93.4 [91.7-95.0]** | 5.8 [2.3-10.3] | 93.5 [90.1-96.6] | **-0.2 [-0.8, +0.3]** |
+| final chain, no hint | identical (same mentions, names and boxes on 60/60 documents) | | | | | -0.2 [-0.8, +0.3] |
+| control: final rules on benchmark OCR words (first run + "pr") | 95.7 | 91.6 | 93.6 | 6.6 | 93.5 | 0.0 [0.0, 0.0] (808/808 spans identical) |
+
+Paired, final chain (hint and no hint): precision -0.0 [-0.6, +0.5], recall -0.4 [-1.3, +0.5]; trapFP -0.8 [-2.2, 0.0]; distinct persons (box) +0.0 [-1.4, +1.4] (full-name reading 91.4 vs 91.2). dF1 by language: en +0.0 [0.0, 0.0], es +0.2 [-0.8, +1.0], pt -0.3 [-2.5, +1.9], fr +0.0 [-1.2, +1.2], de -1.1 [-3.1, +0.2]; by noise: clean -0.2 [-0.8, +0.3], medium -0.4 [-1.5, +0.4], hard +0.4 [-1.8, +2.9]. Every CI includes 0. The residual -0.2 (805 spans, 770 TP vs 808 / 773) is OCR only: on identical OCR words the rules reproduce the benchmark span for span, and the rest is the renderer difference of section 2.8 (a few re-read words on hard and medium pages, e.g. "-GroB," not joined by M2). The new M2 list guard changed no span on this sample (output equal to the first run with "pr" patched in).
+
+**First run (diagnosis).** As first shipped, dF1 was -0.8 [-1.6, -0.0] (fr -3.3 [-5.5, -1.1]): `_TITLES` lacked the French "Pr", so "Pr Rogner" left a bare, untitled surname that Dsingle dropped (9 TP on 6 French documents; patching the list in the measuring process closed the gap). Without a hint, "M." was read as an initial because the title rule got the caller's `None` instead of the detected language ("M. Guyon", 11 names on 4 French documents). Both are fixed (`_TITLES` is now a superset of the benchmark list; `OcrPage.language` feeds the title rule): no-hint output now reads "Guyon", and the only "M. X" name left is the Portuguese initial "M. Azevedo".
+
+Reported names keep inner commas ("Guyon, Guillaume"; the benchmark joins tokens without them); boxes and scores are unaffected.
+
+**Timing** (same container, 16-thread host, sequential documents, OCR `workers=4`, NER `threads=2`): with hint OCR 0.72 + NER 0.55 = **1.27 s/page** (102 pages, 130 s wall); without hint 1.68 + 0.58 = 2.26 s/page (extra detection pass); model load ~5 s once.
+
+**Verdict.** Accepted. The final chain matches the benchmark default on the same 60 documents: paired dF1 -0.2 [-0.8, +0.3] overall, every language and noise CI includes 0, trapFP and distinct-person recall unchanged; with and without hint the output is identical. Absolute F1 93.4 is above the 600-document interval [91.2-92.7] only because the sample is easier (the default scores 93.6 on it).
+
 ---
 
 ## 5. Fuzzy threshold and scorer comparison
