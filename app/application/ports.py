@@ -9,6 +9,7 @@ which ones.
 from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
+from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from app.domain.types import (
     ChatMessage,
     Chunk,
@@ -26,13 +27,24 @@ class OcrEngine(Protocol):
     The adapter rasterises the pages and converts the engine's pixel boxes to page space, so no
     pixel coordinate or rasteriser type crosses this boundary.
 
-    Failures: ``ProcessingFailed`` (code ``ocr_failed``) when a page cannot be read.
+    Failures: ``ProcessingFailed`` (code ``ocr_failed``) when a page cannot be read, and
+    ``ProcessingFailed`` (code ``request_cancelled``) once ``cancel`` is cancelled.
     """
 
-    def recognize(self, pdf: bytes, language: str | None = None) -> list[OcrPage]:
+    def recognize(
+        self,
+        pdf: bytes,
+        language: str | None = None,
+        *,
+        cancel: Cancellation = NEVER_CANCELLED,
+    ) -> list[OcrPage]:
         """Return one ``OcrPage`` per page of ``pdf``, in page order.
 
         ``language`` is an engine-neutral language hint; ``None`` lets the adapter decide.
+        ``cancel`` is checked before each page is rendered or recognised (and, where the
+        engine can, while a page is recognised): once it is cancelled no further page starts,
+        nothing keeps running once the call returns, and ``request_cancelled`` is raised
+        instead of returning pages.
         """
         ...
 

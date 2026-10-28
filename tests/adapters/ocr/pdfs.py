@@ -1,5 +1,6 @@
 """PDFs built in memory for the OCR adapter tests."""
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -62,3 +63,68 @@ def encrypted_pdf() -> bytes:
             encryption=pymupdf.mupdf.PDF_ENCRYPT_AES_256, owner_pw="owner", user_pw="user"
         )
         return data
+
+
+def declare_page_count(pdf: bytes, count: int) -> bytes:
+    """Return ``pdf`` (as written by ``build_pdf``) with its page tree declaring ``count`` pages.
+
+    Only the root ``/Pages`` dictionary's ``/Count`` changes; the cross-reference table is
+    rewritten so every object offset stays right and PDFium does not have to repair the file.
+    """
+    patched, replaced = re.subn(
+        rb"/Type/Pages/Count \d+", b"/Type/Pages/Count %d" % count, pdf, count=1
+    )
+    assert replaced == 1, "no root page tree found"
+    body = patched[: patched.rindex(b"\nxref\n") + 1]
+    offsets = {int(m.group(1)): m.start() for m in re.finditer(rb"(?m)^(\d+) 0 obj\b", body)}
+    size = max(offsets) + 1
+    rows = [b"0000000000 65535 f \n"]
+    rows += [b"%010d 00000 n \n" % offsets[number] for number in range(1, size)]
+    trailer = patched[patched.rindex(b"trailer") : patched.rindex(b"startxref")]
+    return (
+        body
+        + b"xref\n0 %d\n" % size
+        + b"".join(rows)
+        + trailer
+        + b"startxref\n%d\n%%%%EOF\n" % len(body)
+    )
+
+
+PAGE_DICT = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>"
+"""A blank 200 x 200 pt page whose parent is object 2, the root of ``page_tree_pdf``."""
+
+
+def page_tree_pdf(
+    kids: Sequence[bytes],
+    count: int | None = None,
+    tree_entries: bytes = b"",
+    extra: Sequence[bytes] = (),
+) -> bytes:
+    """Return a PDF whose root page tree (object 2) has ``kids`` as objects 3, 4, ...
+
+    A kid is the body of its object: a page dictionary such as ``PAGE_DICT``, or anything else
+    (``b"42"``) for a damaged entry. ``count`` defaults to the number of kids; ``tree_entries``
+    are added to the page tree dictionary (inherited attributes); ``extra`` objects follow the
+    kids. The cross-reference table is exact, so PDFium does not repair the file.
+    """
+    references = b" ".join(b"%d 0 R" % (3 + index) for index in range(len(kids)))
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [%s] /Count %d %s >>"
+        % (references, len(kids) if count is None else count, tree_entries),
+        *kids,
+        *extra,
+    ]
+    out = bytearray(b"%PDF-1.7\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        xref,
+    )
+    return bytes(out)

@@ -5,6 +5,15 @@ a small thread pool whose threads only wait on single-threaded Tesseract process
 ``2 x workers`` rendered pages exist at once, and rendering stops as soon as one page fails.
 Results are reassembled in page order.
 
+Cancellation: the ``Cancellation`` token is checked before every page is rendered (on the
+calling thread), by a worker before it hands a rendered page to Tesseract, and by the runner
+while Tesseract runs. Once it is cancelled no further page is rendered or started, the
+Tesseract processes already running are terminated (killed after a short grace period, and
+reaped; see ``app.adapters.ocr.tesseract``), every thread of the pool is joined and the
+rendered images are released before ``request_cancelled`` is raised, so nothing keeps running
+after ``recognize`` returns. A page being rendered when the token is cancelled still finishes
+rendering (PDFium cannot be interrupted).
+
 Thread safety: ``recognize`` may be called from several threads at once. PDFium is not
 thread-safe, so every PDFium call (open, render, close) is serialised by the module-level lock
 of ``app.adapters.ocr.rendering``; the Tesseract processes of all calls still run concurrently.
@@ -26,6 +35,7 @@ from math import isfinite
 from app.adapters.ocr.preprocess import flatten_illumination
 from app.adapters.ocr.rendering import ImageTransform, RenderedPage, open_pdf, render_pages
 from app.adapters.ocr.tesseract import TesseractCli, TesseractRunner, parse_tsv
+from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from app.domain.errors import ConfigurationError, InvalidInput, ProcessingFailed
 from app.domain.geometry import PageText
 from app.domain.language import SUPPORTED_LANGUAGES, detect_language, validate_language
@@ -52,8 +62,9 @@ class TesseractOcrConfig:
     ``languages`` are engine-neutral codes, read together when the document language is
     unknown. Detection reads pages with all of them until ``detect_language`` decides, giving
     up after ``detect_max_pages`` pages that contain alphabetic words. ``workers=None`` uses
-    ``min(4, cpu_count)`` concurrent Tesseract processes. Invalid values raise
-    ``ConfigurationError``.
+    ``min(4, cpu_count)`` concurrent Tesseract processes. ``max_pages`` is the largest page
+    count accepted; a longer document is refused after opening, before any page is loaded or
+    rendered. Invalid values raise ``ConfigurationError``.
     """
 
     dpi: int = 200
@@ -66,6 +77,7 @@ class TesseractOcrConfig:
     timeout_s: float = 60.0
     workers: int | None = None
     max_page_pixels: int = 40_000_000
+    max_pages: int = 50
     tesseract_cmd: str = "tesseract"
 
     def __post_init__(self) -> None:
@@ -82,6 +94,7 @@ class TesseractOcrConfig:
             "workers must be None or a positive integer",
         )
         _require(_is_positive_int(self.max_page_pixels), "max_page_pixels must be >= 1")
+        _require(_is_positive_int(self.max_pages), "max_pages must be a positive integer")
         _require(
             isinstance(self.tesseract_cmd, str) and bool(self.tesseract_cmd.strip()),
             "tesseract_cmd must be a non-empty string",
@@ -129,8 +142,9 @@ class TesseractOcrEngine:
 
     ``runner`` replaces the Tesseract process, for tests; by default it is a ``TesseractCli``
     built from ``config``. Safe to call from several threads at once (see the module notes).
-    Errors: ``InvalidInput`` (``pdf_unreadable``, ``too_large``,
-    ``unsupported_language``) and ``ProcessingFailed`` (``ocr_failed``).
+    Errors: ``InvalidInput`` (``pdf_unreadable``, ``too_large``, ``too_many_pages``,
+    ``unsupported_language``) and ``ProcessingFailed`` (``ocr_failed``, or
+    ``request_cancelled`` once the ``cancel`` token of ``recognize`` is cancelled).
     """
 
     def __init__(
@@ -155,7 +169,13 @@ class TesseractOcrEngine:
             timeout_s=config.timeout_s,
         )
 
-    def recognize(self, pdf: bytes, language: str | None = None) -> list[OcrPage]:
+    def recognize(
+        self,
+        pdf: bytes,
+        language: str | None = None,
+        *,
+        cancel: Cancellation = NEVER_CANCELLED,
+    ) -> list[OcrPage]:
         """Return one ``OcrPage`` per page of ``pdf``, in page order.
 
         With a ``language`` hint every page is read with that model only. Without one, pages
@@ -167,15 +187,25 @@ class TesseractOcrEngine:
 
         Every page reports the language it was read with: the hint, the detected language, or
         ``None`` when detection was inconclusive (all pages then report ``None``).
+
+        A document with more than ``max_pages`` pages raises ``InvalidInput`` (code
+        ``too_many_pages``) before any page is rendered or read.
+
+        ``cancel`` is checked before each page is rendered, before each is recognised and while
+        Tesseract runs; once cancelled, running Tesseract processes are stopped, no further
+        page starts and ``ProcessingFailed`` (code ``request_cancelled``) is raised.
         """
         code = None if language is None else self._supported(language)
-        with open_pdf(pdf) as document:
-            pages = render_pages(
-                document, self._config.dpi, self._config.max_page_pixels, self._transform()
+        with open_pdf(pdf, max_pages=self._config.max_pages) as document:
+            pages = _until_cancelled(
+                render_pages(
+                    document, self._config.dpi, self._config.max_page_pixels, self._transform()
+                ),
+                cancel,
             )
             if code is not None:
-                return self._recognize_all(pages, code)
-            return self._recognize_detecting(pages)
+                return self._recognize_all(pages, code, cancel)
+            return self._recognize_detecting(pages, cancel)
 
     def _supported(self, language: str) -> str:
         code = validate_language(language)
@@ -194,33 +224,38 @@ class TesseractOcrEngine:
             return None
         return partial(flatten_illumination, dpi=self._config.dpi)
 
-    def _recognize_detecting(self, pages: Iterator[RenderedPage]) -> list[OcrPage]:
+    def _recognize_detecting(
+        self, pages: Iterator[RenderedPage], cancel: Cancellation
+    ) -> list[OcrPage]:
         seen: list[RenderedPage] = []
         combined: list[OcrPage] = []
         texts: list[str] = []
         for rendered in pages:
             seen.append(rendered)
-            result = self._recognize_page(rendered, None)
+            result = self._recognize_page(rendered, None, cancel)
             combined.append(result)
             if not _has_alphabetic_word(result):
                 continue
             texts.append(PageText.from_words(result.words).text)
             detected = detect_language(" ".join(texts), min_words=self._config.detect_min_words)
             if detected is not None and detected in self._config.languages:
-                return self._recognize_all(chain(seen, pages), detected)
+                return self._recognize_all(chain(seen, pages), detected, cancel)
             if len(texts) >= self._config.detect_max_pages:
                 break
         seen.clear()
-        return combined + self._recognize_all(pages, None)
+        return combined + self._recognize_all(pages, None, cancel)
 
-    def _recognize_all(self, pages: Iterable[RenderedPage], language: str | None) -> list[OcrPage]:
+    def _recognize_all(
+        self, pages: Iterable[RenderedPage], language: str | None, cancel: Cancellation
+    ) -> list[OcrPage]:
         """OCR ``pages`` concurrently, holding at most ``2 x workers`` rendered pages at once.
 
         ``language`` is a supported code, or ``None`` for the combined model.
 
-        The next page is rendered only when a slot is free. After the first failure no further
-        page is rendered or started, running processes finish (or time out) and the failure of
-        the earliest failed page is raised.
+        The next page is rendered only when a slot is free. After the first failure, or once
+        ``cancel`` is cancelled, no further page is rendered or started, running processes
+        finish (or time out) and the failure of the earliest failed page (else
+        ``request_cancelled``) is raised.
         """
         window = _Window(_PAGES_IN_FLIGHT_PER_WORKER * self._workers)
         futures: list[Future[OcrPage]] = []
@@ -233,27 +268,39 @@ class TesseractOcrEngine:
                     # Every page is submitted: wait for all of them, or for the first failure.
                     wait(futures, return_when=FIRST_EXCEPTION)
                     break
-                future = pool.submit(self._recognize_unless_stopped, window, rendered, language)
+                future = pool.submit(
+                    self._recognize_unless_stopped, window, rendered, language, cancel
+                )
                 del rendered
                 future.add_done_callback(window.release)
                 futures.append(future)
         finally:
-            # Pages still queued here are abandoned: a page failed or rendering raised.
+            # Pages still queued here are abandoned: a page failed, rendering raised or the
+            # request was cancelled. Running pages finish; every worker thread is joined.
             pool.shutdown(wait=True, cancel_futures=True)
-        return _gather(futures)
+        return _gather(futures, cancel)
 
     def _recognize_unless_stopped(
-        self, window: "_Window", rendered: RenderedPage, language: str | None
+        self,
+        window: "_Window",
+        rendered: RenderedPage,
+        language: str | None,
+        cancel: Cancellation,
     ) -> OcrPage:
-        if window.failed:
+        if window.failed or cancel.cancelled:
             raise _Abandoned
-        return self._recognize_page(rendered, language)
+        return self._recognize_page(rendered, language, cancel)
 
-    def _recognize_page(self, rendered: RenderedPage, language: str | None) -> OcrPage:
+    def _recognize_page(
+        self, rendered: RenderedPage, language: str | None, cancel: Cancellation
+    ) -> OcrPage:
         model = self._model(language)
         try:
-            words = parse_tsv(self._runner(rendered.png, model), rendered.raster, rendered.index)
+            tsv = self._runner(rendered.png, model, cancel=cancel)
+            words = parse_tsv(tsv, rendered.raster, rendered.index)
         except ProcessingFailed as error:
+            if error.code == "request_cancelled":
+                raise
             raise ProcessingFailed(
                 f"OCR failed on page {rendered.index}: {error.message}", "ocr_failed"
             ) from error
@@ -262,7 +309,7 @@ class TesseractOcrEngine:
 
 
 class _Abandoned(Exception):
-    """A queued page that was not started because another page had already failed."""
+    """A queued page that was not started: another page had failed or the job was cancelled."""
 
 
 class _Window:
@@ -298,9 +345,25 @@ def _has_alphabetic_word(page: OcrPage) -> bool:
     return any(char.isalpha() for word in page.words for char in word.text)
 
 
-def _gather(futures: list[Future[OcrPage]]) -> list[OcrPage]:
-    """Return the results in page order, or raise the failure of the earliest failed page."""
+def _until_cancelled(pages: Iterator[RenderedPage], cancel: Cancellation) -> Iterator[RenderedPage]:
+    """Yield ``pages``, checking ``cancel`` before each page is rendered (one per ``next``)."""
+    while True:
+        cancel.raise_if_cancelled()
+        rendered = next(pages, None)
+        if rendered is None:
+            return
+        yield rendered
+        del rendered
+
+
+def _gather(futures: list[Future[OcrPage]], cancel: Cancellation) -> list[OcrPage]:
+    """Return the results in page order, or raise the failure of the earliest failed page.
+
+    Without a page failure, a cancelled token raises ``request_cancelled`` even when every page
+    was read: a cancelled job never returns results.
+    """
     for future in futures:
         if not future.cancelled() and not isinstance(future.exception(), _Abandoned | None):
             future.result()
+    cancel.raise_if_cancelled()
     return [future.result() for future in futures]

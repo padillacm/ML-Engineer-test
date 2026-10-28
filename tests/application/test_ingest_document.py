@@ -7,6 +7,7 @@ from collections.abc import Callable, Sequence
 import pytest
 
 from app.application.ingest_document import DOCUMENT_NAMESPACE, IngestDocument, document_id_for
+from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from app.domain.chunking import ChunkingConfig
 from app.domain.errors import ConfigurationError, DependencyUnavailable, ProcessingFailed
 from app.domain.types import Box, IngestResult, OcrPage, PageWord
@@ -61,7 +62,13 @@ class FailingEmbedder(FakeEmbedder):
 
 
 class FailingOcr(FakeOcrEngine):
-    def recognize(self, pdf: bytes, language: str | None = None) -> list[OcrPage]:
+    def recognize(
+        self,
+        pdf: bytes,
+        language: str | None = None,
+        *,
+        cancel: Cancellation = NEVER_CANCELLED,
+    ) -> list[OcrPage]:
         raise ProcessingFailed("page could not be read", code="ocr_failed")
 
 
@@ -380,11 +387,17 @@ class InterleavingOcr(FakeOcrEngine):
         super().__init__(pages)
         self._during: Callable[[], None] | None = during
 
-    def recognize(self, pdf: bytes, language: str | None = None) -> list[OcrPage]:
+    def recognize(
+        self,
+        pdf: bytes,
+        language: str | None = None,
+        *,
+        cancel: Cancellation = NEVER_CANCELLED,
+    ) -> list[OcrPage]:
         during, self._during = self._during, None
         if during is not None:
             during()
-        return super().recognize(pdf, language)
+        return super().recognize(pdf, language, cancel=cancel)
 
 
 def test_concurrent_ingest_failing_mid_write_keeps_the_completed_ingest() -> None:
@@ -433,3 +446,133 @@ def test_passages_are_embedded_in_batches_in_chunk_order() -> None:
 def test_invalid_batch_size_is_rejected(batch_size: object) -> None:
     with pytest.raises(ConfigurationError, match="batch_size"):
         IngestDocument(FakeOcrEngine(), FakeEmbedder(), FakeVectorStore(), batch_size=batch_size)  # type: ignore[arg-type]
+
+
+# --- cancellation -------------------------------------------------------------------------
+
+
+class CancellingOcr(FakeOcrEngine):
+    """Cancels the token while recognising, as a client leaving during the last page would."""
+
+    def recognize(
+        self,
+        pdf: bytes,
+        language: str | None = None,
+        *,
+        cancel: Cancellation = NEVER_CANCELLED,
+    ) -> list[OcrPage]:
+        pages = super().recognize(pdf, language, cancel=cancel)
+        cancel.cancel()
+        return pages
+
+
+class CancellingEmbedder(FakeEmbedder):
+    """Cancels ``cancel`` during passage call number ``cancel_on`` (1-based)."""
+
+    def __init__(self, cancel: Cancellation, cancel_on: int) -> None:
+        super().__init__()
+        self._cancel = cancel
+        self._cancel_on = cancel_on
+
+    def embed_passages(self, texts: Sequence[str]) -> list[list[float]]:
+        if len(self.passage_calls) + 1 == self._cancel_on:
+            self._cancel.cancel()
+        return super().embed_passages(texts)
+
+
+def _assert_cancelled(raised: pytest.ExceptionInfo[ProcessingFailed]) -> None:
+    assert raised.value.code == "request_cancelled"
+
+
+def test_the_token_is_passed_to_the_ocr_engine() -> None:
+    use_case, ocr, _, _ = build()
+    cancel = Cancellation()
+
+    use_case(PDF_A, cancel=cancel)
+    use_case(PDF_B)
+
+    assert ocr.cancels == [cancel, NEVER_CANCELLED]
+
+
+def test_cancelled_before_ocr_stores_nothing() -> None:
+    use_case, _, embedder, store = build()
+    cancel = Cancellation()
+    cancel.cancel()
+
+    with pytest.raises(ProcessingFailed) as raised:
+        use_case(PDF_A, cancel=cancel)
+
+    _assert_cancelled(raised)
+    assert embedder.passage_calls == []
+    assert store.count() == 0
+
+
+def test_cancelled_during_ocr_skips_chunking_embedding_and_storing() -> None:
+    store = FakeVectorStore()
+    embedder = FakeEmbedder()
+    use_case = IngestDocument(CancellingOcr(TWO_PAGES), embedder, store)
+
+    with pytest.raises(ProcessingFailed) as raised:
+        use_case(PDF_A, cancel=Cancellation())
+
+    _assert_cancelled(raised)
+    assert embedder.passage_calls == []
+    assert store.count() == 0
+
+
+def test_cancelled_between_embedding_batches_embeds_no_further_batch_and_stores_nothing() -> None:
+    cancel = Cancellation()
+    embedder = CancellingEmbedder(cancel, cancel_on=1)
+    use_case, _, _, store = build(embedder=embedder, chunking=SMALL_CHUNKS, batch_size=1)
+
+    with pytest.raises(ProcessingFailed) as raised:
+        use_case(PDF_A, cancel=cancel)
+
+    _assert_cancelled(raised)
+    assert len(embedder.passage_calls) == 1
+    assert store.count() == 0
+
+
+def test_cancelled_during_the_last_batch_stores_nothing() -> None:
+    cancel = Cancellation()
+    embedder = CancellingEmbedder(cancel, cancel_on=1)
+    use_case, _, _, store = build(embedder=embedder)  # one batch holds every chunk
+
+    with pytest.raises(ProcessingFailed) as raised:
+        use_case(PDF_A, cancel=cancel)
+
+    _assert_cancelled(raised)
+    assert len(embedder.passage_calls) == 1
+    assert store.count() == 0
+    assert store.document_chunk_count(document_id_for(hashlib.sha256(PDF_A).hexdigest())) == 0
+
+
+def test_a_cancelled_ingest_is_not_indexed_and_the_next_one_stores_it_completely() -> None:
+    cancel = Cancellation()
+    embedder = CancellingEmbedder(cancel, cancel_on=2)
+    use_case, _, _, store = build(embedder=embedder, chunking=SMALL_CHUNKS, batch_size=1)
+    with pytest.raises(ProcessingFailed):
+        use_case(PDF_A, cancel=cancel)
+
+    result = use_case(PDF_A)
+
+    assert result.already_indexed is False
+    assert result.chunks_stored > 1
+    assert store.document_chunk_count(result.document_id) == result.chunks_stored
+    assert store.count() == result.chunks_stored
+
+
+def test_cancellation_after_storing_began_does_not_interrupt_the_write() -> None:
+    cancel = Cancellation()
+
+    class CancellingStore(FakeVectorStore):
+        def upsert(self, *args: object, **kwargs: object) -> None:
+            cancel.cancel()
+            super().upsert(*args, **kwargs)  # type: ignore[arg-type]
+
+    store = CancellingStore()
+    use_case = IngestDocument(FakeOcrEngine(TWO_PAGES), FakeEmbedder(), store)
+
+    result = use_case(PDF_A, cancel=cancel)
+
+    assert store.document_chunk_count(result.document_id) == result.chunks_stored > 0

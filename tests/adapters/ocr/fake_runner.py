@@ -8,6 +8,7 @@ from collections.abc import Callable
 import numpy as np
 from PIL import Image
 
+from app.domain.cancellation import CANCELLED_MESSAGE, NEVER_CANCELLED, Cancellation
 from app.domain.errors import ProcessingFailed
 
 TSV_HEADER = (
@@ -40,6 +41,10 @@ class FakeTesseract:
     ``fail_width`` makes the image of that width fail; ``delay(width)`` returns seconds to sleep
     before answering, to shuffle completion order between workers. ``widths`` lists the image
     width of every call in call order; ``max_active`` is the largest number of overlapping calls.
+
+    Like ``TesseractCli`` it watches ``cancel`` while it "runs" (during the delay, in 5 ms
+    steps): once cancelled it stops at once with ``request_cancelled`` and records the width in
+    ``stopped``; ``finished`` lists the widths of the calls that returned an answer.
     """
 
     def __init__(
@@ -60,8 +65,12 @@ class FakeTesseract:
         self.widths: list[int] = []
         self.active = 0
         self.max_active = 0
+        self.finished: list[int] = []
+        self.stopped: list[int] = []
 
-    def __call__(self, png: bytes, languages: str) -> str:
+    def __call__(
+        self, png: bytes, languages: str, *, cancel: Cancellation = NEVER_CANCELLED
+    ) -> str:
         image = decode(png)
         width = image.shape[1]
         with self._lock:
@@ -71,16 +80,32 @@ class FakeTesseract:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
-            time.sleep(self._delay(width))
+            self._run_for(self._delay(width), width, cancel)
             if width == self._fail_width:
                 raise ProcessingFailed("tesseract exited with code 1", "ocr_failed")
             if image.min() == 255:
+                with self._lock:
+                    self.finished.append(width)
                 return tsv([])
             box = (0, 0, 8, 8)
             text = self._page_text.get(width)
             text = self._text(languages) if text is None else text
             words = [f"{languages}:{width}", *text.split()]
+            with self._lock:
+                self.finished.append(width)
             return tsv([(word, box) for word in words])
         finally:
             with self._lock:
                 self.active -= 1
+
+    def _run_for(self, seconds: float, width: int, cancel: Cancellation) -> None:
+        end = time.monotonic() + seconds
+        while True:
+            if cancel.cancelled:
+                with self._lock:
+                    self.stopped.append(width)
+                raise ProcessingFailed(CANCELLED_MESSAGE, "request_cancelled")
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(0.005, left))

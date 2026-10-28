@@ -6,6 +6,7 @@ import pytest
 
 from app.adapters.ocr import rendering
 from app.adapters.ocr.rendering import RenderedPage
+from tests.adapters.ocr.pdfs import PageSpec, build_pdf
 
 
 @pytest.fixture
@@ -46,3 +47,9 @@ def rendered_pages(monkeypatch: pytest.MonkeyPatch) -> RenderSpy:
 
     monkeypatch.setattr(rendering, "_render", render)
     return spy
+
+
+@pytest.fixture(scope="session")
+def five_thousand_pages() -> bytes:
+    """A real 5,000-page PDF of blank pages (built once: about a second)."""
+    return build_pdf([PageSpec(lines=())] * 5000)

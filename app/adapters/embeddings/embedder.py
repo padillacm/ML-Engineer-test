@@ -12,7 +12,9 @@ Thread safety: the methods may be called from several threads; inference is seri
 lock per embedder because the tokenizer and model are not documented as thread-safe.
 
 Threads: a successful creation calls ``torch.set_num_threads(config.threads)``, which is
-process-wide; the last torch adapter created wins. A failed creation leaves it unchanged.
+process-wide: every torch computation in the process (the recogniser's included) then uses that
+many intra-op threads, and the last torch adapter created wins, so the service gives both the
+same value (``TORCH_THREADS``). A failed creation leaves it unchanged.
 """
 
 import threading

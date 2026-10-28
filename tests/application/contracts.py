@@ -15,7 +15,13 @@ from collections.abc import Sequence
 import pytest
 
 from app.application.ports import Embedder, LLMClient, NameRecognizer, OcrEngine, VectorStore
-from app.domain.errors import DependencyTimeout, DependencyUnavailable, IncompatibleEmbedding
+from app.domain.cancellation import Cancellation
+from app.domain.errors import (
+    DependencyTimeout,
+    DependencyUnavailable,
+    IncompatibleEmbedding,
+    ProcessingFailed,
+)
 from app.domain.language import SUPPORTED_LANGUAGES
 from app.domain.types import ChatMessage, Chunk, EmbeddingIdentity, OcrPage, TextSpan
 from tests.fakes.vector_store import FakeVectorStore
@@ -123,6 +129,23 @@ class OcrEngineContract:
 
         assert len(languages) == 1
         assert languages <= {None, *SUPPORTED_LANGUAGES}
+
+    @pytest.mark.parametrize("language", [None, "en"])
+    def test_a_cancelled_token_raises_request_cancelled(
+        self, engine: OcrEngine, sample_pdf: bytes, language: str | None
+    ) -> None:
+        cancel = Cancellation()
+        cancel.cancel()
+
+        with pytest.raises(ProcessingFailed) as raised:
+            engine.recognize(sample_pdf, language, cancel=cancel)
+
+        assert raised.value.code == "request_cancelled"
+
+    def test_a_live_token_changes_nothing(
+        self, engine: OcrEngine, sample_pdf: bytes, pages: list[OcrPage]
+    ) -> None:
+        assert engine.recognize(sample_pdf, "en", cancel=Cancellation()) == pages
 
 
 class NameRecognizerContract:

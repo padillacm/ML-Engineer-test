@@ -17,11 +17,19 @@ from app.adapters.ocr.preprocess import flatten_illumination
 from app.adapters.ocr.rendering import open_pdf, render_pages
 from app.adapters.ocr.tesseract import TesseractCli
 from app.application.ports import OcrEngine
+from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from app.domain.errors import ConfigurationError, InvalidInput, ProcessingFailed
 from app.domain.types import Box, OcrPage
 from tests.adapters.ocr.conftest import RenderSpy
 from tests.adapters.ocr.fake_runner import FakeTesseract, decode
-from tests.adapters.ocr.pdfs import A4, PageSpec, build_pdf, encrypted_pdf, image_only_pdf
+from tests.adapters.ocr.pdfs import (
+    A4,
+    PageSpec,
+    build_pdf,
+    declare_page_count,
+    encrypted_pdf,
+    image_only_pdf,
+)
 
 COMBINED = "eng+spa+por+fra+deu"
 SPANISH = (
@@ -74,6 +82,7 @@ class TestConfig:
         assert config.timeout_s == 60.0
         assert config.workers is None
         assert config.max_page_pixels == 40_000_000
+        assert config.max_pages == 50
         assert config.tesseract_cmd == "tesseract"
 
     def test_default_runner_is_built_from_the_config(self) -> None:
@@ -106,6 +115,11 @@ class TestConfig:
             ("timeout_s", False),
             ("workers", 0),
             ("max_page_pixels", 0),
+            ("max_pages", 0),
+            ("max_pages", -1),
+            ("max_pages", True),
+            ("max_pages", 1.5),
+            ("max_pages", None),
             ("tesseract_cmd", ""),
             ("tesseract_cmd", "  "),
         ],
@@ -119,10 +133,18 @@ class TestConfig:
 
     def test_valid_non_default_values_are_accepted(self) -> None:
         config = TesseractOcrConfig(
-            dpi=300, flatten=False, psm=6, oem=0, languages=("es",), timeout_s=1, workers=2
+            dpi=300,
+            flatten=False,
+            psm=6,
+            oem=0,
+            languages=("es",),
+            timeout_s=1,
+            workers=2,
+            max_pages=1,
         )
 
         assert config.languages == ("es",)
+        assert config.max_pages == 1
 
 
 class TestPages:
@@ -235,7 +257,7 @@ class TestFailures:
         runner = FakeTesseract(delay=lambda width: 0.03)
         held: list[int] = []
 
-        def tracking(png: bytes, languages: str) -> str:
+        def tracking(png: bytes, languages: str, *, cancel: Cancellation = NEVER_CANCELLED) -> str:
             with lock:
                 # Pages rendered and not yet finished by OCR, this one included.
                 held.append(len(rendered_pages.indexes) - len(done))
@@ -360,6 +382,56 @@ class TestFailures:
         assert os.listdir(work_dir) == []
 
 
+class TestPageLimit:
+    def test_one_page_over_the_limit_is_refused_before_any_rendering(
+        self, opened_documents: list[pdfium.PdfDocument], rendered_pages: RenderSpy
+    ) -> None:
+        runner = FakeTesseract()
+
+        with pytest.raises(InvalidInput) as caught:
+            _engine(runner, max_pages=3).recognize(_pages(4), "en")
+
+        assert caught.value.code == "too_many_pages"
+        assert caught.value.message == "the PDF has more than 3 pages; at most 3 are accepted"
+        assert rendered_pages.indexes == []
+        assert runner.calls == []
+        assert [document.raw is None for document in opened_documents] == [True]
+
+    def test_limit_applies_while_detecting_the_language(self, rendered_pages: RenderSpy) -> None:
+        runner = FakeTesseract(lambda languages: SPANISH)
+
+        with pytest.raises(InvalidInput) as caught:
+            _engine(runner, max_pages=3).recognize(_pages(4))
+
+        assert caught.value.code == "too_many_pages"
+        assert rendered_pages.indexes == []
+        assert runner.calls == []
+
+    def test_exactly_the_limit_is_recognised(
+        self, opened_documents: list[pdfium.PdfDocument], rendered_pages: RenderSpy
+    ) -> None:
+        runner = FakeTesseract()
+
+        pages = _engine(runner, max_pages=3).recognize(_pages(3), "en")
+
+        assert [page.page for page in pages] == [0, 1, 2]
+        assert rendered_pages.indexes == [0, 1, 2]
+        assert runner.calls == ["eng"] * 3
+        assert [document.raw is None for document in opened_documents] == [True]
+
+    def test_default_limit_refuses_51_pages(self, rendered_pages: RenderSpy) -> None:
+        runner = FakeTesseract()
+        pdf = build_pdf([PageSpec(lines=()) for _ in range(51)])
+
+        with pytest.raises(InvalidInput) as caught:
+            TesseractOcrEngine(runner=runner).recognize(pdf, "en")
+
+        assert caught.value.code == "too_many_pages"
+        assert caught.value.message == ("the PDF has more than 50 pages; at most 50 are accepted")
+        assert rendered_pages.indexes == []
+        assert runner.calls == []
+
+
 class TestLanguage:
     def test_hint_reads_every_page_with_that_model_only(self) -> None:
         runner = FakeTesseract(lambda languages: SPANISH)
@@ -462,3 +534,224 @@ class TestLanguage:
         _engine(runner, languages=("en", "es")).recognize(_pages(2))
 
         assert runner.calls == ["eng+spa", "eng+spa"]
+
+
+class TestDeclaredPageCount:
+    def test_one_page_declaring_a_million_pages_is_recognised(
+        self, opened_documents: list[pdfium.PdfDocument], rendered_pages: RenderSpy
+    ) -> None:
+        runner = FakeTesseract()
+        pdf = declare_page_count(_pages(1), 1_000_000)
+
+        pages = TesseractOcrEngine(FAST, runner=runner).recognize(pdf, "en")
+
+        assert [page.page for page in pages] == [0]
+        assert pages[0].words[0].text == "eng:200"
+        assert rendered_pages.indexes == [0]
+        assert runner.calls == ["eng"]
+        assert [document.raw is None for document in opened_documents] == [True]
+
+    def test_overstated_document_is_recognised_while_detecting_the_language(
+        self, rendered_pages: RenderSpy
+    ) -> None:
+        runner = FakeTesseract(lambda languages: SPANISH)
+        pdf = declare_page_count(_pages(2), 1_000_000)
+
+        pages = _engine(runner).recognize(pdf)
+
+        assert [page.page for page in pages] == [0, 1]
+        assert [page.language for page in pages] == ["es", "es"]
+        assert sorted(set(rendered_pages.indexes)) == [0, 1]
+
+    def test_a_real_5000_page_document_is_refused_fast_without_rendering(
+        self, five_thousand_pages: bytes, rendered_pages: RenderSpy
+    ) -> None:
+        runner = FakeTesseract()
+
+        started = time.monotonic()
+        with pytest.raises(InvalidInput) as caught:
+            TesseractOcrEngine(runner=runner).recognize(five_thousand_pages, "en")
+        elapsed = time.monotonic() - started
+
+        assert caught.value.code == "too_many_pages"
+        assert rendered_pages.indexes == []
+        assert runner.calls == []
+        assert elapsed < 1.0
+
+
+class _CancellingRunner:
+    """Wraps a ``FakeTesseract`` and cancels ``cancel`` around call number ``on_call``.
+
+    By default the token is cancelled when that call starts (the fake then stops at once, as
+    ``TesseractCli`` does); with ``after_answer`` it is cancelled once that call has answered.
+    ``cancelled_at`` is the ``time.monotonic()`` of the cancellation.
+    """
+
+    def __init__(
+        self,
+        runner: FakeTesseract,
+        cancel: Cancellation,
+        on_call: int,
+        *,
+        after_answer: bool = False,
+    ) -> None:
+        self._runner = runner
+        self._cancel = cancel
+        self._on_call = on_call
+        self._after_answer = after_answer
+        self._lock = threading.Lock()
+        self._started = 0
+        self.cancelled_at: float | None = None
+
+    def __call__(
+        self, png: bytes, languages: str, *, cancel: Cancellation = NEVER_CANCELLED
+    ) -> str:
+        with self._lock:
+            self._started += 1
+            number = self._started
+        if number == self._on_call and not self._after_answer:
+            self._cancel_now()
+        result = self._runner(png, languages, cancel=cancel)
+        if number == self._on_call and self._after_answer:
+            self._cancel_now()
+        return result
+
+    def _cancel_now(self) -> None:
+        self.cancelled_at = time.monotonic()
+        self._cancel.cancel()
+
+
+def _no_tesseract_threads() -> bool:
+    return not [thread for thread in threading.enumerate() if thread.name.startswith("tesseract")]
+
+
+def _recognize(
+    runner: _CancellingRunner,
+    cancel: Cancellation,
+    pdf: bytes,
+    language: str | None,
+    **options: Any,
+) -> float:
+    """Recognise ``pdf`` expecting ``request_cancelled``; return the cancel-to-raise seconds."""
+    engine = TesseractOcrEngine(dataclasses.replace(FAST, **options), runner=runner)
+    with pytest.raises(ProcessingFailed) as caught:
+        engine.recognize(pdf, language, cancel=cancel)
+    raised_at = time.monotonic()
+    assert caught.value.code == "request_cancelled"
+    assert runner.cancelled_at is not None
+    return raised_at - runner.cancelled_at
+
+
+class TestCancellation:
+    def test_a_cancelled_token_stops_before_anything_is_rendered(
+        self, opened_documents: list[pdfium.PdfDocument], rendered_pages: RenderSpy
+    ) -> None:
+        runner = FakeTesseract()
+        cancel = Cancellation()
+        cancel.cancel()
+
+        for language in ("en", None):
+            with pytest.raises(ProcessingFailed) as caught:
+                _engine(runner).recognize(_pages(3), language, cancel=cancel)
+            assert caught.value.code == "request_cancelled"
+
+        assert rendered_pages.indexes == []
+        assert runner.calls == []
+        assert [document.raw is None for document in opened_documents] == [True, True]
+
+    def test_cancelled_during_a_page_stops_it_at_once_and_starts_no_later_page(
+        self, opened_documents: list[pdfium.PdfDocument], rendered_pages: RenderSpy
+    ) -> None:
+        cancel = Cancellation()
+        fake = FakeTesseract(delay=lambda width: 0.05 if width == 200 else 2.0)
+        runner = _CancellingRunner(fake, cancel, on_call=2)  # page 1
+
+        latency = _recognize(runner, cancel, _pages(6), "en", workers=1)
+
+        assert fake.widths == [200, 210]  # page 2 and later never reached Tesseract
+        assert fake.finished == [200]
+        assert fake.stopped == [210]  # the page in progress was stopped, not read to the end
+        assert latency < 0.5  # far below the 2 s the page would have taken
+        assert len(rendered_pages.indexes) <= 3  # pages 0 and 1, at most one queued behind
+        assert [document.raw is None for document in opened_documents] == [True]
+        assert _no_tesseract_threads()
+
+    def test_parallel_workers_are_all_stopped_and_leave_nothing_running(
+        self, rendered_pages: RenderSpy
+    ) -> None:
+        cancel = Cancellation()
+        fake = FakeTesseract(delay=lambda width: 2.0)
+        runner = _CancellingRunner(fake, cancel, on_call=4)  # the four workers are busy
+
+        latency = _recognize(runner, cancel, _pages(20), "en", workers=4)
+
+        assert len(fake.widths) == 4
+        assert fake.finished == []
+        assert sorted(fake.stopped) == sorted(fake.widths)
+        assert fake.active == 0
+        assert latency < 0.5
+        assert len(rendered_pages.indexes) <= 8  # the 2 x 4 window
+        assert _no_tesseract_threads()
+
+    def test_cancelled_after_the_last_page_was_handed_over_stops_it_too(self) -> None:
+        cancel = Cancellation()
+        fake = FakeTesseract(delay=lambda width: 0.05 if width < 220 else 2.0)
+        runner = _CancellingRunner(fake, cancel, on_call=3)  # page 2, the last one
+
+        latency = _recognize(runner, cancel, _pages(3), "en", workers=1)
+
+        assert fake.finished == [200, 210]
+        assert fake.stopped == [220]
+        assert latency < 0.5
+        assert _no_tesseract_threads()
+
+    def test_cancelled_once_every_page_is_read_returns_no_result(self) -> None:
+        cancel = Cancellation()
+        fake = FakeTesseract()
+        runner = _CancellingRunner(fake, cancel, on_call=3, after_answer=True)
+
+        _recognize(runner, cancel, _pages(3), "en", workers=1)
+
+        assert sorted(fake.finished) == [200, 210, 220]
+
+    def test_cancelled_while_detecting_reads_no_further_page(self) -> None:
+        cancel = Cancellation()
+        fake = FakeTesseract(lambda languages: NO_STOP_WORDS, delay=lambda width: 2.0)
+        runner = _CancellingRunner(fake, cancel, on_call=1)
+
+        latency = _recognize(runner, cancel, _pages(4), None)
+
+        assert fake.calls == [COMBINED]
+        assert fake.stopped == [200]
+        assert latency < 0.5
+
+    def test_cancelled_after_detection_stops_the_second_reading(self) -> None:
+        cancel = Cancellation()
+        fake = FakeTesseract(lambda languages: SPANISH, delay=lambda width: 0.02)
+        runner = _CancellingRunner(fake, cancel, on_call=2)  # the first Spanish page
+
+        _recognize(runner, cancel, _pages(4), None, workers=1)
+
+        assert fake.calls == [COMBINED, "spa"]
+        assert fake.stopped == [200]
+        assert _no_tesseract_threads()
+
+    def test_a_page_failure_is_reported_even_when_the_job_is_cancelled(self) -> None:
+        cancel = Cancellation()
+        fake = FakeTesseract(fail_width=200)
+        runner = _CancellingRunner(fake, cancel, on_call=1, after_answer=True)
+        engine = TesseractOcrEngine(dataclasses.replace(FAST, workers=1), runner=runner)
+
+        with pytest.raises(ProcessingFailed) as caught:
+            engine.recognize(_pages(3), "en", cancel=cancel)
+
+        assert caught.value.code in {"ocr_failed", "request_cancelled"}
+        assert fake.widths == [200]
+        assert _no_tesseract_threads()
+
+    def test_a_live_token_reads_every_page(self) -> None:
+        pages = _engine(FakeTesseract(), workers=2).recognize(
+            _pages(5), "en", cancel=Cancellation()
+        )
+
+        assert [page.page for page in pages] == list(range(5))

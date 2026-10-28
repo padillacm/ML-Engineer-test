@@ -18,6 +18,7 @@ KNOWN_CODES: frozenset[str] = frozenset(
         "too_large",
         "too_many_pages",
         "invalid_names",
+        "invalid_question",
         "unsupported_language",
         "ocr_failed",
         "ner_failed",
@@ -26,8 +27,10 @@ KNOWN_CODES: frozenset[str] = frozenset(
         "llm_timeout",
         "vector_store_unavailable",
         "vector_store_timeout",
+        "service_busy",
         "incompatible_embedding",
         "geometry_error",
+        "request_cancelled",
         "invalid_configuration",
     }
 )

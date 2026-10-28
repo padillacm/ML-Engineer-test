@@ -7,6 +7,7 @@ import pytest
 
 from app.adapters.ocr import TesseractOcrConfig, TesseractOcrEngine
 from app.adapters.ocr.tesseract import TesseractCli
+from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from tests.adapters.ocr.pdfs import A4, PageSpec, image_only_pdf
 from tests.integration.known_words import normalise
 
@@ -78,10 +79,12 @@ class RecordingCli:
         self._lock = threading.Lock()
         self.models: list[str] = []
 
-    def __call__(self, png: bytes, languages: str) -> str:
+    def __call__(
+        self, png: bytes, languages: str, *, cancel: Cancellation = NEVER_CANCELLED
+    ) -> str:
         with self._lock:
             self.models.append(languages)
-        return self._cli(png, languages)
+        return self._cli(png, languages, cancel=cancel)
 
 
 def _recording_engine() -> tuple[TesseractOcrEngine, RecordingCli]:

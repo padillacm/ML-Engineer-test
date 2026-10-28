@@ -6,6 +6,7 @@ from collections.abc import Sequence
 import pytest
 
 from app.application.extract_names import ExtractNames
+from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from app.domain.errors import ConfigurationError, ProcessingFailed
 from app.domain.geometry import union
 from app.domain.types import Box, NamePair, OcrPage, PageWord, TextSpan
@@ -254,7 +255,13 @@ class _FailingOcr:
     def __init__(self, error: Exception) -> None:
         self.error = error
 
-    def recognize(self, pdf: bytes, language: str | None = None) -> list[OcrPage]:
+    def recognize(
+        self,
+        pdf: bytes,
+        language: str | None = None,
+        *,
+        cancel: Cancellation = NEVER_CANCELLED,
+    ) -> list[OcrPage]:
         raise self.error
 
 
@@ -282,5 +289,65 @@ def test_recognizer_errors_propagate_unchanged() -> None:
 
     with pytest.raises(RuntimeError) as raised:
         use_case(b"%PDF", [])
+
+    assert raised.value is error
+
+
+# --- cancellation -------------------------------------------------------------------------
+
+
+class _CancellingRecognizer(FakeNameRecognizer):
+    """Cancels ``cancel`` while it reads the first page, as a client leaving mid-job would."""
+
+    def __init__(self, names: Sequence[str], cancel: Cancellation) -> None:
+        super().__init__(names)
+        self._cancel = cancel
+
+    def find_persons(self, text: str) -> list[TextSpan]:
+        self._cancel.cancel()
+        return super().find_persons(text)
+
+
+def test_the_token_is_passed_to_the_ocr_engine() -> None:
+    use_case, ocr, _ = extract([make_page(0, ["Maria Gonzalez"])], ["Maria Gonzalez"])
+    cancel = Cancellation()
+
+    use_case(b"%PDF", [], cancel=cancel)
+    use_case(b"%PDF", [])
+
+    assert ocr.cancels == [cancel, NEVER_CANCELLED]
+
+
+def test_cancelled_before_ocr_raises_and_reads_no_page() -> None:
+    use_case, _, recognizer = extract([make_page(0, ["Maria Gonzalez"])], ["Maria Gonzalez"])
+    cancel = Cancellation()
+    cancel.cancel()
+
+    with pytest.raises(ProcessingFailed) as raised:
+        use_case(b"%PDF", [NamePair("Maria", "Gonzalez")], cancel=cancel)
+
+    assert raised.value.code == "request_cancelled"
+    assert recognizer.calls == []
+
+
+def test_cancelled_while_a_page_is_read_stops_before_the_next_page() -> None:
+    pages = [make_page(index, [f"Maria Gonzalez page {index}"]) for index in range(3)]
+    cancel = Cancellation()
+    recognizer = _CancellingRecognizer(["Maria Gonzalez"], cancel)
+    use_case = ExtractNames(FakeOcrEngine(pages), recognizer)
+
+    with pytest.raises(ProcessingFailed) as raised:
+        use_case(b"%PDF", [NamePair("Maria", "Gonzalez")], cancel=cancel)
+
+    assert raised.value.code == "request_cancelled"
+    assert len(recognizer.calls) == 1  # the page in progress finished; no later page was read
+
+
+def test_ocr_cancellation_propagates_unchanged() -> None:
+    error = ProcessingFailed("the request was cancelled", code="request_cancelled")
+    use_case = ExtractNames(_FailingOcr(error), FakeNameRecognizer())
+
+    with pytest.raises(ProcessingFailed) as raised:
+        use_case(b"%PDF", [], cancel=Cancellation())
 
     assert raised.value is error

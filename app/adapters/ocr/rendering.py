@@ -4,17 +4,35 @@ PDFium (through ``pypdfium2``, BSD-3-Clause / Apache-2.0) is used instead of PyM
 AGPL-3.0 licence would reach a network service.
 
 Thread safety: PDFium is not thread-safe, not even across different documents, so every PDFium
-call made here (opening, loading pages, rendering and closing) runs while holding the
-module-level ``PDFIUM_LOCK``. Several requests may therefore render from different threads; only
-numpy arrays, bytes and ``PageRaster`` values leave the lock. Every PDFium object (document,
-page, bitmap) is closed explicitly inside the lock, never left to the garbage collector, whose
-finalizers could run on another thread. Code elsewhere in the process that uses pypdfium2 must
-take the same lock.
+call made here (opening, looking up page sizes, loading and rendering pages, closing) runs
+while holding the module-level ``PDFIUM_LOCK``. Several requests may therefore render from
+different threads; only numpy arrays, bytes and ``PageRaster`` values leave the lock. Every
+PDFium object (document, page, bitmap) is closed explicitly inside the lock, never left to the
+garbage collector, whose finalizers could run on another thread. Code elsewhere in the process
+that uses pypdfium2 must take the same lock.
 
 Damaged files: PDFium refuses to load a truncated file (no usable cross-reference data) instead
 of inventing pages, and loads a file whose cross-reference offsets are wrong but whose objects
-are intact. Every page is loaded once when the document is opened, so a page-tree entry that is
-missing or is not a page dictionary fails the whole PDF with ``pdf_unreadable`` before any OCR.
+are intact.
+
+Page count: PDFium reports the ``/Count`` the page tree declares, which a damaged or hostile
+file can overstate, so the count is verified when the document is opened, with one rule for
+every document. A page is checked by reading its displayed size from its page dictionary
+(``FPDF_GetPageSizeByIndexF``): the page is found in the tree exactly as ``FPDF_LoadPage``
+finds it and its size is computed by the same code (boxes and ``/Rotate``, inherited ones
+included), but its content stream is never parsed, so a check costs microseconds however heavy
+the page's content is. When the declared count is over ``max_pages``, page index ``max_pages``
+is checked first: if it exists, the document is too long. If it does not, the last declared
+page is checked too: if that one exists, a missing page is followed by a readable one and the
+PDF is ``pdf_unreadable`` (never cut to its first ``max_pages`` pages). Then pages
+``0 .. min(declared, max_pages) - 1`` are all checked. The document is the run of pages from 0
+up to the first that does not exist, provided no later page in that range exists; a page that
+fails with a later one existing (a damaged page in the middle) fails the whole PDF with
+``pdf_unreadable``, so pages are never silently dropped from the middle. Pages missing at the
+end of the tree cannot be told apart from an overstated ``/Count`` through PDFium and are
+dropped; so is a longer document whose page ``max_pages`` and last declared page are both
+missing. At most ``max_pages + 2`` pages are checked. Every later step uses that verified count
+(``PdfFile.page_count``), never PDFium's.
 
 Coordinates: pages are rendered as displayed, after ``/Rotate`` and relative to the CropBox, and
 the page size is the displayed size in points (PDFium reports it already rotated), so
@@ -77,17 +95,22 @@ class PdfFile:
 
 
 @contextmanager
-def open_pdf(pdf: bytes) -> Iterator[PdfFile]:
+def open_pdf(pdf: bytes, max_pages: int | None = None) -> Iterator[PdfFile]:
     """Open ``pdf`` from memory and close it on exit, whatever happens inside the block.
 
     Raises ``InvalidInput`` (code ``pdf_unreadable``) when the bytes are not a readable PDF
-    (corrupt or truncated), when it is password protected, when it has no pages or when one of
-    its pages cannot be loaded.
+    (corrupt or truncated), when it is password protected, when no page exists, or when a page
+    is missing or damaged while a later one exists. With ``max_pages``, a document whose page
+    index ``max_pages`` exists raises ``InvalidInput`` (code ``too_many_pages``) after that
+    single check, before any other page is checked. The page count is verified as described in
+    the module notes, without loading any page (at most ``max_pages + 2`` size lookups; without
+    ``max_pages`` every declared page is looked up). The document is closed before any error
+    leaves.
     """
     with PDFIUM_LOCK:
         document = _load(pdf)
         try:
-            sizes = _page_sizes(document)
+            sizes = _verified_page_sizes(document, max_pages)
         except BaseException:
             document.close()
             raise
@@ -107,24 +130,62 @@ def _load(pdf: bytes) -> pdfium.PdfDocument:
         raise InvalidInput("the file cannot be opened as a PDF", _UNREADABLE) from error
 
 
-def _page_sizes(document: pdfium.PdfDocument) -> tuple[tuple[float, float], ...]:
-    count = len(document)
-    if count == 0:
-        raise InvalidInput("the PDF has no pages", _UNREADABLE)
+def _verified_page_sizes(
+    document: pdfium.PdfDocument, max_pages: int | None
+) -> tuple[tuple[float, float], ...]:
+    """The sizes of the pages the document really holds (see the module notes)."""
+    declared = len(document)
+    checked = declared if max_pages is None else min(declared, max_pages)
+    later_page_exists = checked < declared and _exists_beyond_limit(document, checked, declared)
     sizes: list[tuple[float, float]] = []
-    for index in range(count):
-        try:
-            page = document[index]
-        except _PDFIUM_ERRORS as error:
-            raise InvalidInput(
-                f"page {index} of the PDF is missing or damaged", _UNREADABLE
-            ) from error
-        try:
-            width, height = page.get_size()
-        finally:
-            page.close()
-        sizes.append((float(width), float(height)))
+    first_missing: int | None = None
+    for index in range(checked):
+        size = _page_size(document, index)
+        if size is None:
+            if first_missing is None:
+                first_missing = index
+        elif first_missing is not None:
+            raise _missing_page(first_missing)
+        else:
+            sizes.append(size)
+    if later_page_exists:
+        raise _missing_page(checked if first_missing is None else first_missing)
+    if not sizes:
+        raise InvalidInput("the PDF has no pages", _UNREADABLE)
     return tuple(sizes)
+
+
+def _exists_beyond_limit(document: pdfium.PdfDocument, limit: int, declared: int) -> bool:
+    """Whether the last declared page exists, given ``declared > limit``.
+
+    Raises ``too_many_pages`` when page index ``limit`` exists. When it does not, a later
+    existing page means the document goes on after a missing page.
+    """
+    if _page_size(document, limit) is not None:
+        raise InvalidInput(
+            f"the PDF has more than {limit} pages; at most {limit} are accepted",
+            "too_many_pages",
+        )
+    last = declared - 1
+    return last > limit and _page_size(document, last) is not None
+
+
+def _missing_page(index: int) -> InvalidInput:
+    return InvalidInput(f"page {index} of the PDF is missing or damaged", _UNREADABLE)
+
+
+def _page_size(document: pdfium.PdfDocument, index: int) -> tuple[float, float] | None:
+    """The displayed size of page ``index`` in points, or ``None`` when it does not exist.
+
+    ``FPDF_GetPageSizeByIndexF`` finds the page and computes its size like ``FPDF_LoadPage``
+    followed by ``FPDF_GetPageWidthF``/``HeightF`` (same tree lookup, same box and rotation
+    handling) but never parses the content stream.
+    """
+    try:
+        width, height = document.get_page_size(index)
+    except _PDFIUM_ERRORS:
+        return None
+    return float(width), float(height)
 
 
 def render_pages(

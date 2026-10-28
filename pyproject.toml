@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "ML Engineer take-home — document extraction + RAG service (implement from scratch)."
 requires-python = ">=3.12"
 
-# Only what the code imports or runs today. Each adapter block adds its own
-# dependencies (OCR, NER, embeddings, vector store, LLM client, settings, forms) together
-# with the adapter that uses them.
+# Only what the code imports or runs. Each block added its own dependencies together with the
+# code that uses them: OCR, NER, embeddings, vector store and LLM client (adapters), settings
+# (pydantic-settings, app/settings.py), multipart forms (python-multipart, which FastAPI
+# needs to read the upload endpoints' forms) and anyio (app/api runs blocking work on its own
+# thread limiters; already installed through Starlette, declared because app/api imports it).
 dependencies = [
     "fastapi",
     "uvicorn[standard]",
@@ -30,6 +32,9 @@ dependencies = [
     # (the adapter uses the REST/HTTP path). LLM: one httpx client for OpenAI-compatible APIs.
     "qdrant-client>=1.20,<2",
     "httpx>=0.28,<1",
+    "pydantic-settings>=2.11,<3",
+    "python-multipart>=0.0.20",
+    "anyio>=4.5,<5",
 ]
 
 [project.optional-dependencies]
@@ -82,8 +87,8 @@ filterwarnings = [
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-# app/services is the original skeleton, to be replaced (app/api and app/main.py lint clean).
-extend-exclude = ["app/services", "benchmarks", ".claude"]
+# benchmarks/ holds measurement scripts, not service code.
+extend-exclude = ["benchmarks", ".claude"]
 
 [tool.ruff.lint]
 # E722 bare except, BLE001 blind except, S110/S112 silent try-except-pass/continue.
@@ -118,17 +123,22 @@ warn_redundant_casts = true
 # PyMuPDF (tests only) ships py.typed but leaves some constructors (e.g. ``Document``)
 # unannotated.
 untyped_calls_exclude = ["pymupdf"]
-# Original skeleton, to be replaced in later blocks.
 exclude = [
-    '^app/services/',
-    '^app/api/',
-    '^app/main\.py$',
     '^benchmarks/',
     '^\.claude/',
 ]
 
 [[tool.mypy.overrides]]
-module = ["app.domain.*", "app.application.*", "app.adapters.*"]
+module = [
+    "app.domain.*",
+    "app.application.*",
+    "app.adapters.*",
+    "app.api.*",
+    "app.main",
+    "app.bootstrap",
+    "app.settings",
+    "app.observability",
+]
 strict = true
 
 [[tool.mypy.overrides]]
@@ -137,7 +147,7 @@ module = ["pypdfium2", "pypdfium2.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]
-source = ["app/domain", "app/application", "app/adapters"]
+source = ["app"]
 branch = true
 
 [tool.coverage.report]

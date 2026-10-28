@@ -24,6 +24,7 @@ from app.adapters.ocr import TesseractOcrEngine
 from app.adapters.vector_store import QdrantStoreConfig, QdrantVectorStore
 from app.application.ask_question import DEFAULT_THRESHOLD, AskQuestion
 from app.application.ingest_document import IngestDocument
+from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from app.domain.prompting import REFUSAL, SYSTEM_PROMPT, select_context, shown_sources
 from app.domain.types import IngestResult, OcrPage, SearchHit
 from tests.adapters.ocr.pdfs import A4
@@ -53,9 +54,15 @@ class CountingOcr:
         self._engine = engine
         self.calls = 0
 
-    def recognize(self, pdf: bytes, language: str | None = None) -> list[OcrPage]:
+    def recognize(
+        self,
+        pdf: bytes,
+        language: str | None = None,
+        *,
+        cancel: Cancellation = NEVER_CANCELLED,
+    ) -> list[OcrPage]:
         self.calls += 1
-        return self._engine.recognize(pdf, language)
+        return self._engine.recognize(pdf, language, cancel=cancel)
 
 
 @pytest.fixture(scope="module")

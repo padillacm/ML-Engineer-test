@@ -5,9 +5,14 @@ from collections.abc import Sequence
 import pytest
 
 from app.application.ask_question import AskQuestion
-from app.domain.errors import ConfigurationError, DependencyTimeout, DependencyUnavailable
+from app.domain.errors import (
+    ConfigurationError,
+    DependencyTimeout,
+    DependencyUnavailable,
+    InvalidInput,
+)
 from app.domain.prompting import REFUSAL, REFUSAL_SENTINEL, SYSTEM_PROMPT
-from app.domain.types import Chunk
+from app.domain.types import Chunk, EmbeddingIdentity, SearchHit
 from tests.fakes.embedder import FakeEmbedder
 from tests.fakes.llm import FakeLLMClient
 from tests.fakes.vector_store import FakeVectorStore
@@ -275,15 +280,53 @@ def test_store_failure_propagates() -> None:
         ask("Who signed the contract?")
 
 
-@pytest.mark.parametrize("question", ["", "   \n"])
-def test_blank_question_is_rejected_before_any_port_call(question: str) -> None:
-    ask, embedder, _, llm = build()
+class _RecordingStore(FakeVectorStore):
+    """Records the name of every port method called on it."""
 
-    with pytest.raises(ValueError, match="blank"):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+
+    def ensure_collection(self, identity: EmbeddingIdentity) -> None:
+        self.calls.append("ensure_collection")
+        super().ensure_collection(identity)
+
+    def search(self, vector: Sequence[float], top_k: int) -> list[SearchHit]:
+        self.calls.append("search")
+        return super().search(vector, top_k)
+
+
+@pytest.mark.parametrize("question", ["", "   \n", "\t  "])
+def test_blank_question_is_rejected_before_any_port_call(question: str) -> None:
+    embedder, store, llm = FakeEmbedder(), _RecordingStore(), FakeLLMClient(default="unused")
+    ask = AskQuestion(embedder, store, llm)
+
+    with pytest.raises(InvalidInput) as caught:
         ask(question)
 
+    assert caught.value.code == "invalid_question"
+    assert caught.value.message == "question must not be blank"
     assert embedder.query_calls == []
+    assert embedder.passage_calls == []
+    assert store.calls == []
     assert llm.calls == []
+
+
+def test_recording_store_sees_the_calls_of_a_real_question() -> None:
+    store = _RecordingStore()
+
+    AskQuestion(FakeEmbedder(), store, FakeLLMClient(default="unused"))("Who signed?")
+
+    assert store.calls == ["ensure_collection", "search"]
+
+
+def test_blank_question_is_not_a_plain_value_error() -> None:
+    ask, _, _, _ = build()
+
+    with pytest.raises(InvalidInput) as caught:
+        ask("\t  ")
+
+    assert not isinstance(caught.value, ValueError)
 
 
 @pytest.mark.parametrize(

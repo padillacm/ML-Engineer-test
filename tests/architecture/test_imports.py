@@ -1,4 +1,6 @@
-"""The core imports no vendor library and no outer layer (spec: architecture-boundaries).
+"""The core imports no vendor library and no outer layer, the HTTP layer only the framework,
+the use cases and core types, and only the composition root imports adapters (spec:
+architecture-boundaries).
 
 The scan is static: dynamic imports (``importlib``, ``__import__``) are not detected.
 """
@@ -12,13 +14,26 @@ from tests.architecture.scan import Violation, collect_imports, find_violations,
 APP = Path(__file__).resolve().parents[2] / "app"
 DOMAIN = APP / "domain"
 APPLICATION = APP / "application"
+API = APP / "api"
 OUTER_LAYERS = (
     "app.adapters",
     "app.models",
     "app.api",
-    "app.services",
+    "app.bootstrap",
     "app.main",
+    "app.settings",
+    "app.observability",
 )
+API_THIRD_PARTY = frozenset({"fastapi", "starlette", "pydantic", "anyio"})
+API_INTERNAL = (
+    "app.api",
+    "app.application",
+    "app.domain",
+    "app.models",
+    "app.settings",
+    "app.observability",
+)
+COMPOSITION_ROOT = APP / "bootstrap.py"
 
 
 def _report(violations: list[Violation]) -> str:
@@ -92,3 +107,37 @@ def test_core_does_not_import_outer_layers(directory: Path, name: str) -> None:
         imp for imp in collect_imports(directory, name) if is_under(imp.module, OUTER_LAYERS)
     ]
     assert not offenders, f"{name} imports an outer layer:\n{_report(offenders)}"
+
+
+def test_api_imports_only_the_framework_use_cases_and_core() -> None:
+    violations = find_violations(API, "app.api", API_THIRD_PARTY, API_INTERNAL)
+    assert not violations, f"app/api has forbidden imports:\n{_report(violations)}"
+
+
+def test_api_guard_reports_an_adapter_or_vendor_import(tmp_path: Path) -> None:
+    (tmp_path / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "router.py").write_text(
+        "from fastapi import APIRouter\n"
+        "from app.application.extract_names import ExtractNames\n"
+        "from app.adapters.ocr.engine import TesseractOcrEngine\n"
+        "import torch\n"
+        "from app.bootstrap import build_container\n",
+        encoding="utf-8",
+    )
+
+    violations = find_violations(tmp_path, "app.api", API_THIRD_PARTY, API_INTERNAL)
+
+    assert [(v.file.name, v.line, v.module) for v in violations] == [
+        ("router.py", 3, "app.adapters.ocr.engine"),
+        ("router.py", 4, "torch"),
+        ("router.py", 5, "app.bootstrap"),
+    ]
+
+
+def test_only_the_composition_root_imports_adapters() -> None:
+    importers = {
+        imp.file
+        for imp in collect_imports(APP, "app")
+        if is_under(imp.module, ("app.adapters",)) and not imp.file.is_relative_to(APP / "adapters")
+    }
+    assert importers == {COMPOSITION_ROOT}

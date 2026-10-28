@@ -21,7 +21,10 @@ class E5EmbedderConfig:
     Hub commit the files come from; it is recorded in the embedder identity, so vectors of two
     revisions are never mixed in one collection. ``max_length`` is the token limit of one input
     (longer inputs are truncated; an 800-character chunk is about 200 tokens), ``batch_size`` the
-    number of texts run together, ``threads`` the torch intra-op thread count. ``max_chars``
+    number of texts run together, ``threads`` the torch intra-op thread count (process-wide:
+    creating the embedder sets it for every torch computation in the process, and the last torch
+    adapter created wins, so the service passes the one ``TORCH_THREADS`` to the embedder and the
+    recogniser; the field stays for standalone use by benchmarks and scripts). ``max_chars``
     bounds one text: a longer one is refused without running the model, because it would be
     truncated anyway and its tokenisation holds the embedder's lock. Invalid values raise
     ``ConfigurationError``.

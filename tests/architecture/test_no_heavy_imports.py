@@ -1,4 +1,4 @@
-"""Importing the core must not load any heavy or vendor module."""
+"""Importing the core, or the HTTP layer, must not load any heavy or vendor module."""
 
 import json
 import subprocess
@@ -45,3 +45,31 @@ def test_core_import_loads_no_heavy_module() -> None:
     assert result.returncode == 0, result.stderr
     offenders = json.loads(result.stdout.strip().splitlines()[-1])
     assert not offenders, f"importing app.domain / app.application loaded: {offenders}"
+
+
+API_SCRIPT = """
+import importlib
+import json
+import pkgutil
+import sys
+
+import app.api
+
+for info in pkgutil.walk_packages(app.api.__path__, "app.api."):
+    importlib.import_module(info.name)
+vendor = ("torch", "transformers", "qdrant_client", "httpx", "pypdfium2", "PIL", "numpy", "grpc")
+print(json.dumps(sorted(m for m in vendor if m in sys.modules)))
+"""
+
+
+def test_api_import_loads_no_vendor_module() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", API_SCRIPT],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    offenders = json.loads(result.stdout.strip().splitlines()[-1])
+    assert not offenders, f"importing app.api loaded: {offenders}"

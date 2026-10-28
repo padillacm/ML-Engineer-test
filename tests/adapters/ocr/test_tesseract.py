@@ -2,12 +2,16 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
 
+from app.adapters.ocr import tesseract
 from app.adapters.ocr.tesseract import TesseractCli, parse_tsv
+from app.domain.cancellation import Cancellation
 from app.domain.errors import ProcessingFailed
 from app.domain.geometry import PageRaster
 from app.domain.types import Box, PageWord
@@ -189,7 +193,7 @@ class FakePopen:
         self,
         args: list[str],
         *,
-        answers: list[tuple[bytes, bytes] | BaseException],
+        answers: list[Any],
         returncode: int = 0,
         **kwargs: Any,
     ) -> None:
@@ -202,6 +206,7 @@ class FakePopen:
         self.inputs: list[bytes | None] = []
         self.timeouts: list[float | None] = []
         self.killed = False
+        self.terminated = False
         self.waited = False
         self.stdin = FakeStream()
         self.stdout = FakeStream()
@@ -220,13 +225,22 @@ class FakePopen:
         self.inputs.append(input)
         self.timeouts.append(timeout)
         answer = self.answers.pop(0)
+        if callable(answer):  # computes the answer, e.g. after cancelling a token
+            answer = answer(timeout)
         if isinstance(answer, BaseException):
             raise answer
         self.returncode = self.final_returncode
-        return answer
+        output: tuple[bytes, bytes] = answer
+        return output
 
     def kill(self) -> None:
         self.killed = True
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def poll(self) -> int | None:
+        return self.returncode
 
     def wait(self) -> int:
         self.waited = True
@@ -353,3 +367,123 @@ class TestTesseractCli:
 
         assert caught.value.code == "ocr_failed"
         assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+
+
+class TestTesseractCliCancellation:
+    """A cancellable token is watched while Tesseract runs; once set the process is stopped."""
+
+    @pytest.fixture(autouse=True)
+    def short_grace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(tesseract, "CANCEL_GRACE_S", 0.1)
+
+    @staticmethod
+    def _signals(popen: dict[str, Any]) -> list[int]:
+        return [sig for _, sig in popen["killpg"]]
+
+    @staticmethod
+    def _signalled(popen: dict[str, Any], sig: int) -> bool:
+        if sys.platform == "win32":
+            return any(process.killed for process in FakePopen.instances)
+        return sig in TestTesseractCliCancellation._signals(popen)
+
+    def _running_until(
+        self, popen: dict[str, Any], cancel: Cancellation, sig: int, answer: Any
+    ) -> Any:
+        """An answer that cancels ``cancel``, waits until ``sig`` is sent, then gives ``answer``."""
+
+        def run(timeout: float | None) -> Any:
+            cancel.cancel()
+            deadline = time.monotonic() + 2.0
+            while not self._signalled(popen, sig) and time.monotonic() < deadline:
+                time.sleep(0.005)
+            return answer
+
+        return run
+
+    def test_a_cancelled_token_starts_no_process(self, popen: dict[str, Any]) -> None:
+        cancel = Cancellation()
+        cancel.cancel()
+
+        with pytest.raises(ProcessingFailed) as caught:
+            _cli()(PNG, "eng", cancel=cancel)
+
+        assert caught.value.code == "request_cancelled"
+        assert FakePopen.instances == []
+
+    @pytest.mark.parametrize("live", [True, False], ids=["live-token", "default-token"])
+    def test_without_cancellation_the_output_is_returned_after_one_wait(
+        self, popen: dict[str, Any], live: bool
+    ) -> None:
+        popen["answers"] = [(b"tsv", b"")]
+        options = {"cancel": Cancellation()} if live else {}
+
+        assert _cli()(PNG, "eng", **options) == "tsv"
+
+        (process,) = FakePopen.instances
+        assert process.inputs == [PNG]
+        assert process.timeouts == [12.5]
+        assert popen["killpg"] == []
+        assert not [t for t in threading.enumerate() if t.name == "ocr-cancel-watch"]
+
+    def test_cancelling_terminates_the_process_group_and_raises_request_cancelled(
+        self, popen: dict[str, Any]
+    ) -> None:
+        cancel = Cancellation()
+        popen["answers"] = [self._running_until(popen, cancel, _SIGTERM, (b"", b""))]
+        popen["returncode"] = -15
+
+        started = time.monotonic()
+        with pytest.raises(ProcessingFailed) as caught:
+            _cli()(PNG, "eng", cancel=cancel)
+        elapsed = time.monotonic() - started
+
+        assert caught.value.code == "request_cancelled"
+        assert elapsed < 0.1 + 0.5
+        (process,) = FakePopen.instances
+        assert process.waited
+        if sys.platform != "win32":
+            assert popen["killpg"] == [(FAKE_PID, _SIGTERM)]  # it exited: no SIGKILL
+        assert not [t for t in threading.enumerate() if t.name == "ocr-cancel-watch"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no SIGTERM to ignore")
+    def test_a_process_ignoring_sigterm_is_killed_after_the_grace_period(
+        self, popen: dict[str, Any]
+    ) -> None:
+        cancel = Cancellation()
+        popen["answers"] = [self._running_until(popen, cancel, _SIGKILL, (b"", b""))]
+        popen["returncode"] = -9
+
+        started = time.monotonic()
+        with pytest.raises(ProcessingFailed) as caught:
+            _cli()(PNG, "eng", cancel=cancel)
+        elapsed = time.monotonic() - started
+
+        assert caught.value.code == "request_cancelled"
+        assert self._signals(popen) == [_SIGTERM, _SIGKILL]
+        assert 0.1 <= elapsed < 1.0
+
+    def test_a_timeout_after_the_cancellation_is_reported_as_cancelled(
+        self, popen: dict[str, Any]
+    ) -> None:
+        cancel = Cancellation()
+        popen["answers"] = [self._running_until(popen, cancel, _SIGTERM, _timeout()), (b"", b"")]
+
+        with pytest.raises(ProcessingFailed) as caught:
+            _cli()(PNG, "eng", cancel=cancel)
+
+        assert caught.value.code == "request_cancelled"
+        assert FakePopen.instances[0].killed
+
+    def test_the_timeout_still_applies_with_a_live_token(self, popen: dict[str, Any]) -> None:
+        popen["answers"] = [_timeout(), (b"", b"")]
+
+        with pytest.raises(ProcessingFailed) as caught:
+            _cli()(PNG, "eng", cancel=Cancellation())
+
+        assert caught.value.code == "ocr_failed"
+        assert "12.5" in caught.value.message
+        assert FakePopen.instances[0].killed
+
+
+_SIGTERM = getattr(signal, "SIGTERM", 15)
+_SIGKILL = getattr(signal, "SIGKILL", 9)
