@@ -15,6 +15,7 @@ def test_defaults() -> None:
     assert (config.backoff_base_s, config.backoff_cap_s, config.upsert_batch) == (0.2, 2.0, 128)
     assert config.deadline_s == 20.0
     assert config.api_key is None
+    assert config.ping_timeout_s == 2.0
 
 
 @pytest.mark.parametrize(
@@ -42,6 +43,9 @@ def test_defaults() -> None:
         {"location": ":memory:", "deadline_s": "20"},
         {"location": ":memory:", "upsert_batch": 0},
         {"location": ":memory:", "api_key": ""},
+        {"location": ":memory:", "ping_timeout_s": 0},
+        {"location": ":memory:", "ping_timeout_s": float("inf")},
+        {"location": ":memory:", "ping_timeout_s": True},
     ],
 )
 def test_invalid_values_are_rejected(kwargs: dict[str, Any]) -> None:

@@ -22,8 +22,10 @@ class QdrantStoreConfig:
     ``random() * min(backoff_cap_s, backoff_base_s * 2**n)`` between them. ``deadline_s`` bounds
     the tries of one call: no new try starts once ``deadline_s`` has passed since the first one, so
     a call fails no later than ``deadline_s`` plus one ``timeout_s``. ``upsert_batch`` is the
-    number of points per upsert request. ``api_key`` is never shown by ``repr``. Invalid values
-    raise ``ConfigurationError``.
+    number of points per upsert request. ``ping_timeout_s`` bounds the readiness ping, which uses
+    a client of its own (rounded up to whole seconds too), so a probe against a hung server ends
+    within about that time instead of ``timeout_s``. ``api_key`` is never shown by ``repr``.
+    Invalid values raise ``ConfigurationError``.
     """
 
     url: str | None = None
@@ -36,6 +38,7 @@ class QdrantStoreConfig:
     deadline_s: float = 20.0
     upsert_batch: int = 128
     api_key: str | None = None
+    ping_timeout_s: float = 2.0
 
     def __post_init__(self) -> None:
         _require((self.url is None) != (self.location is None), "set exactly one of url, location")
@@ -61,6 +64,9 @@ class QdrantStoreConfig:
         _require(_is_positive_number(self.deadline_s), "deadline_s must be a finite number > 0")
         _require(_is_positive_int(self.upsert_batch), "upsert_batch must be a positive integer")
         _require(
+            _is_positive_number(self.ping_timeout_s), "ping_timeout_s must be a finite number > 0"
+        )
+        _require(
             self.api_key is None or (isinstance(self.api_key, str) and bool(self.api_key)),
             "api_key must be None or a non-empty string",
         )
@@ -73,7 +79,7 @@ class QdrantStoreConfig:
             f"attempts={self.attempts!r}, backoff_base_s={self.backoff_base_s!r}, "
             f"backoff_cap_s={self.backoff_cap_s!r}, deadline_s={self.deadline_s!r}, "
             f"upsert_batch={self.upsert_batch!r}, "
-            f"api_key={key!r})"
+            f"api_key={key!r}, ping_timeout_s={self.ping_timeout_s!r})"
         )
 
 

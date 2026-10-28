@@ -25,7 +25,9 @@ documents (every point agrees on ``chunk_total`` and there are that many), 0 oth
 
 Every client call goes through ``Retrier`` (see ``retry``): connection errors, timeouts and HTTP
 502/503/504 are retried within an attempt limit and a deadline, other client errors fail at once,
-all as ``DependencyUnavailable`` / ``DependencyTimeout`` with fixed messages.
+all as ``DependencyUnavailable`` / ``DependencyTimeout`` with fixed messages. The readiness ping
+tries once, through a second REST client whose timeout is ``ping_timeout_s``, so a probe of a hung
+server returns within about that time.
 
 Lost collection: when a call on the bound collection fails because the collection no longer
 exists (the server lost its storage, or someone dropped it), the collection is recreated once
@@ -103,6 +105,11 @@ class QdrantVectorStore:
     ) -> None:
         self._config = config
         self._client = client if client is not None else _build_client(config)
+        # The readiness ping has a client of its own with a short timeout, so a probe of a hung
+        # server ends within ``ping_timeout_s``; an injected client (tests) serves both.
+        self._probe_client = (
+            self._client if client is not None or config.url is None else _build_probe(config)
+        )
         self._retrier = Retrier(
             RetryPolicy(
                 config.attempts, config.backoff_base_s, config.backoff_cap_s, config.deadline_s
@@ -110,6 +117,10 @@ class QdrantVectorStore:
             sleep=sleep,
             uniform=uniform,
             clock=clock,
+        )
+        # Readiness probes try once: a down server must not hold a probe for the whole deadline.
+        self._probe = Retrier(
+            RetryPolicy(1, 0.0, 0.0, config.deadline_s), sleep=sleep, uniform=uniform, clock=clock
         )
         self._identity: EmbeddingIdentity | None = None
         self._collection: str | None = None
@@ -130,8 +141,22 @@ class QdrantVectorStore:
         return self._collection
 
     def close(self) -> None:
-        """Release the client's connections."""
-        self._client.close()
+        """Release the connections of the client and of the probe client."""
+        try:
+            self._client.close()
+        finally:
+            if self._probe_client is not self._client:
+                self._probe_client.close()
+
+    def ping(self) -> None:
+        """Check that the server answers, with one request and no retry (readiness probe).
+
+        Lists the collections, which needs no bound collection and writes nothing, through the
+        probe client, whose timeout is ``ping_timeout_s``. Raises ``DependencyUnavailable``
+        (``vector_store_unavailable``) or ``DependencyTimeout`` (``vector_store_timeout``) like
+        every other call.
+        """
+        self._probe.call(self._probe_client.get_collections)
 
     def ensure_collection(self, identity: EmbeddingIdentity) -> None:
         if self._identity is not None:
@@ -334,6 +359,18 @@ def _build_client(config: QdrantStoreConfig) -> QdrantClient:
         api_key=config.api_key,
         timeout=math.ceil(config.timeout_s),
         prefer_grpc=False,
+    )
+
+
+def _build_probe(config: QdrantStoreConfig) -> QdrantClient:
+    """The readiness client: ``ping_timeout_s`` per request, no start-up version check (the
+    main client already runs one)."""
+    return QdrantClient(
+        url=config.url,
+        api_key=config.api_key,
+        timeout=math.ceil(config.ping_timeout_s),
+        prefer_grpc=False,
+        check_compatibility=False,
     )
 
 
