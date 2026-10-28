@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 #
 # Stages:
-#   model - downloads the NER model (Davlan/xlm-roberta-base-ner-hrl) at a pinned revision
+#   model - downloads the NER model (Davlan/xlm-roberta-base-ner-hrl) and the embedding model
+#           (intfloat/multilingual-e5-base), each at a pinned revision with sha256-checked files
 #   base  - Python 3.12 on Debian 13 (trixie) + Tesseract 5 with eng/spa/por/fra/deu + uv
-#           + the NER model at /models (read-only; Hugging Face offline mode)
+#           + both models at /models (read-only; Hugging Face offline mode)
 #   test  - project + dev dependencies; runs the full pytest suite (incl. `tesseract` tests)
 # A `runtime` stage (no dev deps) is added later on top of `base`.
 #
@@ -14,6 +15,9 @@
 # python:3.12-slim-trixie, pinned by digest (resolved 2026-10-27). Debian 13 ships Tesseract 5.5,
 # the version the OCR defaults were benchmarked with; bump tag and digest together.
 ARG PYTHON_IMAGE=python:3.12-slim-trixie@sha256:12316debbfb86890f6b2d825820612741ba527ad5a44e3902759141d572bfe8f
+# Embedding model commit (intfloat/multilingual-e5-base main, resolved 2026-10-27). Global so the
+# `model` stage downloads it and `base` exposes it as EMBEDDING_MODEL_REVISION (model identity).
+ARG E5_MODEL_REVISION=d128750597153bb5987e10b1c3493a34e5a4502a
 
 
 # NER model, downloaded at build time so run time never touches the network. Only this stage has
@@ -105,11 +109,85 @@ for name in sorted(p.name for p in target.iterdir()):
     print(name, (target / name).stat().st_size)
 PY
 
+# Embedding model (intfloat/multilingual-e5-base), same procedure and bump instructions as the NER
+# model above with E5_ in place of NER_ (API: .../api/models/intfloat/multilingual-e5-base).
+# Only what AutoModel + AutoTokenizer load: config, safetensors weights, tokenizer.json (the fast
+# tokenizer, loaded directly), sentencepiece.bpe.model and the two small tokenizer configs, plus
+# the model card. pytorch_model.bin, the onnx/ and openvino/ variants and the sentence-transformers
+# files (modules.json, 1_Pooling/, sentence_bert_config.json) are never downloaded: the adapter
+# does its own mean pooling.
+ARG E5_MODEL_REPO=intfloat/multilingual-e5-base
+# The revision is the global ARG at the top of the file.
+ARG E5_MODEL_REVISION
+ARG E5_MODEL_SAFETENSORS_SHA256=a18a44fad1d0b46ded15928144138cff1135d5cc8233bdd90be5f18822de09a7
+ARG E5_MODEL_TOKENIZER_SHA256=62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626
+ARG E5_MODEL_SPM_SHA256=cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865
+ARG E5_MODEL_CONFIG_SHA256=9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4
+ARG E5_MODEL_TOKENIZER_CONFIG_SHA256=efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15
+ARG E5_MODEL_SPECIAL_TOKENS_SHA256=06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f
+ARG E5_MODEL_CARD_SHA256=9d129cb0b912b55c7b5378f976a9c35ae4796c80466b659ad63930d8ca090fca
+
+RUN python - <<'PY'
+import hashlib
+import os
+import pathlib
+import shutil
+
+from huggingface_hub import snapshot_download
+
+expected = {
+    "README.md": "E5_MODEL_CARD_SHA256",
+    "config.json": "E5_MODEL_CONFIG_SHA256",
+    "model.safetensors": "E5_MODEL_SAFETENSORS_SHA256",
+    "sentencepiece.bpe.model": "E5_MODEL_SPM_SHA256",
+    "special_tokens_map.json": "E5_MODEL_SPECIAL_TOKENS_SHA256",
+    "tokenizer.json": "E5_MODEL_TOKENIZER_SHA256",
+    "tokenizer_config.json": "E5_MODEL_TOKENIZER_CONFIG_SHA256",
+}
+files = sorted(expected)
+target = pathlib.Path("/models/multilingual-e5-base")
+snapshot_download(
+    os.environ["E5_MODEL_REPO"], revision=os.environ["E5_MODEL_REVISION"],
+    allow_patterns=files, local_dir=target,
+)
+shutil.rmtree(target / ".cache", ignore_errors=True)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+present = sorted(p.name for p in target.iterdir())
+assert present == files, f"unexpected model files: {present}"
+for name, env in expected.items():
+    actual = sha256(target / name)
+    assert actual == os.environ[env], f"{name}: sha256 {actual} != {os.environ[env]}"
+repo, revision = os.environ["E5_MODEL_REPO"], os.environ["E5_MODEL_REVISION"]
+(target / "NOTICE").write_text(
+    f"Model: {repo}\n"
+    f"Source: https://huggingface.co/{repo} (revision {revision})\n"
+    "Authors: Liang Wang, Nan Yang, Xiaolong Huang, Linjun Yang, Rangan Majumder, Furu Wei\n"
+    "(Microsoft), 'Multilingual E5 Text Embeddings: A Technical Report', arXiv:2402.05672.\n"
+    "Licence: MIT License, as declared in the model card README.md.\n"
+    "Base model: FacebookAI/xlm-roberta-base (XLM-RoBERTa, Conneau et al., 2019), MIT License.\n"
+    "The model files in this directory are redistributed unmodified.\n",
+    encoding="utf-8",
+)
+for name in sorted(p.name for p in target.iterdir()):
+    print(name, (target / name).stat().st_size)
+PY
+
 # Read-only for everyone; COPY keeps these modes (owner root), so the app user cannot change it.
 RUN chmod -R a=rX /models
 
 
 FROM ${PYTHON_IMAGE} AS base
+
+ARG E5_MODEL_REVISION
 
 # uv 0.12.19 (same version as the host), pinned by digest.
 COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 /uv /uvx /usr/local/bin/
@@ -142,6 +220,7 @@ RUN apt-get update \
 # UV_PROJECT_ENVIRONMENT keeps the venv outside the copied source tree.
 # HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE: the model is baked in, nothing is fetched at run time.
 # NER_MODEL_PATH: where the baked-in model lives (read by the `ner_model` tests and app settings).
+# EMBEDDING_MODEL_PATH/EMBEDDING_MODEL_REVISION: the baked-in e5 embedder and its pinned commit.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
@@ -151,7 +230,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
-    NER_MODEL_PATH=/models/xlm-roberta-base-ner-hrl
+    HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    NER_MODEL_PATH=/models/xlm-roberta-base-ner-hrl \
+    EMBEDDING_MODEL_PATH=/models/multilingual-e5-base \
+    EMBEDDING_MODEL_REVISION=${E5_MODEL_REVISION}
 
 RUN useradd --create-home --uid 10001 app
 

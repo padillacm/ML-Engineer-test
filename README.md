@@ -158,7 +158,7 @@ batching, or other production hardening. Not required — credited when present.
 
 ```bash
 uv sync --extra dev                          # create .venv and install deps from pyproject.toml
-# Vector DB (planned): Qdrant, via docker compose; tests use an in-memory instance.
+# Vector DB: Qdrant server (see "Tests with Qdrant (compose)" below); unit tests use an in-memory Qdrant.
 uv run uvicorn app.main:app --reload
 ```
 
@@ -221,8 +221,36 @@ capped at `max_chars` (default 50,000 characters): inference costs about 0.25 s 
 `NER_MODEL_REVISION` and every `*_SHA256` build arg in the `Dockerfile` to the new commit and
 its file hashes (the comment above the `model` stage says where to get them), rebuild and
 rerun the suite.
+
+The embedding model (`intfloat/multilingual-e5-base`, MIT, 768 dimensions, about 1.1 GB) is
+baked in the same way: the `model` stage downloads `config.json`, `model.safetensors`,
+`tokenizer.json`, `sentencepiece.bpe.model`, the two tokenizer configs and the model card
+at a pinned commit (never `pytorch_model.bin` or the ONNX/OpenVINO variants), checks every
+file's sha256, writes a `NOTICE` (model MIT, base XLM-RoBERTa MIT) and copies it read-only
+to `/models/multilingual-e5-base`. The image sets `EMBEDDING_MODEL_PATH` to that directory
+and `EMBEDDING_MODEL_REVISION` to the commit (part of the embedding identity, so a new
+revision opens a new vector collection). It loads offline in about 5 s; one 800-character
+passage (~180 tokens) takes about 0.16 s at 2 threads. To bump it, set the global
+`E5_MODEL_REVISION` build arg and every `E5_MODEL_*_SHA256` arg in the `Dockerfile` (same
+sources as the NER model), rebuild and rerun the suite.
 `torch` is CPU-only on every platform: `pyproject.toml` takes it from the PyTorch CPU
 wheel index (`[tool.uv.sources]`), so neither the host nor the image installs CUDA.
+
+#### Tests with Qdrant (compose)
+
+`docker-compose.test.yml` runs the same `docintel-test` image next to a Qdrant server
+(`qdrant/qdrant:v1.20.0`, pinned by digest, storage on tmpfs, no ports published). The
+`tests` service sets `QDRANT_URL=http://qdrant:6333` and starts only once Qdrant answers
+`/readyz`, so the tests marked `qdrant_server` (the `VectorStore` contract on a real server,
+skipped on the host where `QDRANT_URL` is unset) run with the rest of the suite:
+
+```
+docker compose -f docker-compose.test.yml run --rm tests     # builds the image if missing
+docker compose -f docker-compose.test.yml build tests        # rebuild after source changes
+docker compose -f docker-compose.test.yml down -v            # remove the Qdrant container
+```
+
+On the host, the same contract runs against qdrant-client's embedded `:memory:` mode.
 
 ## Use of AI tools
 
