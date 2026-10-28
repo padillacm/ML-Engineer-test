@@ -159,27 +159,132 @@ batching, or other production hardening. Not required — credited when present.
 ```bash
 uv sync --extra dev                          # create .venv and install deps from pyproject.toml
 # Vector DB: Qdrant server (see "Tests with Qdrant (compose)" below); unit tests use an in-memory Qdrant.
-uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload         # needs the variables of "Running the service"
 ```
 
 Sample scanned PDFs are in `sample_pdfs/`.
 
-### Project layout (work in progress)
+### Project layout
 
 ```
-app/domain/       pure logic: geometry, name matching, chunking, errors (stdlib + rapidfuzz only)
-app/application/  ports (typing.Protocol) the use cases depend on
+app/domain/       pure logic: geometry, name matching, chunking, uploads, errors (stdlib + rapidfuzz only)
+app/application/  ports (typing.Protocol) and the use cases that depend on them
 app/adapters/     real OCR / NER / embedding / vector-store / LLM implementations
-app/api/, app/models/schemas.py   HTTP edge and the fixed API contract
-tests/            unit tests, in-memory fakes (tests/fakes), architecture guard
+app/api/          HTTP edge: thin routers, error mapping, middleware, form parsing (no adapters)
+app/bootstrap.py  composition root: builds every adapter and use case once from the settings
+app/main.py       create_app(): routers, handlers, middleware, lifespan; `app` is the Uvicorn target
+app/settings.py   every tunable, read from the environment (and .env)
+app/observability.py   JSON/text logs on stdout with the request id
+app/models/schemas.py  the fixed API contract
+tests/            unit and HTTP tests, in-memory fakes (tests/fakes), architecture guard
 docs/BENCHMARKS.md, benchmarks/   measurements behind the defaults and how to reproduce them
 openspec/         specs and change proposals the implementation follows
 ```
 
 Run the tests and the linter with `uv run pytest -q` and `uv run ruff check app tests`.
 Install the git hooks once with `uv run pre-commit install` (see `.pre-commit-config.yaml`).
-`tests/architecture` fails if the domain or application layers import a
-framework or vendor library.
+`tests/architecture` fails if the domain or application layers import a framework or vendor
+library, if `app/api` imports an adapter or a vendor library, or if anything but
+`app/bootstrap.py` imports an adapter.
+
+### Running the service
+
+All configuration comes from environment variables, read once at start-up by `app/settings.py`
+(names are case-insensitive; an empty value counts as unset). A `.env` file in the working
+directory is read too; it is git- and docker-ignored, and API keys belong there or in the
+environment, never in a committed file. An invalid or missing value stops the service before
+it accepts requests, with a message naming the variable and the rule (never its value).
+Required variables are marked **R**; every default is the benchmarked value (`docs/BENCHMARKS.md`).
+
+| Group | Variable (default) |
+|---|---|
+| Models | `NER_MODEL_PATH` **R**, `EMBEDDING_MODEL_PATH` **R**, `EMBEDDING_MODEL_REVISION` **R**, `TORCH_THREADS` (2: torch intra-op threads, process-wide, shared by the recogniser and the embedder; the former `NER_THREADS`/`EMBEDDING_THREADS` stop start-up), `NER_POOL_SIZE` (8: texts recognised at once, sharing one model; start-up warns when `NER_POOL_SIZE` x `TORCH_THREADS` exceeds the CPUs available), `EMBEDDING_BATCH_SIZE` (16) |
+| OCR | `OCR_DPI` (200), `OCR_WORKERS` (min(4, CPUs)), `OCR_TIMEOUT_S` (60), `OCR_FLATTEN` (true), `MAX_PAGES` (50) |
+| Matching | `MATCH_THRESHOLD` (0.90) |
+| Chunking | `CHUNK_SIZE` (800 characters), `CHUNK_OVERLAP` (0.12, a ratio of the size) |
+| Retrieval | `RAG_THRESHOLD` (0.808), `RAG_TOP_K` (5), `RAG_MAX_CHUNKS` (3), `RAG_MAX_CONTEXT_CHARS` (6000) |
+| Vector store | `QDRANT_URL` or `QDRANT_LOCATION` **R** (exactly one; `:memory:` is the embedded, non-persistent mode), `QDRANT_API_KEY`, `QDRANT_COLLECTION_PREFIX` (chunks), `QDRANT_TIMEOUT_S` (10), `QDRANT_ATTEMPTS` (3), `QDRANT_DEADLINE_S` (20) |
+| Language model | `LLM_BASE_URL` (unset: no model), `LLM_MODEL` (required with a base URL), `LLM_API_KEY`, `LLM_CONNECT_TIMEOUT_S` (5), `LLM_READ_TIMEOUT_S` (60), `LLM_TOTAL_TIMEOUT_S` (90), `LLM_ATTEMPTS` (3), `LLM_MAX_TOKENS` (512) |
+| Limits | `MAX_UPLOAD_MB` (20), `MAX_NAMES` (1000), `MAX_CONCURRENT_JOBS` (12), `MAX_CONCURRENT_QUESTIONS` (16), `BUSY_WAIT_S` (10, at most 300), `READINESS_TIMEOUT_S` (2, at most 30) |
+| Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (json, or text), `LOG_EXCEPTION_MESSAGES` (false; local debugging only: logs exception messages, which may contain document text) |
+
+The image also sets `MALLOC_ARENA_MAX=2` (glibc), which keeps the service's memory flat under
+load (`docs/BENCHMARKS.md` section 15); set it too when running the service outside Docker on Linux.
+
+```bash
+# .env (example values; never commit this file)
+NER_MODEL_PATH=/models/xlm-roberta-base-ner-hrl
+EMBEDDING_MODEL_PATH=/models/multilingual-e5-base
+EMBEDDING_MODEL_REVISION=<commit of the e5 files>
+QDRANT_URL=http://localhost:6333
+LLM_BASE_URL=http://localhost:11434/v1     # any OpenAI-compatible server, e.g. Ollama
+LLM_MODEL=qwen2.5:7b-instruct
+# LLM_API_KEY=...                          # only if the server needs one
+
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Models and clients are built once, when the application starts (not on the first request),
+and closed when it stops; one process holds one copy of the models, so scale with processes or
+replicas, not threads. Without `LLM_BASE_URL` the service still starts: `/api/ask` refuses
+questions that match nothing and answers 503 `llm_unavailable` when it would need the model.
+If Qdrant is down the service starts too (readiness reports it) and recovers when Qdrant is
+back. The test image already contains Tesseract and both models; the runtime image and a
+`docker-compose.yml` that starts the service with Qdrant and a local model come in a later
+block.
+
+Endpoints (interactive documentation at `/docs`, schema at `/openapi.json`):
+
+```bash
+# Liveness (never touches a dependency) and readiness (200, or 503 naming the failing check)
+curl http://localhost:8000/health
+curl http://localhost:8000/health/ready
+# -> {"status":"ready","checks":{"vector_store":"ok","llm":"configured"}}
+
+# Names, boxes (PDF points, 0-based pages) and fuzzy matches; `names` and `language` are optional
+curl -F pdf_file=@sample_pdfs/meeting_minutes.pdf \
+     -F 'names=[{"first_name": "Maria", "last_name": "Gonzalez"}]' \
+     -F language=es \
+     http://localhost:8000/api/extract
+
+# Index a document: {"status": "indexed" | "already_indexed", "chunks_stored": n, "document_id": "..."}
+curl -F pdf_file=@sample_pdfs/meeting_minutes.pdf http://localhost:8000/api/ingest
+
+# Ask: {"answer": "...", "sources": ["exact stored chunk text", ...]}
+curl -H 'Content-Type: application/json' -d '{"question": "Who signed the contract?"}' \
+     http://localhost:8000/api/ask
+```
+
+Uploads are judged by their content (a `%PDF-` header within the first 1,024 bytes), not by
+their name or content type. At most `MAX_CONCURRENT_JOBS` extractions and ingestions run at
+once; a request that cannot start within `BUSY_WAIT_S` gets 503 `service_busy` (questions and
+health checks never wait for this limit: waiting requests hold no thread, questions have their
+own `MAX_CONCURRENT_QUESTIONS` slots (503 `service_busy` after `BUSY_WAIT_S`) and readiness checks
+run on their own threads with a `READINESS_TIMEOUT_S` timeout). A job whose client disconnects
+stops after the page in progress (logged as 499 `request_cancelled`).
+The defaults of 12 jobs and 8 NER pipelines were measured on a 16-CPU host
+(`docs/BENCHMARKS.md` sections 14 and 15); re-measure on other hardware. Every error has the body
+`{"detail": "...", "code": "...", "request_id": "..."}`:
+
+| Status | Codes |
+|---|---|
+| 400 | `empty_file`, `http_error` (a form the multipart parser refuses, e.g. a field over 1 MiB) |
+| 413 | `too_large` (file over `MAX_UPLOAD_MB`, refused while reading or from `Content-Length`, or a body over the endpoint's limit: 64 KiB for `/api/ask` and other routes without uploads; a body up to 1 MiB over is read to its end so the client can read the 413), `too_many_pages` (over `MAX_PAGES`, refused before any page is rendered) |
+| 415 | `not_a_pdf` |
+| 499 | `request_cancelled` (the client disconnected; logged only, no response reaches it) |
+| 422 | `pdf_unreadable`, `invalid_names` (names the wrong entry, e.g. `names[1]`, including a name over 100 characters), `unsupported_language` (not en, es, pt, fr, de), `invalid_question` (blank), `invalid_request` (validation `detail` list of `{type, loc, msg}`; the rejected value is never echoed) |
+| 500 | `ocr_failed`, `ner_failed`, `embedding_failed`, `geometry_error`, `incompatible_embedding`, `invalid_configuration`, `internal_error` (anything unexpected; no internal detail is returned) |
+| 503 | `vector_store_unavailable`, `llm_unavailable`, `service_busy`, with `Retry-After` (5 s; `BUSY_WAIT_S` rounded up for `service_busy`) |
+| 504 | `vector_store_timeout`, `llm_timeout`, with `Retry-After: 5` |
+
+Every response carries an `X-Request-ID` header: the client's own value when it is 1 to 64
+letters, digits, `.`, `_` or `-`, otherwise a generated one. Logs go to stdout, one JSON object
+per line (`LOG_FORMAT=text` for a readable line) with `timestamp`, `level`, `logger`,
+`message` and, inside a request, `request_id`. Each request writes one access line (`method`,
+route template, `status`, `duration_ms`) and each use case one outcome line of counts, ids and
+durations; failures are logged with their `code` and `category`, unexpected exceptions with
+their stack trace. Document text, names, questions, answers, file names and keys are never
+logged.
 
 #### Tests in the production-like container
 

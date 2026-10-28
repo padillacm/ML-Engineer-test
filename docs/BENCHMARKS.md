@@ -20,6 +20,9 @@ Environment recorded in the sources (details per section): Windows 11 (10.0.2263
 10. Data-leakage and provenance caveats
 11. Defaults chosen
 12. Not adopted / future work
+13. HTTP edge (`add-http-api`): parity, overhead, concurrency, resources, start-up
+14. NER pipeline pool (task 10.1)
+15. Concurrency with the NER pool (tasks 10.1 and 10.7): job limit, pool size, 50-page documents, resources
 
 ---
 
@@ -753,6 +756,16 @@ Sensitivity (scenario A)
 | Embedder | `intfloat/multilingual-e5-base` (`query: ` / `passage: ` prefixes, mean pooling, fp32 on CPU) | 6.1 (public nDCG@10 mean 79.3, CPU 106.2 / 356.2 ms), 6.2 (corpus) | ans R@5 64.4 (62.7-66.2) at `s800_o12`; +5.1 [+3.9, +6.2] over e5-small; arctic-m-v2 is -3.9 [-5.1, -2.8] below it on same-language questions and +4.7 [+1.8, +7.5] above it on cross-lingual ones; e5-base needs no remote code |
 | Chunking | 800 characters, 12 % overlap (96 characters), word-safe, never crossing a page; retrieve chunks, pass the parent page to the LLM | 7 (sweep, paired, parent-page table) | k = 3 chunks + parent pages: 81.4 (79.9-82.9) at 4,798 characters vs 72.2 for whole-page chunks at 5,211 |
 | Refusal threshold | top-1 cosine < 0.808 -> refuse | 8 (e5-base `global`, `s800_o12`) | keeps 95.0 % of answerable, refuses 48.3 % of unanswerable (66.0 % without cross-document items) |
+| `MAX_CONCURRENT_JOBS` | **12** (applied), one process, 16 logical CPUs | 15.2 (D7 rule: smallest limit within 5 % of the best throughput); before the NER pool: 8 (13.2) | with the NER pool, 75-request runs (two passes or more each): 87.9 docs/min at 12 / pool 4 and 91.2 at 12 / pool 8, against 78.9 at 8 (-13.5 % of the best, 91.2); 16 and 24 are no faster (88.6-89.3; 87.1 on the short set); host-specific, re-measure on the target hardware |
+| `NER_POOL_SIZE` (`TORCH_THREADS` 2) | **8** (applied) | 14 (NER alone: identical spans, +70 MB), 15.2, 15.3 and 15.6 (D7 rule over both workloads) | short documents: pools 4 and 8 within 4 % of each other (87.9 and 91.2 docs/min at 12 jobs, run-to-run spread 1-3 %); 50-page documents at 12 jobs: 24 documents in 342-345 s with 8 against 367-370 s with 4 (pool 4 is 7 % slower, outside the 5 % band); under mixed load short-document p95 15 s against 27-33 s; server peak +40-90 MB |
+| `BUSY_WAIT_S` | 10 s (unchanged; re-derived with the pool) | 13.2, 15.2 (derived from measured latency, not an optimum) | before the pool: one loaded job at limit 8 (p50 10.1 s, 13.2); with the pool at the recommended 12 jobs: a job holds its slot 7.4-7.7 s on average and p50 latency at 16 clients is 9.6-10.8 s, so 10 s is still about one loaded job; a 50-page job holds a slot 47-347 s, so a burst of long documents is shed after 10 s (intended; clients retry after `Retry-After`) |
+| `TORCH_THREADS` | 2 (one process-wide value for the recogniser and the embedder) | 3 and 6 (CPU latency; both models were benchmarked at 2 threads), 14.2 (NER alone: threads 1 vs 2) | NER alone 65.7 docs/min at 2 threads vs 34.7 at 1 (pool 1); the former `NER_THREADS` / `EMBEDDING_THREADS` were merged because torch threads are process-wide (15.2 note); above 2 not measured end to end |
+| `MALLOC_ARENA_MAX` | 2 (Dockerfile) | 13.3, 15.5 (resources, 200 mixed requests per round) | RSS flat after round 1 (2,454-2,462 MB) instead of growing 16-520 MB per round, about 840 MB lower, at the same throughput (91.1-92.1 docs/min) |
+| `MAX_CONCURRENT_QUESTIONS` | 16 | not measured (judgement) | a question costs about 20 ms of embedding plus the language model's wait (I/O); 16 bounds threads and model calls while a slow model answers; to be measured with the real model in block 6 |
+| `READINESS_TIMEOUT_S` | 2 s (at most 30) | not measured (judgement) | a healthy store answers its ping in milliseconds; 2 s is below the 3 s compose healthcheck timeout; the review measured a hung store's ping cut from 10.0 s to 2.0 s |
+| Drain after an early 413 | up to 1 MiB over the route limit, at most 5 s | `add-http-api` 10.4 (`tests/api/test_uvicorn_edge.py`) | 900 KiB over: the client reads the 413 (reset without the drain); 5 s is nginx's `lingering_timeout`; far-over bodies are closed after about 1 MiB |
+| Body limits | uploads `MAX_UPLOAD_MB` + 1 MiB + 64 KiB; other routes 64 KiB | `add-http-api` 10.6 and review finding 2 | 1 MiB is the multipart parser's per-field limit (no accepted `names` field is cut); a 2,000-character question fully escaped is about 24 KB |
+| `MAX_UPLOAD_MB`, `MAX_PAGES`, `MAX_NAMES`, name length | 20 MB, 50 pages, 1,000 names, 100 characters | product limits agreed in the `add-http-api` proposal, not optimised; 15.3 checks the worst case | 24 concurrent 50-page jobs (11.6-15.7 MB files): all 200, server peak 2.6-2.9 GB, no OCR timeout |
 
 ---
 
@@ -763,3 +776,309 @@ Sensitivity (scenario A)
 - **Model-complexity router** (a cheap model for easy pages, a larger one for hard pages). Not designed or measured; only the per-model latencies of section 4.4 and the public speed-quality table (section 3) exist.
 - Other items measured and rejected: whole-page or 1,200/1,600-character embedding (higher raw recall but worse recall per context character once the parent page is passed, section 7); `wikineural_mbert` (best public NER score but CC-BY-NC-SA-4.0 licence and not evaluated on OCR text); spaCy, GLiNER and larger transformer NER models (section 3-4); particle-bridge, box-trim and regex-rescue span rules (section 4.3); `WRatio`, `token_set_ratio`, `partial_ratio`, plain `ratio` (section 5.2); Otsu / adaptive binarisation, 300-DPI rendering of 150-DPI scans, psm 4 and 6 (sections 2.4, 2.5); per-language refusal thresholds (section 8, noisy); the generic legal-form lexicon rule `Dtrap` (+0.3 F1, section 4.3).
 - **Open measurements:** single-thread NER and embedding cost; GPU service cost; end-to-end cost of the two-pass language strategy; behaviour on real scans, handwriting, non-Latin scripts, letters that NFKD does not decompose (o-slash, l-stroke, d-stroke, ae); re-calibration of the refusal and fuzzy thresholds on real documents; the verification of the e5 and bge-m3 training-data statements (section 10).
+
+---
+
+## 13. HTTP edge (`add-http-api`)
+
+Scripts: `benchmarks/http_edge/scripts/` (local, like every benchmark script; driver `run.sh`, see `benchmarks/README.md` step 8).
+
+Tasks 8.1-8.3 of `add-http-api`: the FastAPI edge adds no model behaviour, so acceptance is parity with the use cases and cost. **Environment** (all subsections): image `docintel-evidence` built with `docker build --target test` from the tree of this change (Python 3.12.16, Tesseract 5.5.0, FastAPI 0.162.0, Starlette 1.10.0, Uvicorn 0.54.0, httpx 0.28.1), run through `docker-compose.test.yml` (project `block5ev`, Qdrant v1.20.0, collections with a unique prefix dropped afterwards); Docker Desktop 29.9.2 on the Windows 11 host of the preamble (AMD Ryzen 7 7700X); the container sees **16 CPUs** (`os.cpu_count()`, affinity 16, cgroup `cpu.max` unlimited) and 15.2 GiB of memory; settings at their defaults unless stated (so `OCR_WORKERS` = min(4, 16) = 4, `NER_THREADS` = `EMBEDDING_THREADS` = 2), no language model configured; nothing else ran on the host during the timing runs. Inputs: the seed-0 sample of section 2.8 (60 documents, 102 pages), name lists from `namelists.jsonl` where a document has one (19 documents), no language hint. Scripts and raw outputs are in the scratch folder of the session (`http_evidence/scripts/{p81,p82,p82_supp,p82_long,p82_arena,p83,p83_spool,ev_common}.py`, `run.sh`, outputs in `http_evidence/out/`; local, not committed). Each script runs as `TEST_IMAGE=docintel-evidence docker compose -p block5ev -f docker-compose.test.yml run --rm -v <scripts>:/ev:ro -v <corpus>:/data:ro -v <sample>:/calib:ro -v <out>:/out tests python /ev/<script>.py`, followed by `docker compose -p block5ev -f docker-compose.test.yml down -v` (`run.sh` does both).
+
+### 13.1 Parity and overhead (task 8.1)
+
+**Method.** One process builds the NER model and the e5 embedder once (shared adapter factories, as in `tests/integration/test_http_e2e.py`) and two containers with `build_container(load_settings(...))`, each with its own collection prefix: H behind `TestClient(create_app(settings, H'))`, where H' is H with its `ask` replaced by an `AskQuestion` on H's store and a scripted LLM (`FakeLLMClient`, fixed reply), and D for direct ingestion. (a) For every sample document `H.extract(pdf, names, None)` against `POST /api/extract` with the same PDF and names; names, boxes (exact float equality of the domain values with the JSON values) and matches compared, and the whole JSON body against `to_response(result).model_dump(mode="json")`. (b) `POST /api/ingest` (H's collection) against `D.ingest(pdf)` (D's collection); status, chunk count and document id compared, then both collections scrolled and every stored chunk compared (document id, sequence, page, text, offsets). (c) For the sample's 290 answerable questions, their 60 cross-lingual variants, the 22 unanswerable questions paired with sample documents and the 50 corpus-level off-topic ones: `POST /api/ask` against a direct `AskQuestion` with its own scripted LLM on the same store (decision, sources, answer text, prompt messages sent to the LLM) and against an `AskQuestion` on D's store (checks that the two ingestion paths stored equivalent data). Timing: one warm-up document and three warm-up questions first; each pair alternates which call goes first (even items direct first, odd items HTTP first).
+
+| check | identical / total | detail |
+|---|---|---|
+| extract: names, boxes, matches | **60 / 60** documents | 805 name occurrences, 86 matches (19 documents with a name list); JSON body equals the response model's own serialisation on 60 / 60 |
+| ingest: status, chunk count, document id | **60 / 60** | 327 chunks; every response `indexed` |
+| ingest: stored chunks (two collections) | **327 / 327** | identical payloads |
+| ask: refusal decision and sources | **422 / 422** | 89 refusals (answerable 18 / 290, cross-lingual 10 / 60, paired unanswerable 11 / 22, off-topic 50 / 50) |
+| ask: answer text and prompt sent to the LLM | **422 / 422** | |
+| ask: HTTP store against the directly ingested store | **422 / 422** | |
+
+No difference was found, so there is no cause to report.
+
+**Overhead** (wall time per call, 60 documents / 422 questions; paired = HTTP minus direct for the same item):
+
+| endpoint | direct median / p95 | HTTP median / p95 | paired difference median / p95 | relative (paired median) | edge only (stub use case) median / p95 |
+|---|---|---|---|---|---|
+| `/api/extract` | 3.816 / 5.033 s | 3.785 / 4.985 s | -16.0 / +33.6 ms | -0.5 % | 2.41 / 2.84 ms |
+| `/api/ingest` | 3.710 / 5.201 s | 3.750 / 5.241 s | -8.9 / +61.5 ms | -0.3 % | not measured |
+| `/api/ask` | 44.2 / 56.3 ms | 47.2 / 58.7 ms | +2.6 / +9.3 ms | +5.7 % | 1.82 / 2.03 ms |
+
+"Edge only" replaces the use case by a stub that returns the result already computed for the same input, so it is the cost of `TestClient` + multipart parsing of the upload (median 490 KB) + form validation + response serialisation alone (180 requests each, after one unmeasured round). For extraction and ingestion the edge costs about 2.4 ms against a 3.8 s OCR + NER call (**0.06 %**), well under the 1 % expected by the design; the paired difference is dominated by run-to-run OCR jitter (it was slightly negative in both orders, -15.0 and -17.8 ms; direct calls ran on the main thread and HTTP calls on an AnyIO worker thread, a cause that was not investigated further). For questions the edge adds about 2 ms to a 44 ms call (embedding the question dominates). `TestClient` calls the application in process, so the socket and Uvicorn cost is not in these figures; it is part of the real-server latencies of 13.2.
+
+### 13.2 Concurrency default (task 8.2, design D7)
+
+**Method.** Real Uvicorn (`uvicorn app.main:app --host 0.0.0.0 --port 8000`, one process) started inside the container for each limit with `MAX_CONCURRENT_JOBS` in {1, 2, 4} and `BUSY_WAIT_S=600` (nothing rejected); the client runs in the same container (threads, one `httpx.Client` each, pulling from a shared queue). Request set: 25 sample documents (45 pages; per language the 1st and 3rd clean, 1st and 3rd medium and 1st hard document of the sample, interleaved by language), `POST /api/extract` with the name list where one exists, no language hint. Two warm-up requests per server, then the set at 1, 2, 4, 8 and 16 concurrent clients. Two passes (limits 1, 2, 4 then 4, 2, 1); cells are the mean of both. docs/min = 25 / wall; latency is the client's (includes waiting for a slot); peak RSS is the server's `VmHWM` (reset per cell through `/proc/<pid>/clear_refs`; it matched the 0.25 s sampled maximum within 10 MB) and the sampled peak of the server plus its Tesseract children; CPU is the busy share of all 16 CPUs (`/proc/stat`). Every request of every cell returned 200.
+
+| limit | clients | docs/min | p50 / p95 latency (s) | server peak RSS (MB) | server + Tesseract peak (MB) | CPU busy |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 15.5 | 4.0 / 4.9 | 1,704 | 1,798 | 10 % |
+| 1 | 2 | 15.6 | 7.5 / 8.9 | 1,766 | 1,871 | 10 % |
+| 1 | 4 | 15.6 | 15.4 / 17.2 | 1,886 | 1,972 | 10 % |
+| 1 | 8 | 15.5 | 29.8 / 33.0 | 2,068 | 2,162 | 10 % |
+| 1 | 16 | 15.6 | 48.5 / 62.4 | 2,233 | 2,305 | 10 % |
+| 2 | 1 | 15.5 | 4.0 / 4.9 | 1,699 | 1,770 | 10 % |
+| 2 | 2 | 28.5 | 4.3 / 5.3 | 1,765 | 1,945 | 18 % |
+| 2 | 4 | 27.8 | 8.3 / 10.2 | 1,850 | 2,026 | 17 % |
+| 2 | 8 | 28.9 | 16.1 / 17.8 | 2,019 | 2,215 | 18 % |
+| 2 | 16 | 27.8 | 29.2 / 34.2 | 2,338 | 2,530 | 17 % |
+| 4 | 1 | 15.5 | 4.0 / 4.9 | 1,711 | 1,798 | 10 % |
+| 4 | 2 | 28.1 | 4.4 / 5.3 | 1,771 | 1,982 | 17 % |
+| 4 | 4 | 39.3 | 6.2 / 7.4 | 1,897 | 2,270 | 25 % |
+| 4 | 8 | 40.4 | 10.6 / 13.3 | 2,058 | 2,432 | 26 % |
+| 4 | 16 | 41.6 | 18.7 / 22.8 | 2,326 | 2,628 | 27 % |
+
+Within D7's grid limit 4 is best (41.6 docs/min) and 1 and 2 are far below it, but throughput was still rising at 4 while only a quarter of the CPUs were busy, so the grid was extended (same method, two passes each, `p82_supp.py`) and the decisive pair re-run with three times the request set (75 requests, two passes, `p82_long.py`) to reduce the end-of-run tail:
+
+| limit | clients | requests | docs/min (pass 1, pass 2) | p50 / p95 latency (s) | server peak RSS (MB) | server + Tesseract peak (MB) | CPU busy |
+|---|---|---|---|---|---|---|---|
+| 8 | 8 | 25 | 44.9, 45.3 | 10.1 / 12.6 | 2,043 | 2,607 | 30 % |
+| 8 | 16 | 25 | 45.6, 45.5 | 17.7 / 23.2 | 2,391 | 2,905 | 30 % |
+| 16 | 8 | 25 | 45.3, 45.1 | 10.1 / 12.8 | 1,974 | 2,567 | 30 % |
+| 16 | 16 | 25 | 44.5, 44.7 | 18.3 / 25.8 | 2,288 | 5,228 | 32 % |
+| 4 | 16 | 75 | 42.5, 42.0 | 21.3 / 25.9 | 2,294 | 2,658 | 26 % |
+| **8** | 16 | 75 | **47.8, 47.7** | 19.4 / 23.4 | 2,332 | 2,709 | 31 % |
+
+**Choice.** The best throughput is limit 8 (47.7 docs/min on the long run; 16 is not faster, 44.5-45.3 against 44.9-45.6 for 8 on the short set, and once peaked at 5.2 GB with up to 20 processes). Limit 4 reaches 42.3 docs/min, 11 % below it, so it is outside the 5 % band; limit 8 is the smallest limit within 5 % of the best. **Recommended `MAX_CONCURRENT_JOBS` = 8** for one process on this 16-CPU host (the initial value 2 gives 61 % of that throughput). At 8 jobs, a single request's latency is unchanged (4.0 s at one client), the server peak stays at 2.0-2.4 GB and the process tree at 2.6-2.9 GB.
+
+**Why throughput stops at about 45-48 docs/min with 70 % of the CPUs idle.** The NER model runs under one lock per process (`TransformersNameRecognizer`, two torch threads): from the use case's own log, NER costs 0.58 s per page unloaded, so the 135 pages of the 75-request run need 78 s of NER, 83 % of the 94 s wall time at limit 8 (73 % at limit 4); its logged `ner_ms` (which includes waiting for the lock) rises from 0.58 s per page at limit 1 to 3.5 s at limit 8 and 5.1 s at limit 16, while OCR per page stays at 1.6-1.8 s (2.2 s at 16). More jobs per process therefore only queue behind the NER lock; more throughput on the same host needs more processes or replicas, each with its own models (~2 GB), as `DESIGN.md` plans (and `KNOWN_LIMITATIONS.md` P4). `NER_THREADS` above 2 was not measured. **Update:** the NER lock has since been replaced by a pool of pipelines (section 14); with it one process reaches 88-91 docs/min on the same request set, the job limit worth having rises to 12 and the bottleneck moves to the CPU, shared by Tesseract and NER (section 15, which also covers 50-page documents and shows that the occasional 5 GB process-tree peaks were most likely a sampling artefact). The documents are short (1-3 pages), so per request OCR uses at most 2-3 of its 4 workers: at 8 jobs at most 14 processes were seen (server + Tesseract); a 50-page document could have 4 Tesseract processes and 8 rendered pages in flight per job, i.e. up to 32 processes at limit 8 on 16 CPUs, which the measurement did not cover.
+
+**Back-pressure check.** With limit 8 and a short `BUSY_WAIT_S=1`, 24 simultaneous `/api/extract` requests (released by a barrier, `p83.py`) gave **8 x 200 and 16 x 503 `service_busy`**, the 503s after 1.03-1.05 s with `Retry-After: 1` and the error body with its `request_id`; no other status. With `BUSY_WAIT_S=10` the same burst gave 10 x 200 (3.7-14.7 s) and 14 x 503 at 10.03-10.04 s with `Retry-After: 10`, nothing else.
+
+**`BUSY_WAIT_S` (recommendation, derived rather than optimised): 10 s.** The unloaded median `/api/extract` latency of these 1-3-page documents is 4.0 s (p95 4.9 s) and a job at full load (8 jobs) takes about 10 s (p50 10.1 s at 8 clients). A 10 s wait (about 2.5 x the unloaded median, about one loaded job) lets a request wait for roughly one job's duration: under steady load, with jobs finishing at staggered times, a slot frees about every 10 s / 8 = 1.3 s, so about 8 queued requests (one more generation) are admitted before the service sheds load; it also bounds what a client waits before it hears 503 to 10 s, and a served request completes within about 25 s (p95 23.4 s at 16 clients on the long run), under the 30 s timeout of common proxies. A synchronised burst is shed harder, because all jobs start together: in the burst above the first slot freed at 3.7 s and the second at 7.4 s, so 5 s would have served 9 of the 24 requests and 10 s served 10. Longer documents (OCR plus NER about 2.3 s per page unloaded without a hint) hold a slot longer, so bursts of them are shed sooner; that is the intended behaviour, and clients retry after `Retry-After`. The current 5 s is also defensible; the measurement bounds the choice (a few seconds to about one loaded job) but does not single out one value.
+
+### 13.3 Resources and start-up (task 8.3)
+
+**Method** (`p83.py`). Uvicorn with `MAX_CONCURRENT_JOBS=8`, `BUSY_WAIT_S=600`, `MAX_UPLOAD_MB=1` and no language model. Warm-up (one valid request of each endpoint and two invalid ones), then two rounds of the same 200 requests from 4 client threads, deterministic shuffle (seed 0): 100 invalid (PNG and text renamed `.pdf`, empty file, four kinds of malformed `names`, uploads of 1 MiB + 1 byte and 2 MiB, a PDF truncated to a third, unsupported language, missing file field, blank, 2,001-character and non-JSON questions; 6-7 of each) and 100 valid (40 extractions, 30 ingestions of sample documents under 1 MiB, the repeats `already_indexed`; 30 questions, refused or 503 `llm_unavailable`). Snapshots of the server process: open descriptors (`/proc/<pid>/fd` and their targets), threads and RSS (`/proc/<pid>/status`), the `/tmp` listing (`TMPDIR` is unset, so Starlette's spooled uploads go to `/tmp`), sampled every second during the rounds. Because no upload under `MAX_UPLOAD_MB=1` exceeds Starlette's 1 MB in-memory spool, a complement (`p83_spool.py`, default `MAX_UPLOAD_MB=20`, two rounds of 40 requests: 20 valid 300-DPI PDFs of 1.5-2.9 MB, 10 of them truncated to 60 %, 10 bodies of 21 MiB) exercised the disk spool, sampled every 0.2 s.
+
+| point | open fds | threads | RSS (MB) | `/tmp` entries | Tesseract processes |
+|---|---|---|---|---|---|
+| after start-up | 14 | 22 | 1,092 | 2 (pre-existing: `torchinductor_app`, a uv lock) | 0 |
+| after warm-up (baseline) | 14 | 23 | 1,859 | 2 | 0 |
+| round 1, maximum during | 30 | 34 | 2,375 | 2 (no descriptor on `/tmp`) | 5 |
+| round 1, right after / 10 s later | 14 / 14 | 29 / 29 | 2,375 / 2,375 | 2 / 2 | 0 |
+| round 2, maximum during | 30 | 32 | 2,399 | 2 | 5 |
+| round 2, right after / 10 s later | 14 / 14 | 29 / 29 | 2,386 / 2,386 | 2 / 2 | 0 |
+| spool complement, after each round | 14 | 29 | 1,810, 1,844 | 2 (at most one descriptor on an unlinked `/tmp` file seen during) | 0 |
+
+Every invalid request got its documented status and code (400 `empty_file`, 413 `too_large`, 415 `not_a_pdf`, 422 `invalid_names` / `unsupported_language` / `pdf_unreadable` / `invalid_question` / `invalid_request`) and every valid one 200, except questions that would need the model (503 `llm_unavailable`, 6 in round 1 and 10 in round 2 as the index grew); no other 5xx in either run. The spool complement returned 20 x 200, 10 x 422 `pdf_unreadable` and 10 x 413 per round.
+
+**Reading.** Descriptors return to 14 and the `/tmp` listing never changes (spooled uploads are unnamed temporary files, closed at the end of the request); no Tesseract process outlives its request. The thread count settles at 29 after the first round and stays there (idle AnyIO worker threads are kept for reuse; the pool is capped at 40). RSS rises once and then stays flat: +767 MB on the first requests (model working memory), +516 MB during the first loaded round, **+11 MB (0.5 %) during the second** identical round. The growth with concurrency is mostly allocator retention: glibc keeps per-thread malloc arenas and does not return their pages to the system. With `MALLOC_ARENA_MAX=2` (`p82_arena.py`, an environment variable of the C library, no code change) the server peak at limit 1 and 16 clients was 1,813 MB instead of 2,229 MB, and at limit 8 and 16 clients 1,956 MB instead of 2,391 MB, at unchanged throughput (15.5 and 45.4 docs/min); worth setting in the runtime image (block 6), measured on these runs only.
+
+**Start-up** (17 server starts across 13.2 and 13.3): process start to the first `/health/ready` 200 **10.4 s** (median 10.41, range 10.30-10.45). `/health` answers at the same moment, since Uvicorn accepts connections only after the lifespan has built the container. Split: importing `app.main` (FastAPI, torch, transformers, the adapters) 3.47 s (three fresh interpreters, 3.45-3.49); building the container in the lifespan 6.54 s (median of the `service started` log line's `duration_ms`, 6.46-6.58), of which the NER model 5.0 s and e5 1.55 s (timed separately in the 8.1 process; building a second container with the same models took 13 ms); the remaining ~0.4 s is interpreter and Uvicorn start-up, the Qdrant readiness probe (~28 ms) and the 50 ms polling interval. All starts were warm (model files in the page cache after the first run); a cold first start was not measured.
+
+**Verdict.** Accepted. HTTP and the direct use cases agree on every document, chunk and question of the sample; the edge costs about 2 ms per request; with the recommended limit a burst is shed with 503 `service_busy` and `Retry-After` only; descriptors, temporary files, processes and threads return to their baseline after 400 mixed requests, and RSS plateaus after the first loaded round. Uvicorn exits with the SIGTERM it received (status -15 / 143) after a clean shutdown (`service stopped` and `Application shutdown complete` are logged), which is its normal behaviour.
+
+---
+
+## 14. NER pipeline pool (task 10.1 of `add-http-api`, design D10)
+
+Scripts: `benchmarks/ner_pool/scripts/` (local, like every benchmark script; driver `run.sh`, see `benchmarks/README.md` step 8).
+
+`TransformersNameRecognizer` used to run its one pipeline under a lock, which capped one process at about 45-48 `/api/extract` documents per minute (13.2). It now keeps `NER_POOL_SIZE` token-classification pipelines that share one model and one tokenizer; a call takes a free pipeline, the forward passes run in parallel (eval mode, no gradients), and only the tokenizer steps (tokenising a text, grouping the predicted tokens) run under one lock shared by the pool. This section measures the recogniser alone; the end-to-end effect is in section 15.
+
+**Environment.** Image `docintel-nerpool` built (target `test`) from the tree with the pool (torch 2.14.1+cpu, transformers 5.21.0, tokenizers 0.23.3), run through `docker-compose.test.yml` without Qdrant (`run --no-deps`, project `nerpool`), same host and container view as section 13 (16 CPUs, nothing else running). Model `Davlan/xlm-roberta-base-ner-hrl` from the image. Inputs: the 60 documents of the seed-0 sample (section 2.8), read once with the production OCR engine without a language hint (`ocr_texts.py`); each page's NER input is cached exactly as the use case builds it (`title_case_caps(PageText.from_words(words).text)`): **101 page texts** (one page of the 102 has no text), 34 of them longer than the model's 512 tokens (so the 64-token-stride windowing runs). Scripts and raw outputs are in the session scratch folder (`ner_pool/scripts/{ocr_texts,correct,bench_one,bench_all,supp,control_shared_tokenizer,tok_mem,tables}.py`, outputs in `ner_pool/out/`; local, not committed).
+
+### 14.1 Identical output (`correct.py`)
+
+**Method.** Expected spans: a pool of 1 called sequentially on 111 texts (the 101 pages, plus 10 long texts of six pages joined, 1,972-3,230 tokens each, which exercise windowing and batching over many windows). Then a pool of 4 called from 16 threads on the same texts, in three rounds with different shuffles (seeds 0-2); every returned span list is compared for equality with the expected one. The pool's structure is read from the object.
+
+| check | result |
+|---|---|
+| spans, pool 4 under 16 threads vs pool 1 sequential | **111 / 111 texts identical in each of the 3 rounds** (333 calls, 1,590 spans per round), 0 exceptions; all 60 documents identical in every round |
+| structure | 4 pipelines, 1 model object, 1 weight tensor (`data_ptr`), 1 tokenizer (and 1 Rust tokenizer), model in eval mode |
+| wall time | pool 1 sequential 86.2 s; pool 4 at 16 threads 31.1, 31.7, 32.0 s (2.7-2.8 x) |
+| after `close()` | `ProcessingFailed('ner_failed', 'NER model is closed')` |
+
+The rejected design A (each pipeline with its own tokenizer, no lock) also gave 111 / 111 identical texts in all three rounds (`correct_designA.json`). A negative control (`control_shared_tokenizer.py`: 4 pipelines sharing one tokenizer **without** the lock, 16 threads, 3 rounds) returned 333 / 333 identical results with no exception as well: on these inputs a concurrent-use failure of the tokenizer was **not reproduced**, so the lock is a precaution resting on the tokenizer switching its truncation and padding settings in place (the reason given in the recogniser's docstring), not on a failure observed here. It costs little: the tokenizer steps are a small part of a call, and pool 4 with the lock is not slower than design A without it (14.3).
+
+### 14.2 Throughput: pool size x threads x concurrency (`bench_one.py`, `bench_all.py`)
+
+**Method.** Each configuration runs in a fresh process: the recogniser is built with `pool_size` P and `threads` T (`torch.set_num_threads(T)`), every pipeline is warmed up once (P concurrent calls), then the 101 page texts are recognised from 1, 2, 4 and 8 threads pulling from a shared queue. Two passes: pass 1 with configurations and concurrencies ascending, pass 2 with both descending; cells are the mean of the two. "docs/min" here is the NER rate alone: the 60 documents' 101 page texts per minute of wall time (not comparable with the end-to-end docs/min of sections 13 and 15, which include OCR). "Process CPUs" is the process's CPU time over wall time.
+
+| pool | threads | concurrent calls | docs/min (pass 1, pass 2) | mean | process CPUs | errors |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1 | 34.1, 35.3 | 34.7 | 1.00 | 0 |
+| 1 | 1 | 2 | 34.1, 35.6 | 34.9 | 1.00 | 0 |
+| 1 | 1 | 4 | 34.4, 35.5 | 35.0 | 1.00 | 0 |
+| 1 | 1 | 8 | 34.6, 35.6 | 35.1 | 1.00 | 0 |
+| 1 | 2 | 1 | 65.6, 65.8 | 65.7 | 1.99 | 0 |
+| 1 | 2 | 2 | 66.4, 65.9 | 66.2 | 1.99 | 0 |
+| 1 | 2 | 4 | 64.0, 65.4 | 64.7 | 1.99 | 0 |
+| 1 | 2 | 8 | 63.8, 66.9 | 65.3 | 1.99 | 0 |
+| 2 | 1 | 1 | 36.1, 35.2 | 35.7 | 1.00 | 0 |
+| 2 | 1 | 2 | 69.4, 68.3 | 68.9 | 2.00 | 0 |
+| 2 | 1 | 4 | 69.4, 67.8 | 68.6 | 1.99 | 0 |
+| 2 | 1 | 8 | 68.9, 68.8 | 68.9 | 1.99 | 0 |
+| 2 | 2 | 1 | 64.8, 65.5 | 65.2 | 1.99 | 0 |
+| 2 | 2 | 2 | 118.9, 117.3 | 118.1 | 3.91 | 0 |
+| 2 | 2 | 4 | 116.8, 117.8 | 117.3 | 3.90 | 0 |
+| 2 | 2 | 8 | 117.5, 117.7 | 117.6 | 3.90 | 0 |
+| 4 | 1 | 1 | 35.6, 35.8 | 35.7 | 1.00 | 0 |
+| 4 | 1 | 2 | 68.8, 69.5 | 69.2 | 1.99 | 0 |
+| 4 | 1 | 4 | 128.7, 127.7 | 128.2 | 3.96 | 0 |
+| 4 | 1 | 8 | 125.7, 126.1 | 125.9 | 3.88 | 0 |
+| 4 | 2 | 1 | 65.4, 64.8 | 65.1 | 1.99 | 0 |
+| 4 | 2 | 2 | 118.2, 117.5 | 117.8 | 3.91 | 0 |
+| **4** | **2** | 4 | 185.8, 186.6 | **186.2** | 7.60 | 0 |
+| 4 | 2 | 8 | 182.7, 182.7 | 182.7 | 7.49 | 0 |
+
+Best cell per configuration: pool 1 / 1 thread 35.1 (-81 % of the best), 1 / 2 66.2 (-64 %), 2 / 1 68.9 (-63 %), 2 / 2 118.1 (-37 %), 4 / 1 128.2 (-31 %), **4 / 2 186.2**. The rate scales with pool size x threads (the CPUs the recogniser can use) up to about 7.6 CPUs; concurrency beyond the pool size adds nothing. At equal CPUs, more pipelines with one thread each are slightly faster than fewer with two (4 / 1: 128.2 against 2 / 2: 118.1 on four CPUs).
+
+**Supplement: pool 8** (`supp.py`, same method, 8 and 16 concurrent calls, two interleaved passes against 4 / 2):
+
+| pool | threads | concurrent calls | docs/min (pass 1, pass 2) | mean | process CPUs | errors |
+|---|---|---|---|---|---|---|
+| 4 | 2 | 8 | 174.0, 185.6 | 179.8 | 7.51 | 0 |
+| 4 | 2 | 16 | 172.5, 188.6 | 180.5 | 7.62 | 0 |
+| 8 | 1 | 8 | 203.7, 207.5 | 205.6 | 7.70 | 0 |
+| 8 | 1 | 16 | 191.5, 198.9 | 195.2 | 7.42 | 0 |
+| 8 | 2 | 8 | 236.3, 236.4 | 236.4 | 15.33 | 0 |
+| 8 | 2 | 16 | 227.5, 228.7 | 228.1 | 14.95 | 0 |
+
+Alone on the host, pool 8 / 2 threads is 31 % faster than 4 / 2 but uses all 16 CPUs (15.3), which a server shares with Tesseract; pool 8 / 1 thread is 14 % faster than 4 / 2 on the same ~7.6 CPUs. Which one helps end to end depends on what OCR leaves free, so section 15 measures it in the server.
+
+### 14.3 Memory (RSS of the process, MB)
+
+| configuration | after import | after load | after warm-up | peak (`VmHWM`) over the cells, pass 1 / pass 2 |
+|---|---|---|---|---|
+| pool 1, 1 thread | 229 | 987 | 1,023 | 1,368 / 1,460 |
+| pool 1, 2 threads | 228 | 987 | 1,026 | 1,432 / 1,437 |
+| pool 2, 2 threads | 228 | 987 | 1,051 | 1,465 / 1,508 |
+| pool 4, 1 thread | 229 | 988 | 1,081 | 1,521 / 1,611 |
+| **pool 4, 2 threads** | 229 | 987 | **1,093** | **1,588 / 1,627** |
+| pool 8, 1 thread (supplement) | 229 | 987 | 1,206-1,225 | 1,723 / 1,853 |
+| pool 8, 2 threads (supplement) | 229 | 987 | 1,190-1,196 | 1,874 / 1,878 |
+| design A, pool 1, 2 threads (rejected) | 229 | 654 | 1,023 | 1,389 |
+| design A, pool 2, 2 threads (rejected) | 229 | 951 | 1,347 | 1,779 |
+| **design A, pool 4, 2 threads (rejected)** | 229 | 1,547 | **1,983** | **2,478** |
+
+"After load" of the final design includes the one warm-up call that `load_pipelines` makes. The shared pool costs **+70 MB** after warm-up and +160-190 MB at peak for pool 4 against pool 1 with the same 2 threads (1,093 against 1,026 MB; 1,588 / 1,627 against 1,432 / 1,437 MB: the working memory of four parallel forward passes). Design A, a tokenizer per pipeline, costs about **300 MB per extra tokenizer** (654 -> 951 -> 1,547 MB after loading 1, 2 and 4; this model's tokenizer has a 250,002-token vocabulary): at pool 4, **+890 MB** after warm-up (1,983 against 1,093 MB; +893 MB against the 1,090 MB of the supplement's second pass) and +850 MB at peak (2,478 against 1,627 MB), for no gain in throughput (design A pool 4 / 2 threads: 171.5-174.3 docs/min at 4-8 calls, single pass, against 182.7-186.2) or in correctness (14.1). It was rejected for that reason.
+
+**Choice (NER alone).** `NER_POOL_SIZE` = 4 with `NER_THREADS` = 2 was the default implemented: in the grid it is the fastest configuration (186.2 docs/min, **2.8 x** the 66.2 of the former single pipeline with 2 threads), with output identical to pool 1 and +70 MB resident. Pool 8 is faster when the recogniser has the host to itself (14.2 supplement). End to end, section 15 recommends pool 8: equivalent to 4 for short documents, 7 % faster for 50-page documents (15.6).
+
+**Caveats.** NER alone on cached text: the end-to-end rate is lower, since OCR shares the CPUs (section 15). `torch.set_num_threads` is process-wide (recogniser docstring), so every torch computation in the process, the embedder's included, uses the last value set. Design A was measured in one pass only. The negative control did not reproduce the tokenizer failure (14.1). Host-specific: re-measure on the target hardware.
+
+---
+
+## 15. Concurrency with the NER pool (tasks 10.1 and 10.7 of `add-http-api`, design D7)
+
+Scripts: `benchmarks/http_pool/scripts/` (local, like every benchmark script; driver `run.sh`, see `benchmarks/README.md` step 8).
+
+With the NER lock gone (section 14) the job limit of 13.2 had to be re-measured, together with the pool size, on real Uvicorn; task 10.7 adds 50-page documents. **Environment**: as in section 13, except the image: `docintel-test` built fresh with `docker compose -p block5ev2 -f docker-compose.test.yml build tests` from the tree with the pool, the job cancellation on disconnect and the drain after an early 413 (settings `MAX_CONCURRENT_QUESTIONS`, `READINESS_TIMEOUT_S`, `LOG_EXCEPTION_MESSAGES` at their defaults), compose project `block5ev2`, torn down with `down -v --remove-orphans` after every run; 16 CPUs in the container (`os.cpu_count()` and affinity 16; the host's AMD Ryzen 7 7700X has 8 cores with two hardware threads each); nothing else ran on the host. Scripts and raw outputs are in the session scratch folder (`http_evidence2/scripts/{p15,p107,p15res,ev2,tables15}.py` with `ev_common.py` and `run.sh` reused from section 13; outputs and server logs in `http_evidence2/out/`; local, not committed).
+
+### 15.1 Method
+
+Same request set and client as 13.2 (`p15.py`, derived from `p82.py`): one Uvicorn process per configuration with `MAX_CONCURRENT_JOBS` J, `NER_POOL_SIZE` P (optionally `OCR_WORKERS`, `NER_THREADS`) and `BUSY_WAIT_S=300` (the new maximum; nothing was rejected); the 25 sample documents (45 pages) of 13.2 sent as `POST /api/extract` with their name lists and no language hint, from c client threads (one `httpx.Client` each) pulling from a shared queue. Warm-up per server: 2 sequential requests, then 8 concurrent ones (so every pipeline of the pool has run once), not counted. Clients 8 and 16, and 24 for J >= 12. Two passes, configurations in reverse order in the second; the decisive configurations again with the set three times (75 requests). Per cell: docs/min = requests / wall; client latency p50 / p95 (it includes waiting for a slot); server peak RSS (`VmHWM`, reset per cell, and the 0.25 s sampled maximum, whichever is larger); peak of the server plus its Tesseract children; most Tesseract processes at once; CPU busy share of all 16 CPUs (`/proc/stat`); and from the use case's own `extraction completed` lines of the cell: `ocr_ms` and `ner_ms` summed over the jobs and divided by their pages (`ner_ms` includes waiting for a free pipeline), and the mean `duration_ms` (time a job holds its slot). Every request of every cell returned 200.
+
+**Sampling artefact in the process-tree peak.** Starting a Tesseract process forks the 2-3 GB server; for a moment the child (still named `uvicorn`, or already `tesseract` in the middle of `exec`) reports the parent's shared pages as its own RSS (2.1-2.7 GB). A sample that catches it adds that to the tree: such samples gave 4.6-6.2 GB "peaks" in about a third of the busy cells, while a running Tesseract never exceeded 127 MB. The tree peaks below leave those samples out (server RSS + RSS of the processes named `tesseract` below 500 MB); where only maxima were recorded, the bound server peak + peak Tesseract sum is used (marked †). The 5,228 MB peak of 13.2 (limit 16) was most likely the same artefact, which the 13.2 sampler could not tell apart.
+
+### 15.2 Job limit x pool size (short documents)
+
+25-request set, mean of two passes (docs/min at 8 / 16 / 24 clients; the other columns at 16 clients; peaks are the maxima over all clients of the configuration):
+
+| jobs | pool | docs/min at 8 / 16 / 24 clients | CPU busy | OCR ms / page | NER ms / page | server peak (MB) | server + Tesseract peak (MB) |
+|---|---|---|---|---|---|---|---|
+| 4 | 1 | 43.2 / 44.2 / - | 28 % | 1,710 | 1,103 | 1,878 | 2,238 |
+| 8 | 1 | 45.3 / 45.5 / - | 30 % | 1,840 | 3,209 | 2,055 | 2,845 |
+| 12 | 1 | 45.0 / 45.9 / 46.1 | 31 % | 2,114 | 4,835 | 2,267 | 3,451 |
+| 16 | 1 | 45.1 / 45.0 / 45.0 | 32 % | 2,628 | 6,313 | 2,456 | 3,877 |
+| 4 | 4 | 50.7 / 50.3 / - | 33 % | 1,750 | 734 | 1,903 | 2,269 |
+| 8 | 4 | 72.6 / 73.3 / - | 58 % | 2,166 | 1,042 | 2,062 | 2,825 |
+| 12 | 4 | 73.1 / 81.0 / 82.5 | 67 % | 2,490 | 1,617 | 2,276 | 3,364 |
+| 16 | 4 | 72.3 / 84.2 / 84.3 | 70 % | 2,865 | 2,381 | 2,449 | 3,915 |
+| 12 | 8 | 74.1 / 79.6 / 82.8 | 69 % | 2,588 | 1,538 | 2,373 | 3,695 |
+| 16 | 8 | 74.1 / 85.7 / 85.5 | 77 % | 3,116 | 2,130 | 2,461 | 4,027 |
+| 16 | 8, `NER_THREADS` 1 (invalid: see note) | 73.9 / 85.7 / 85.9 | 77 % | 3,081 | 2,102 | 2,464 | 3,997 |
+| 24 | 8 | 74.4 / 84.4 / 87.1 | 76 % | 3,042 | 2,106 | 2,756 | 4,426 |
+
+Pool 1 (the former single pipeline) reproduces 13.2: 43-46 docs/min at any job limit, NER per page (lock wait included) growing from 1.1 to 6.3 s while CPUs stay 70 % idle. With the pool, throughput rises to 82-87 docs/min. With 8 clients every limit from 8 up gives 72-74 docs/min (only 8 requests are in flight); the limits differ from 16 clients on. The pool-8 run repeated J 12 and 16 with pool 4 as controls (72.8 / 81.9 / 82.0 and 72.5 / 83.5 / 82.5), within 1-2 % of the grid. The `NER_THREADS` 1 row is invalid: the review of task 10.x found that `torch.set_num_threads` is process-wide and the embedder, built after the recogniser, set it to `EMBEDDING_THREADS` (2), so that run used 2 threads like the others; the settings were then merged into one `TORCH_THREADS`. Thread counts other than 2 were measured only for NER alone (section 14).
+
+**75-request runs** (the decisive pairs; 16 and 24 clients; † = bound, see 15.1):
+
+| jobs | pool | OCR workers | clients | docs/min (passes) | mean | p50 / p95 (s) | mean job in slot (s) | server peak (MB) | server + Tesseract peak (MB) | max Tesseract | CPU busy | OCR ms / page | NER ms / page |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8 | 4 | 4 | 16 | 78.9, 79.0 | 78.9 | 11.4 / 13.8 | 5.8 | 2,100 | 2,691 | 11 | 63 % | 2,140 | 1,076 |
+| 8 | 4 | 4 | 24 | 78.6, 78.8 | 78.7 | 17.0 / 19.4 | 5.8 | 2,104 | 2,837 | 11 | 63 % | 2,142 | 1,081 |
+| 12 | 4 | 4 | 16 | 88.2, 84.9, 88.3, 90.1 | 87.9 | 10.2 / 13.0 | 7.7 | 2,260 | 3,533 † | 15 | 76 % | 2,484 | 1,810 |
+| 12 | 4 | 4 | 24 | 88.3, 85.5, 88.5, 89.5 | 87.9 | 15.1 / 18.2 | 7.7 | 2,265 | 3,426 | 16 | 76 % | 2,473 | 1,817 |
+| 12 | 4 | 3 | 16 | 88.3, 89.3 | 88.8 | 10.1 / 12.6 | 7.6 | 2,260 | 3,126 | 14 | 76 % | 2,439 | 1,791 |
+| 12 | 4 | 3 | 24 | 82.0, 89.5 | 85.7 | 15.6 / 18.5 | 8.0 | 2,289 | 3,375 | 15 | 76 % | 2,540 | 1,883 |
+| 12 | 4 | 5 | 16 | 86.6, 89.1 | 87.8 | 10.0 / 13.3 | 7.7 | 2,317 | 3,245 | 15 | 76 % | 2,486 | 1,817 |
+| 12 | 4 | 5 | 24 | 88.6, 88.8 | 88.7 | 14.9 / 18.1 | 7.7 | 2,300 | 3,451 | 14 | 76 % | 2,439 | 1,820 |
+| **12** | **8** | 4 | 16 | 91.0, 91.5 | **91.2** | 9.8 / 13.0 | 7.5 | 2,303 | 3,180 | 15 | 79 % | 2,477 | 1,662 |
+| 12 | 8 | 4 | 24 | 90.6, 90.8 | 90.7 | 14.6 / 17.6 | 7.5 | 2,318 | 3,474 | 16 | 78 % | 2,476 | 1,665 |
+| 16 | 4 | 4 | 16 | 88.8, 89.4 | 89.1 | 9.7 / 14.8 | 10.1 | 2,377 | 3,957 † | 18 | 77 % | 2,596 | 3,018 |
+| 16 | 4 | 4 | 24 | 89.5, 88.3 | 88.9 | 14.3 / 21.4 | 10.2 | 2,415 | 3,849 | 18 | 77 % | 2,628 | 3,022 |
+| 16 | 8 | 4 | 16 | 89.2, 89.3 | 89.3 | 10.2 / 14.3 | 10.0 | 2,504 | 4,103 † | 19 | 82 % | 2,955 | 2,589 |
+| 16 | 8 | 4 | 24 | 89.0, 88.3 | 88.6 | 14.4 / 19.6 | 10.1 | 2,568 | 4,047 † | 19 | 82 % | 2,972 | 2,620 |
+| 12 | 8, `MALLOC_ARENA_MAX=2` | 4 | 16 | 91.9, 92.3 | 92.1 | 10.0 / 12.4 | 7.4 | 2,208 | 3,131 | 14 | 79 % | 2,467 | 1,636 |
+| 12 | 8, `MALLOC_ARENA_MAX=2` | 4 | 24 | 91.0, 91.2 | 91.1 | 14.8 / 17.2 | 7.5 | 2,194 | 3,472 | 14 | 79 % | 2,492 | 1,652 |
+
+The runs were made in four sessions (J 12 / 16 with pools 4 and 8; J 8 with J 12 / pool 4 and the `OCR_WORKERS` variants; J 12 / pool 8; the same with `MALLOC_ARENA_MAX=2`), each with two interleaved passes; J 12 / pool 4 appears in two sessions (88.2-90.1 except one pass at 84.9-85.5), so differences of 1-3 % between sessions are within run-to-run variation. A single request is as fast as before: the first warm-up requests of every server (2-page documents) took 3.5-3.8 s, as in 13.2. Start-up to readiness: 10.2-10.7 s with pool 4 or 8 (56 starts, the first, cold start of the session at 12.6 s excluded), as in 13.3.
+
+**`OCR_WORKERS`** (default `min(4, cpu_count)` = 4), tried one step down and up at J 12 / pool 4 because the CPUs were not saturated: 3 gives 88.8 / 85.7 and 5 gives 87.8 / 88.7 docs/min against 87.9 / 87.9, inside the pass-to-pass spread (one pass of 3 at 24 clients at 82.0). Short documents use at most 2-3 workers per job anyway. No change is recommended.
+
+### 15.3 50-page documents (task 10.7)
+
+**Documents.** One 50-page PDF per language (`p107.py`), made of the language's sample documents' pages in sample order, cycled, with the original page images copied unchanged (150-DPI grey JPEG scans, PyMuPDF `insert_pdf`), and the union of the included documents' name lists (16-45 names). Sizes 11.6-15.7 MB (en 11.6, es 13.2, pt 13.9, de 14.4, fr 15.7 MB), under `MAX_UPLOAD_MB` (20). The 1-2 MB first envisaged would need about 30 KB per page, i.e. re-encoding to about 75 DPI or bilevel images, unlike the corpus scans; the larger files are the stricter case for memory (each job holds its upload in memory). **Server**: `MAX_CONCURRENT_JOBS=12` (the recommended limit), `BUSY_WAIT_S=300`, pool 4 or 8, after the same warm-up. **Parts**: (a) 12 clients, each sending two long documents one after the other (24 requests, 1,200 pages); (b) 24 clients sending one long document each at once (12 wait for a slot); (c) mixed: 6 clients each send one long document while 6 clients send the short 25-document set in a loop until the long ones are done. Samples every 0.25 s as in 15.1.
+
+| part | pool | wall (s) | requests | latency long p50 / p95 / max (s) | short served, p50 / p95 / max (s) | server peak (MB) | server + Tesseract peak (MB) | max Tesseract | CPU busy | long: OCR / NER ms per page |
+|---|---|---|---|---|---|---|---|---|---|---|
+| a | 4 | 367.5 (369.9 in an earlier run) | 24 x 200 | 159 / 251 / 301 | - | 2,627 | 3,408 | 16 | 60 % | 1,050 / 2,172 |
+| a | 8 | 344.9, 342.2 | 24 x 200, 24 x 200 | 146-152 / 244-251 / 260-295 | - | 2,700-2,715 | 3,442-3,491 | 15 | 75-76 % | 1,188-1,204 / 1,861-1,923 |
+| b | 4 | 375.5 | 24 x 200 | 271 / 366 / 375 | - | 2,860 | 3,857 | 16 | 59 % | 1,074 / 2,186 |
+| c | 4 | 140.6, 137.5 | 6 + 74, 6 + 72 x 200 | 97-99 / 133-135 / 133-136 | 74 and 72; 7.6-8.7 / 26.5-33.1 / 44 | 2,428-2,862 | 3,336-3,846 | 16 | 63-64 % | 1,105-1,167 / 956-972 |
+| c | 8 | 140.7, 141.3 | 6 + 89, 6 + 92 x 200 | 129-131 / 136-137 / 137 | 89 and 92; 8.6-8.9 / 14.8-15.0 / 17.5 | 2,498-2,806 | 3,246 (one pass †: about 3.0 GB) | 15 | 78 % | 1,143-1,171 / 1,392-1,393 |
+
+The "earlier run" of part a is the first attempt of the same script, which completed every request but crashed in the sampler afterwards (fixed); its wall time is taken from the server log (first job start to last job end, 369.9 s), so it has no memory figures.
+
+**Findings.** Every request returned 200; no error, warning other than the request-failure lines, or timeout was logged: each 50-page job's whole OCR took 18-83 s with 4 workers, far from `OCR_TIMEOUT_S` (60 s per Tesseract call). A job holds its slot 47-347 s (mean 152-163 s in parts a and b), so with the default `BUSY_WAIT_S` of 10 s, part b's 12 waiting requests would have been answered 503 `service_busy` after 10 s (here they waited, under the 300 s used for the measurement). **Memory stays bounded by the job limit**: the server peaked at 2.6-2.9 GB and server + Tesseract at **3.9 GB at most**; in part b, 12 requests waiting with their 12-16 MB uploads did not raise the peak beyond part a's (part b started at 2,616 MB, retained from part a, and peaked at 2,860 MB; part a rose from 2,221 to 2,627 MB). Tesseract never exceeded **16 processes** (127 MB each at most, 1.3 GB together), although 12 jobs x 4 workers would allow 48: each job reads all its pages first and then runs NER page by page, so at any time part of the jobs are in their NER phase (no Tesseract process ran at all in 30 % of part a's samples), and pages reach Tesseract only as fast as they are rendered, one at a time under the process-wide PDFium lock (a likely contributor, not measured separately). Threads peaked at 90.
+
+With long documents, **NER is the bottleneck again**: 2.2 s of `ner_ms` per page (waiting for one of 4 pipelines included) against 1.05 s of OCR, with 40 % of the CPUs idle. Pool 8 brings it to 1.9 s per page, uses 75 % of the CPUs and finishes part a **7 % sooner** (342-345 s against 367-370 s). In the mixed run it serves **24 % more short documents** in the same time (89-92 against 72-74) and **halves their p95** (15 s against 27-33 s; max 17.5 s against 44 s), while the long documents take longer (p50 129-131 s against 97-99 s): with 8 pipelines, short documents' pages wait less behind long documents' 50 pages. Pages per minute in part c: 196-198 with pool 8, 185-188 with pool 4. The server peak was no higher with pool 8 (2.5-2.8 GB against 2.4-2.9 GB; section 14 measured +100-250 MB for the NER part alone).
+
+### 15.4 Where the bottleneck is now
+
+| configuration | OCR ms / page | NER ms / page | CPU busy | docs/min |
+|---|---|---|---|---|
+| one request, unloaded (warm-up, 2-page documents) | 1,240-1,330 | 530-580 | - | - |
+| pool 1, J 8, 16 clients (former behaviour) | 1,840 | 3,209 | 30 % | 45.5 |
+| pool 4, J 8, 16 clients, 75 requests | 2,140 | 1,076 | 63 % | 78.9 |
+| pool 4, J 12, 16 clients, 75 requests | 2,484 | 1,810 | 76 % | 87.9 |
+| pool 8, J 12, 16 clients, 75 requests | 2,477 | 1,662 | 79 % | 91.2 |
+| pool 8, J 16, 16 clients, 75 requests | 2,955 | 2,589 | 82 % | 89.3 |
+| 50 pages, pool 4, J 12 (part a) | 1,050 | 2,172 | 60 % | 3.9 |
+| 50 pages, pool 8, J 12 (part a) | 1,188-1,204 | 1,861-1,923 | 75-76 % | 4.2 |
+
+For short documents the NER lock is gone as a bottleneck: per-page NER time no longer explodes (1.7-1.8 s at J 12, against 3.2-6.3 s with one pipeline) and throughput doubles (45.5 -> 87.9-91.2 docs/min). What limits it now is the **CPU shared by Tesseract and NER**: beyond J 12 both stages only get slower per page (OCR 2.5 -> 3.0 s, NER 1.7 -> 2.6 s from J 12 to J 16 with pool 8) at the same throughput, and more jobs (16, 24), more pipelines (8), more or fewer OCR workers (3, 5) or one NER thread per pipeline all stay within 88-92 docs/min. The CPUs are 76-82 % busy over a run, ramp-up and tail included, i.e. 12-13 of 16 logical CPUs; the host has 8 physical cores with two hardware threads each, so the remaining share is mostly second hardware threads of busy cores (an inference; per-core load was not measured). For long documents the bottleneck is NER, because a job does its NER page by page after its OCR and the pool is shared by all jobs (15.3). More throughput on this host would need less CPU per page (a faster NER runtime, ONNX or quantisation; fewer Tesseract passes, e.g. a language hint, which skips the detection read) or more hosts.
+
+### 15.5 Resources and cancellation at the recommended settings (`p15res.py`)
+
+**Method.** As 13.3, at `MAX_CONCURRENT_JOBS=12`, `NER_POOL_SIZE` 8 (and 4 for comparison), `MAX_UPLOAD_MB=1`, no language model, with two changes: 20 of the 100 valid requests of the 13.3 mix are replaced by **clients that disconnect mid-job** (10 `/api/extract`, 10 `/api/ingest`, 2-3-page sample documents: a raw socket sends the whole request, waits 0.3, 0.8, 1.5, 2.2 or 3.0 s and closes without reading), and `BUSY_WAIT_S=2`, so that a job slot never freed would show up as 503 `service_busy` (the 4 client threads keep at most 4 jobs plus cancelled ones still finishing a step). After each round: snapshots right after and after 10 s idle (descriptors, threads, RSS, `/tmp`, Tesseract processes anywhere in the container), then a **slot check**: 12 simultaneous extractions released by a barrier must all get 200 (one leaked slot would make one of them wait more than 2 s, then 503). Four rounds per run (the first run had two).
+
+| run | RSS after warm-up | RSS after rounds 1 / 2 / 3 / 4 (10 s idle) | max during rounds: RSS, server + Tesseract, fds, threads, Tesseract | after each round: fds / threads / `/tmp` entries / Tesseract |
+|---|---|---|---|---|
+| pool 8 | 1,865 | 2,497 / 2,856 / 3,068 / 3,299 | 3,457, 3,763, 32, 60, 5 | 15 / 38 / 2 / 0 |
+| pool 8, earlier 2-round run | 1,865 | 2,458 / 2,925 | 2,925, 3,373, 34, 61, 6 | 15 / 38 / 2 / 0 |
+| pool 4 | 1,855 | 2,456 / 2,845 / 3,113 / 3,129 | 3,335, 3,711, 33, 60, 5 | 15 / 38 / 2 / 0 |
+| pool 8, no disconnecting clients | 1,864 | 2,366 / 2,884 / 3,040 / 3,060 | 3,282, 3,667, 33, 61, 6 | 15 / 36 / 2 / 0 |
+| pool 8, `MALLOC_ARENA_MAX=2` | 1,815 | **2,302 / 2,461 / 2,454 / 2,462** | 2,462, 2,921, 32, 60, 5 | 15 / 38 / 2 / 0 |
+
+**Cancellation.** In each of the 14 rounds with disconnecting clients, 19 of the 20 were cancelled: **19 access lines with status 499** (10 `/api/extract`, 9 `/api/ingest`), 9-10 `extraction cancelled` and 9 `ingestion cancelled` lines (a 499 without a use-case line is a request whose job had not started, which the use case never sees; not checked further); the 20th had already received its 200 when its client closed (a job finished within 3.0 s). The request ended 0.04-0.07 s (median) and at most 0.47 s after the client closed (499 duration minus the client's waiting time, matched in sorted order). **No Tesseract process outlived its job** (0 in the container after every round and after shutdown), and **every slot check returned 12 x 200** (4.6-9.0 s) with no 503 `service_busy` anywhere, so cancelled jobs free their slots. Every other request got the status and code of 13.3 (400, 413, 415, 422 as documented; 200; 503 `llm_unavailable` only for questions that need the model, 6 then 10 per round); no other 5xx.
+
+**Resources.** Descriptors return to 15 (14 right after start-up, one more socket after the warm-up) and the `/tmp` listing never changes (the two pre-existing entries); threads settle at 36-38 when idle (the 12 job threads are kept; 52 right after a slot check). **RSS does not plateau as in 13.3** (where the second round added 11 MB at limit 8 with one pipeline): it grows by 360-520 MB in round 2 and by 16-270 MB per round after that, about the same with or without disconnecting clients (so it is not the cancellation path) and with pool 4 or 8 (pool 4 had nearly stopped: +16 MB in round 4). With `MALLOC_ARENA_MAX=2` it stops after the first round (2,461 -> 2,454 -> 2,462 MB), about 840 MB lower after four rounds, so the growth is glibc keeping per-thread malloc arenas for the 12 job threads and the NER threads, not a leak. The cap also cost nothing in throughput (J 12 / pool 8: 91.1-92.1 docs/min against 90.7-91.2, server peak 2.2 GB against 2.3 GB, 15.2). Setting it in the runtime image (block 6), already suggested in 13.3, is now clearly worth it.
+
+### 15.6 Choice
+
+D7's rule, the smallest setting within 5 % of the best throughput, applied to both workloads:
+
+- **Short documents** (75-request runs): best 91.2 docs/min (J 12 / pool 8); the 5 % band starts at 86.6. J 8 reaches 78.9 (-13.5 %), outside; **J 12 is the smallest limit inside** (87.9 with pool 4, 91.2 with pool 8); 16 and 24 add nothing (88.6-89.3; 87.1 on the short set). Both pools are inside at J 12.
+- **50-page documents** (J 12): pool 4 needs 367-370 s for part a against 342-345 s with pool 8, i.e. **6.8 % less throughput, outside the band**; pool 8 is inside on both workloads, and under mixed load it serves 24 % more short documents with half the p95.
+
+**Applied: `MAX_CONCURRENT_JOBS` = 12, `NER_POOL_SIZE` = 8, `TORCH_THREADS` = 2 (the former `NER_THREADS` = `EMBEDDING_THREADS` = 2), `OCR_WORKERS` unset (min(4, CPUs) = 4, unchanged), `BUSY_WAIT_S` = 10 s (unchanged).** If the traffic is short documents only, pool 4 is equivalent (within 1-4 %) and saves the extra pipelines' memory (+100-250 MB for NER alone in section 14; not visible in the server peaks here). `BUSY_WAIT_S`, by the reasoning of 13.2 (about one loaded job's duration): at J 12 a job holds its slot 7.4-7.7 s on average and a request at 16 clients waits and runs 9.6-10.8 s (p50), so 10 s is still about one loaded job; with jobs finishing at staggered times a slot frees about every 7.5 s / 12 = 0.6 s, so about 16 queued requests are admitted before the service sheds load; a served short request completes within about 18 s (p95 at 24 clients), under common 30 s proxy timeouts. 50-page jobs hold a slot 47-347 s, so a burst of long documents is shed after 10 s, the intended behaviour (clients retry after `Retry-After`). **Expected envelope** at these settings on this host: 88-92 short docs/min per process; in the throughput runs the server peaks at 2.2-2.3 GB and server + Tesseract at 3.5 GB with short documents, and at 2.6-2.9 GB and 3.9 GB with 50-page documents; without `MALLOC_ARENA_MAX=2` the server's RSS keeps growing by allocator retention (3.3-3.5 GB after four resource rounds, 15.5), with it it stayed at 2.5 GB.
+
+**Caveats.** One host, synthetic scans, no language hint (detection reads the first pages twice); the client ran in the server's container and shares its CPUs. Configurations measured in different sessions differ by up to 3 % for the same setting; the 50-page comparison rests on two passes per pool (part a) and two passes of part c, part b on one pass (pool 4). Pool 8 at J 8 and J 12 with 50-page documents at other limits were not measured. The tree peaks marked † are upper bounds. The PDFium lock as a limit on concurrent Tesseract processes and the reading of the idle CPU share as second hardware threads are inferences, not measurements. `KNOWN_LIMITATIONS.md` P4 (one process tops out at 45-48 docs/min behind the NER lock) describes the state before the pool.
