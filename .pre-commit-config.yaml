@@ -31,12 +31,11 @@ repos:
         language: system
         entry: uv run --no-sync ruff format --force-exclude
         types: [python]
-        exclude: ^app/services/
 
       - id: mypy
         name: mypy
         language: system
-        entry: uv run --no-sync mypy app/domain app/application app/adapters tests
+        entry: uv run --no-sync mypy app tests
         files: ^(app|tests)/.*\.py$|^pyproject\.toml$
         pass_filenames: false
 
