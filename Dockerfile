@@ -221,7 +221,11 @@ RUN apt-get update \
 # HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE: the model is baked in, nothing is fetched at run time.
 # NER_MODEL_PATH: where the baked-in model lives (read by the `ner_model` tests and app settings).
 # EMBEDDING_MODEL_PATH/EMBEDDING_MODEL_REVISION: the baked-in e5 embedder and its pinned commit.
+# MALLOC_ARENA_MAX=2: glibc otherwise keeps one memory arena per worker thread; under load the
+# service's RSS kept growing by 16-520 MB per round of 200 requests, while with 2 arenas it stays
+# flat about 840 MB lower at the same throughput (docs/BENCHMARKS.md section 15).
 ENV PYTHONDONTWRITEBYTECODE=1 \
+    MALLOC_ARENA_MAX=2 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=0 \
