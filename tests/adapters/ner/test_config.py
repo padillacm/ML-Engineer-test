@@ -16,6 +16,7 @@ def test_defaults_are_the_benchmarked_configuration(model_dir: Path) -> None:
     assert config.aggregation == "first"
     assert (config.stride, config.threads, config.batch_size) == (64, 2, 8)
     assert config.max_chars == 50_000
+    assert config.pool_size == 8
     assert config.path == model_dir
 
 
@@ -76,7 +77,7 @@ def test_unreadable_config_json_is_invalid(model_dir: Path, content: str) -> Non
         TransformersNerConfig(model_dir)
 
 
-@pytest.mark.parametrize("field", ["stride", "threads", "batch_size", "max_chars"])
+@pytest.mark.parametrize("field", ["stride", "threads", "batch_size", "max_chars", "pool_size"])
 @pytest.mark.parametrize("value", [0, -1, 1.5, True, "2"])
 def test_counts_must_be_positive_integers(model_dir: Path, field: str, value: object) -> None:
     with pytest.raises(ConfigurationError, match=field):

@@ -1,16 +1,20 @@
-"""The real loading and inference path (``load_pipeline``) on a tiny local model, on the host."""
+"""The real loading and inference path (``load_pipelines``) on a tiny local model, on the host."""
 
 import json
 import shutil
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
 from app.adapters.ner import TransformersNameRecognizer, TransformersNerConfig
-from app.adapters.ner.recognizer import load_pipeline
+from app.adapters.ner.recognizer import load_pipelines
 from app.application.ports import NameRecognizer
 from app.domain.errors import ConfigurationError
 from tests.adapters.ner.tiny_model import MAX_LENGTH
@@ -112,7 +116,7 @@ def test_a_slow_tokenizer_is_refused(copied_model: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", slow)
 
     with pytest.raises(ConfigurationError, match="fast tokenizer"):
-        load_pipeline(TransformersNerConfig(copied_model, stride=4))
+        load_pipelines(TransformersNerConfig(copied_model, stride=4))
 
 
 def test_weights_of_another_architecture_are_refused(copied_model: Path) -> None:
@@ -148,3 +152,114 @@ def test_a_failed_load_leaves_the_thread_count_unchanged(copied_model: Path) -> 
         TransformersNameRecognizer(TransformersNerConfig(copied_model, stride=4, threads=target))
 
     assert torch.get_num_threads() == before
+
+
+class Concurrency:
+    """Counts how many calls of one kind run at once; each call lasts at least ``pause``."""
+
+    def __init__(self, pause: float) -> None:
+        self.pause = pause
+        self.guard = threading.Lock()
+        self.active = 0
+        self.peak = 0
+        self.calls = 0
+
+    def wrap(self, function: Callable[..., Any]) -> Callable[..., Any]:
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            with self.guard:
+                self.active += 1
+                self.calls += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                time.sleep(self.pause)
+                return function(*args, **kwargs)
+            finally:
+                with self.guard:
+                    self.active -= 1
+
+        return counted
+
+
+def test_a_pool_shares_one_model_and_one_tokenizer(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import transformers  # noqa: PLC0415 - patched only in this test
+
+    real_pipeline = transformers.pipeline
+    real_model = transformers.AutoModelForTokenClassification.from_pretrained
+    built: list[tuple[object, object]] = []
+    loads: list[object] = []
+
+    def recording_pipeline(*args: object, **kwargs: object) -> object:
+        built.append((kwargs["model"], kwargs["tokenizer"]))
+        return real_pipeline(*args, **kwargs)  # type: ignore[call-overload]
+
+    def counting_model(*args: Any, **kwargs: Any) -> object:
+        loads.append(args)
+        return real_model(*args, **kwargs)
+
+    monkeypatch.setattr(transformers, "pipeline", recording_pipeline)
+    monkeypatch.setattr(
+        transformers.AutoModelForTokenClassification, "from_pretrained", counting_model
+    )
+
+    classifiers = load_pipelines(TransformersNerConfig(tiny_model_dir, stride=4, pool_size=3))
+
+    assert len(classifiers) == 3
+    assert len(loads) == 1
+    assert len(built) == 3
+    assert len({id(model) for model, _ in built}) == 1
+    assert len({id(tokenizer) for _, tokenizer in built}) == 1
+
+
+def test_tokenizer_steps_are_serialised_while_forward_passes_overlap(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import transformers  # noqa: PLC0415 - patched only in this test
+
+    real_pipeline = transformers.pipeline
+    built: list[Any] = []
+
+    def recording_pipeline(*args: object, **kwargs: object) -> object:
+        built.append(kwargs)
+        return real_pipeline(*args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(transformers, "pipeline", recording_pipeline)
+    classifiers = load_pipelines(TransformersNerConfig(tiny_model_dir, stride=4, pool_size=4))
+    model, tokenizer = built[0]["model"], built[0]["tokenizer"]
+    tokenizing = Concurrency(pause=0.01)
+    grouping = Concurrency(pause=0.002)
+    forward = Concurrency(pause=0.03)
+    monkeypatch.setattr(type(tokenizer), "__call__", tokenizing.wrap(type(tokenizer).__call__))
+    monkeypatch.setattr(
+        type(tokenizer),
+        "convert_tokens_to_string",
+        grouping.wrap(type(tokenizer).convert_tokens_to_string),
+    )
+    model.forward = forward.wrap(model.forward)
+    text = SENTENCE * 2
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda index: classifiers[index % 4](text), range(12)))
+
+    assert all(result == results[0] for result in results)
+    assert tokenizing.calls == 12
+    assert grouping.calls >= 12
+    assert (tokenizing.peak, grouping.peak) == (1, 1)
+    assert forward.peak > 1
+
+
+def test_concurrent_calls_on_a_pool_match_a_pool_of_one(tiny_model_dir: Path) -> None:
+    texts = [SENTENCE * repeat + "Signed by Peter Smith." for repeat in range(1, 9)] * 4
+    single = TransformersNameRecognizer(TransformersNerConfig(tiny_model_dir, stride=4))
+    pooled = TransformersNameRecognizer(
+        TransformersNerConfig(tiny_model_dir, stride=4, pool_size=4)
+    )
+    expected = [single.find_persons(text) for text in texts]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(pooled.find_persons, texts))
+
+    assert results == expected
+    pooled.close()
+    single.close()

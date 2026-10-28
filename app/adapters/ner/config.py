@@ -27,11 +27,20 @@ class TransformersNerConfig:
     or ``pytorch_model.bin``); nothing is ever downloaded. ``labels`` are the entity groups
     reported (the model's ``PER``), ``aggregation`` and ``stride`` (overlap, in tokens, between
     the windows of a text longer than the model input) are passed to the ``transformers``
-    pipeline, ``threads`` is the torch intra-op thread count and ``batch_size`` the number of
-    windows of one long text run together. ``max_chars`` bounds the text of one call: a longer
-    text is refused without running the model, because inference costs about 0.25 s per 1,000
-    characters at 2 threads and holds the recogniser's lock meanwhile (a 200,000-character text
-    took 75 s). 50,000 characters is several dense pages of text, far above one OCR page.
+    pipeline, ``threads`` is the torch intra-op thread count (process-wide: creating the
+    recogniser sets it for every torch computation in the process, and the last torch adapter
+    created wins, so the service passes the one ``TORCH_THREADS`` to the recogniser and the
+    embedder; the field stays for standalone use by benchmarks and scripts) and ``batch_size``
+    the number of windows of one long text run together. ``max_chars`` bounds the text of one
+    call: a longer text is refused without running the model, because inference costs about
+    0.25 s per 1,000 characters at 2 threads and holds one of the recogniser's pipelines
+    meanwhile (a 200,000-character text took 75 s). 50,000 characters is several dense pages
+    of text, far above one OCR page.
+    ``pool_size`` is the number of texts recognised at once: that many pipelines share one copy
+    of the model weights and one tokenizer (its steps run under one lock); a call waits for a free
+    one. Each running call uses ``threads`` intra-op threads, so up to ``pool_size`` x ``threads``
+    CPUs are busy. The default 8 is the measured best end to end with 2 threads, mostly for
+    long documents (BENCHMARKS 14 and 15).
     Invalid values raise ``ConfigurationError``.
     """
 
@@ -42,6 +51,7 @@ class TransformersNerConfig:
     threads: int = 2
     batch_size: int = 8
     max_chars: int = 50_000
+    pool_size: int = 8
 
     def __post_init__(self) -> None:
         _require(
@@ -58,6 +68,7 @@ class TransformersNerConfig:
         _require(_is_positive_int(self.threads), "threads must be a positive integer")
         _require(_is_positive_int(self.batch_size), "batch_size must be a positive integer")
         _require(_is_positive_int(self.max_chars), "max_chars must be a positive integer")
+        _require(_is_positive_int(self.pool_size), "pool_size must be a positive integer")
         _validate_model_directory(self.path)
         max_length = _declared_max_length(self.path)
         _require(

@@ -4,22 +4,31 @@ The model is loaded once, when the recogniser is created, from ``TransformersNer
 with ``local_files_only=True``: nothing is fetched from the network, and a missing or unusable
 model fails creation with ``ConfigurationError`` instead of failing the first request.
 
-Thread safety: ``find_persons`` may be called from several threads; inference is serialised by
-one lock per recogniser because the ``transformers`` pipeline is not documented as thread-safe.
+Thread safety: ``find_persons`` may be called from several threads. The recogniser keeps a pool
+of ``config.pool_size`` pipeline objects (each with its own per-call state) that share one model
+and one tokenizer. A call takes a free pipeline, waiting while all are busy, and always gives it
+back. The model only runs forward in ``eval`` mode without gradients, which torch allows from
+several threads at once, so up to ``pool_size`` forward passes run in parallel. The fast
+tokenizer is not thread-safe (it switches its truncation and padding settings in place, and a
+concurrent use then fails), so every step of the pipelines that uses it (tokenising a text,
+grouping the predicted tokens into entities) runs under one lock shared by the pool; those steps
+are a small part of a call. A tokenizer per pipeline would avoid the lock but costs about 300 MB
+of memory each for this model's 250,002-token vocabulary.
 
 Threads: a successful creation calls ``torch.set_num_threads(config.threads)``, which is
-process-wide. Every torch computation in the process (including another recogniser) then uses
-that many intra-op threads; the last recogniser created wins. A failed creation leaves the
-thread count unchanged.
+process-wide. Every torch computation in the process (the embedder's and another recogniser's
+included) then uses that many intra-op threads; the last torch adapter created wins, so the
+service gives both the same value (``TORCH_THREADS``). A failed creation leaves the thread count
+unchanged. ``pool_size`` concurrent calls use up to ``pool_size`` x ``threads``.
 
 Input size: a text longer than ``config.max_chars`` is refused before the model runs (inference
-time grows linearly with the text and holds the lock; see ``TransformersNerConfig``).
+time grows linearly with the text and holds a pipeline; see ``TransformersNerConfig``).
 """
 
 import threading
 import warnings
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TypeGuard
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, TypeGuard
 
 import torch
 
@@ -34,14 +43,15 @@ type TokenClassifier = Callable[[str], Sequence[Entity]]
 ``start``/``end`` are character offsets into the text. The ``word`` field is not used: the
 pipeline rebuilds it from sub-word tokens and can glue words together ("MariaGonzalez").
 """
-type PipelineFactory = Callable[[TransformersNerConfig], TokenClassifier]
+type PipelineFactory = Callable[[TransformersNerConfig], Sequence[TokenClassifier]]
+"""Builds ``config.pool_size`` classifiers, each safe to run while the others run."""
 
 
 class TransformersNameRecognizer:
     """Finds the spans of the configured entity groups (``PER``) in a text.
 
-    ``pipeline_factory`` builds the classifier from the configuration; the default loads the
-    local model with ``transformers``. Tests pass a stub.
+    ``pipeline_factory`` builds the pool of classifiers from the configuration; the default loads
+    the local model with ``transformers``. Tests pass a stub. ``close`` releases the pipelines.
     """
 
     def __init__(
@@ -49,17 +59,24 @@ class TransformersNameRecognizer:
         config: TransformersNerConfig,
         pipeline_factory: PipelineFactory | None = None,
     ) -> None:
-        factory = load_pipeline if pipeline_factory is None else pipeline_factory
+        factory = load_pipelines if pipeline_factory is None else pipeline_factory
         try:
-            self._classify = factory(config)
+            classifiers = list(factory(config))
         except ServiceError:
             raise
         except Exception as error:  # every other loading failure is a configuration error
             raise ConfigurationError(f"NER model could not be loaded from {config.path}") from error
+        if len(classifiers) != config.pool_size:
+            raise ConfigurationError(
+                f"NER pipeline factory built {len(classifiers)} pipelines "
+                f"instead of pool_size={config.pool_size}"
+            )
         torch.set_num_threads(config.threads)
         self._max_chars = config.max_chars
         self._labels = frozenset(config.labels)
-        self._lock = threading.Lock()
+        self._free = classifiers
+        self._changed = threading.Condition()
+        self._closed = False
 
     def find_persons(self, text: str) -> list[TextSpan]:
         """Return the person-name spans of ``text`` in order, without overlaps.
@@ -68,7 +85,9 @@ class TransformersNameRecognizer:
         overlap are merged into one. A blank text returns ``[]`` and a text longer than
         ``max_chars`` raises ``ProcessingFailed`` (code ``ner_failed``), both without running
         the model. Any failure of the model raises ``ProcessingFailed`` (code ``ner_failed``)
-        with a fixed message; the original exception is kept as ``__cause__``.
+        with a fixed message; the original exception is kept as ``__cause__``. A call on a
+        closed recogniser, or still waiting for a pipeline when it is closed, raises
+        ``ProcessingFailed`` (code ``ner_failed``) too.
         """
         if len(text) > self._max_chars:
             raise ProcessingFailed(
@@ -76,26 +95,53 @@ class TransformersNameRecognizer:
             )
         if not text.strip():
             return []
-        with self._lock:
-            try:
-                entities = self._classify(text)
-            except ServiceError:
-                raise
-            except Exception as error:  # every vendor failure becomes one fixed error
-                raise ProcessingFailed(
-                    "NER model could not process the text", "ner_failed"
-                ) from error
+        classify = self._acquire()
+        try:
+            entities = classify(text)
+        except ServiceError:
+            raise
+        except Exception as error:  # every vendor failure becomes one fixed error
+            raise ProcessingFailed("NER model could not process the text", "ner_failed") from error
+        finally:
+            self._release(classify)
         return merge_spans(_label_spans(entities, text, self._labels))
 
+    def close(self) -> None:
+        """Release the pipelines (idempotent); calls already running finish normally.
 
-def load_pipeline(config: TransformersNerConfig) -> TokenClassifier:
-    """Load tokenizer and model from ``config.path`` (local files only) into a pipeline.
+        A pipeline in use when ``close`` runs is dropped as soon as its call returns.
+        """
+        with self._changed:
+            self._closed = True
+            self._free.clear()
+            self._changed.notify_all()
 
-    Raises ``ConfigurationError`` when the tokenizer is not a fast one (character offsets and
-    ``stride`` need it), when ``stride`` does not fit the model input, when the weights do not
-    fit the declared architecture (missing, unexpected or mismatched tensors: ``transformers``
-    would otherwise initialise the missing ones at random and only log a warning) or when the
-    model has no entity tag for a configured label. Other loading errors are left to the caller.
+    def _acquire(self) -> TokenClassifier:
+        with self._changed:
+            while not self._free and not self._closed:
+                self._changed.wait()
+            if self._closed:
+                raise ProcessingFailed("NER model is closed", "ner_failed")
+            return self._free.pop()
+
+    def _release(self, classify: TokenClassifier) -> None:
+        with self._changed:
+            if not self._closed:
+                self._free.append(classify)
+                self._changed.notify()
+
+
+def load_pipelines(config: TransformersNerConfig) -> list[TokenClassifier]:
+    """Load the model once from ``config.path`` (local files only) into ``pool_size`` pipelines.
+
+    The pipelines share the model and the tokenizer; their tokenizer steps share one lock (see
+    the module docstring), and one warm-up call settles the tokenizer's truncation and padding
+    settings before any concurrent use. Raises ``ConfigurationError`` when the tokenizer is not a
+    fast one (character offsets and ``stride`` need it), when ``stride`` does not fit the model
+    input, when the weights do not fit the declared architecture (missing, unexpected or
+    mismatched tensors: ``transformers`` would otherwise initialise the missing ones at random
+    and only log a warning) or when the model has no entity tag for a configured label. Other
+    loading errors are left to the caller.
     """
     from transformers import (  # noqa: PLC0415 - heavy import, needed only to load a model
         AutoModelForTokenClassification,
@@ -129,26 +175,65 @@ def load_pipeline(config: TransformersNerConfig) -> TokenClassifier:
     missing = sorted(set(config.labels) - groups)
     if missing:
         raise ConfigurationError(f"NER model has no entity tags for labels {missing}: {path}")
-    classifier = pipeline(
-        "token-classification",
-        model=model,
-        tokenizer=tokenizer,
-        aggregation_strategy=config.aggregation,
-        stride=config.stride,
-        device="cpu",
-    )
     # SentencePiece tokenizers (XLM-R) have no sub-word prefix, so with "first"/"average"/"max"
     # the pipeline decides word starts from the surrounding spaces and warns on every call.
     # That heuristic is the benchmarked behaviour; this one message is ignored process-wide
-    # (``catch_warnings`` per call is not thread-safe).
+    # (``catch_warnings`` per call is not thread-safe). Adding an identical filter replaces the
+    # existing one, so loading again does not grow the filter list.
     warnings.filterwarnings(
         "ignore",
         message="Tokenizer does not support real words",
         category=UserWarning,
         module=r"transformers\.pipelines\.token_classification",
     )
-    batch_size = config.batch_size
+    tokenizer_lock = threading.Lock()
+    classifiers = []
+    for _ in range(config.pool_size):
+        classifier = pipeline(
+            "token-classification",
+            model=model,
+            tokenizer=tokenizer,
+            aggregation_strategy=config.aggregation,
+            stride=config.stride,
+            device="cpu",
+        )
+        _serialise_tokenizer_steps(classifier, tokenizer_lock)
+        classifiers.append(_batched(classifier, config.batch_size))
+    # Every call passes the same tokenizer settings, so after this first call the tokenizer's
+    # truncation and padding are never changed again (only read), and the pipeline's one-time
+    # set-up (the TOKENIZERS_PARALLELISM environment variable) has happened.
+    classifiers[0](_WARM_UP_TEXT)
+    return classifiers
 
+
+_WARM_UP_TEXT = "Maria Gonzalez signed the agreement."
+
+
+def _serialise_tokenizer_steps(classifier: Any, lock: threading.Lock) -> None:
+    """Run the pipeline's ``preprocess`` (tokenising) and ``postprocess`` (grouping) under ``lock``.
+
+    The pipeline looks both up on the instance when it is called, so instance attributes take
+    the place of the methods; ``forward`` (the model) stays outside the lock. ``preprocess`` is
+    a generator over the text's windows: the windows are all produced (one tokenizer call)
+    inside the lock and handed out afterwards.
+    """
+    preprocess = classifier.preprocess
+    postprocess = classifier.postprocess
+
+    def locked_preprocess(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        with lock:
+            windows = list(preprocess(*args, **kwargs))
+        return iter(windows)
+
+    def locked_postprocess(*args: Any, **kwargs: Any) -> Any:
+        with lock:
+            return postprocess(*args, **kwargs)
+
+    classifier.preprocess = locked_preprocess
+    classifier.postprocess = locked_postprocess
+
+
+def _batched(classifier: Callable[..., Sequence[Entity]], batch_size: int) -> TokenClassifier:
     def classify(text: str) -> Sequence[Entity]:
         return classifier(text, batch_size=batch_size)
 
