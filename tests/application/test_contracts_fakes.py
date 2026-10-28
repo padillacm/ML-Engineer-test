@@ -6,10 +6,16 @@ parametrised factory) that overrides the same fixtures.
 
 import pytest
 
-from app.application.ports import Embedder, OcrEngine, VectorStore
+from app.application.ports import Embedder, NameRecognizer, OcrEngine, VectorStore
 from app.domain.types import Box, EmbeddingIdentity, OcrPage, PageWord
-from tests.application.contracts import EmbedderContract, OcrEngineContract, VectorStoreContract
+from tests.application.contracts import (
+    EmbedderContract,
+    NameRecognizerContract,
+    OcrEngineContract,
+    VectorStoreContract,
+)
 from tests.fakes.embedder import FakeEmbedder
+from tests.fakes.names import FakeNameRecognizer
 from tests.fakes.ocr import FakeOcrEngine
 from tests.fakes.vector_store import FakeVectorStore
 
@@ -19,8 +25,10 @@ class TestFakeOcrEngineContract(OcrEngineContract):
     def engine(self) -> OcrEngine:
         return FakeOcrEngine(
             [
-                OcrPage(0, 595.0, 842.0, (PageWord("Memo", Box(0, 72.0, 72.0, 40.0, 12.0)),)),
-                OcrPage(1, 842.0, 595.0, ()),
+                OcrPage(
+                    0, 595.0, 842.0, (PageWord("Memo", Box(0, 72.0, 72.0, 40.0, 12.0), 0),), None
+                ),
+                OcrPage(1, 842.0, 595.0, (), None),
             ]
         )
 
@@ -31,6 +39,12 @@ class TestFakeOcrEngineContract(OcrEngineContract):
     @pytest.fixture
     def expected_pages(self) -> int:
         return 2
+
+
+class TestFakeNameRecognizerContract(NameRecognizerContract):
+    @pytest.fixture
+    def recognizer(self) -> NameRecognizer:
+        return FakeNameRecognizer(["Maria Gonzalez", "Peter Smith", "Peter"])
 
 
 class TestFakeEmbedderContract(EmbedderContract):

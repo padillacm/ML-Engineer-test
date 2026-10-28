@@ -5,6 +5,7 @@ from math import isfinite
 from typing import Literal
 
 from app.domain.errors import GeometryError
+from app.domain.language import SUPPORTED_LANGUAGES
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,10 +63,20 @@ class PixelBox:
 
 @dataclass(frozen=True, slots=True)
 class PageWord:
-    """A word already converted to page space."""
+    """A word already converted to page space.
+
+    ``line`` is the 0-based index of the text line the word belongs to on its page, as
+    segmented by the recognition engine, with lines numbered in reading order. Words on the same
+    printed line share an index.
+    """
 
     text: str
     box: Box
+    line: int
+
+    def __post_init__(self) -> None:
+        if self.line < 0:
+            raise ValueError(f"line index must be >= 0, got {self.line}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +120,26 @@ class FuzzyMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class NameMention:
+    """A person name found in a document and the page-space box that covers it."""
+
+    name: str
+    box: Box
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("name must not be blank")
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionResult:
+    """The names found in a document, in reading order, and their matches to requested names."""
+
+    names: tuple[NameMention, ...]
+    matches: tuple[FuzzyMatch, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: Literal["system", "user", "assistant"]
     content: str
@@ -134,12 +165,15 @@ class OcrPage:
     """OCR result of one PDF page, with words already converted to page space.
 
     ``width`` and ``height`` are the page size in points. Every word must lie on ``page``.
+    ``language`` is the code (from ``SUPPORTED_LANGUAGES``) of the language the page was read
+    with, or ``None`` when it was read with several languages together.
     """
 
     page: int
     width: float
     height: float
     words: tuple[PageWord, ...]
+    language: str | None
 
     def __post_init__(self) -> None:
         if self.page < 0:
@@ -148,6 +182,11 @@ class OcrPage:
             raise ValueError("page width and height must be > 0")
         if any(word.box.page != self.page for word in self.words):
             raise ValueError(f"every word must be on page {self.page}")
+        if self.language is not None and self.language not in SUPPORTED_LANGUAGES:
+            raise ValueError(
+                f"language must be None or one of: {', '.join(SUPPORTED_LANGUAGES)}, "
+                f"got {self.language!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

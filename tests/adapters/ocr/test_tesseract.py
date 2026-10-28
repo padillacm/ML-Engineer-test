@@ -28,8 +28,21 @@ def _cli(command: str = "tesseract") -> TesseractCli:
     return TesseractCli(command=command, dpi=200, psm=3, oem=1, timeout_s=12.5)
 
 
-def _row(left: str = "10", conf: str = "90", text: str = "word") -> str:
-    return f"{TSV_HEADER}\n5\t1\t1\t1\t1\t1\t{left}\t10\t10\t10\t{conf}\t{text}\n"
+def _row(left: str = "10", conf: str = "90", text: str = "word", line: str = "1") -> str:
+    return f"{TSV_HEADER}\n5\t1\t1\t1\t{line}\t1\t{left}\t10\t10\t10\t{conf}\t{text}\n"
+
+
+def _words(*rows: tuple[int, int, int, str]) -> str:
+    """Build TSV with one 10 x 10 pixel word row per ``(block, par, line, text)``."""
+    body = [
+        f"5\t1\t{block}\t{par}\t{line}\t1\t{10 * number}\t10\t10\t10\t90\t{text}"
+        for number, (block, par, line, text) in enumerate(rows)
+    ]
+    return "\n".join([TSV_HEADER, *body]) + "\n"
+
+
+def _lines(tsv: str) -> list[tuple[str, int]]:
+    return [(word.text, word.line) for word in parse_tsv(tsv, RASTER, 0)]
 
 
 class TestParseTsv:
@@ -40,12 +53,38 @@ class TestParseTsv:
         words = parse_tsv(_fixture("page_words.tsv.txt"), RASTER, 3)
 
         assert words == (
-            PageWord("Ramírez", Box(3, 50.0, 25.0, 100.0, 20.0)),
-            PageWord("Müller", Box(3, 160.0, 25.0, 50.0, 20.0)),
-            PageWord("São", Box(3, 300.0, 25.0, 75.0, 20.0)),
-            PageWord("edge", Box(3, 450.0, 230.0, 50.0, 20.0)),
-            PageWord("beyond", Box(3, 475.0, 240.0, 25.0, 10.0)),
+            PageWord("Ramírez", Box(3, 50.0, 25.0, 100.0, 20.0), 0),
+            PageWord("Müller", Box(3, 160.0, 25.0, 50.0, 20.0), 0),
+            PageWord("São", Box(3, 300.0, 25.0, 75.0, 20.0), 0),
+            PageWord("edge", Box(3, 450.0, 230.0, 50.0, 20.0), 1),
+            PageWord("beyond", Box(3, 475.0, 240.0, 25.0, 10.0), 1),
         )
+
+    def test_words_on_one_line_share_an_index_and_the_next_line_gets_the_next(self) -> None:
+        tsv = _words((1, 1, 1, "Maria"), (1, 1, 1, "Gonzalez"), (1, 1, 2, "Director"))
+
+        assert _lines(tsv) == [("Maria", 0), ("Gonzalez", 0), ("Director", 1)]
+
+    def test_a_line_is_the_whole_block_paragraph_line_triple(self) -> None:
+        tsv = _words((1, 1, 1, "a"), (1, 2, 1, "b"), (2, 1, 1, "c"), (2, 1, 1, "d"))
+
+        assert _lines(tsv) == [("a", 0), ("b", 1), ("c", 2), ("d", 2)]
+
+    def test_line_numbers_skipped_by_tesseract_still_give_consecutive_indices(self) -> None:
+        tsv = _words((1, 1, 2, "first"), (1, 1, 5, "second"), (3, 2, 9, "third"))
+
+        assert _lines(tsv) == [("first", 0), ("second", 1), ("third", 2)]
+
+    def test_lines_whose_words_are_all_dropped_take_no_index(self) -> None:
+        tsv = _words((1, 1, 1, "kept"), (1, 1, 2, " "), (1, 1, 3, "next"))
+
+        assert _lines(tsv) == [("kept", 0), ("next", 1)]
+
+    def test_line_numbering_restarts_on_every_page(self) -> None:
+        tsv = _words((1, 1, 3, "late"), (1, 1, 4, "later"))
+
+        assert [word.line for word in parse_tsv(tsv, RASTER, 0)] == [0, 1]
+        assert [word.line for word in parse_tsv(tsv, RASTER, 1)] == [0, 1]
 
     def test_blank_negative_confidence_and_empty_boxes_are_dropped(self) -> None:
         texts = [word.text for word in parse_tsv(_fixture("page_words.tsv.txt"), RASTER, 0)]
@@ -80,6 +119,8 @@ class TestParseTsv:
             _row(conf="nan"),
             _row(conf="inf"),
             _row(conf="-inf"),
+            _row(line="first"),
+            _row(line="9" * 5000),
         ],
         ids=[
             "empty",
@@ -92,6 +133,8 @@ class TestParseTsv:
             "nan-conf",
             "inf-conf",
             "minus-inf-conf",
+            "bad-line",
+            "line-over-digit-limit",
         ],
     )
     def test_unparsable_output_fails(self, text: str) -> None:

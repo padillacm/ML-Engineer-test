@@ -97,17 +97,17 @@ def _two_page_document(lines: tuple[str, ...]) -> bytes:
 
 
 @pytest.mark.parametrize(
-    ("lines", "model", "expected_word"),
+    ("lines", "code", "model", "expected_word"),
     [
-        pytest.param(SPANISH, "spa", "cláusula", id="es"),
-        pytest.param(PORTUGUESE, "por", "comissão", id="pt"),
-        pytest.param(GERMAN, "deu", "Mängel", id="de"),
-        pytest.param(FRENCH, "fra", "société", id="fr"),
-        pytest.param(ENGLISH, "eng", "guarantees", id="en"),
+        pytest.param(SPANISH, "es", "spa", "cláusula", id="es"),
+        pytest.param(PORTUGUESE, "pt", "por", "comissão", id="pt"),
+        pytest.param(GERMAN, "de", "deu", "Mängel", id="de"),
+        pytest.param(FRENCH, "fr", "fra", "société", id="fr"),
+        pytest.param(ENGLISH, "en", "eng", "guarantees", id="en"),
     ],
 )
-def test_without_a_hint_the_detected_language_reads_every_page(
-    lines: tuple[str, ...], model: str, expected_word: str
+def test_without_a_hint_the_detected_language_reads_and_is_reported_on_every_page(
+    lines: tuple[str, ...], code: str, model: str, expected_word: str
 ) -> None:
     engine, runner = _recording_engine()
 
@@ -117,6 +117,7 @@ def test_without_a_hint_the_detected_language_reads_every_page(
     assert runner.models[0] == COMBINED
     assert Counter(runner.models[1:]) == Counter({model: 2})
     assert [page.page for page in pages] == [0, 1]
+    assert [page.language for page in pages] == [code, code]
     assert expected_word in {normalise(word.text) for word in pages[0].words}
 
 
@@ -126,7 +127,16 @@ def test_with_a_hint_every_page_is_read_with_that_model_only() -> None:
     pages = engine.recognize(_two_page_document(SPANISH), language="es")
 
     assert runner.models == ["spa", "spa"]
-    assert len(pages) == 2
+    assert [page.language for page in pages] == ["es", "es"]
+
+
+def test_a_french_document_reports_the_hint_over_the_detected_language() -> None:
+    engine, runner = _recording_engine()
+
+    pages = engine.recognize(_two_page_document(FRENCH), language="es")
+
+    assert runner.models == ["spa", "spa"]
+    assert [page.language for page in pages] == ["es", "es"]
 
 
 def test_short_text_without_a_hint_is_read_with_all_languages_together() -> None:
@@ -140,6 +150,7 @@ def test_short_text_without_a_hint_is_read_with_all_languages_together() -> None
 
     assert runner.models == [COMBINED, COMBINED]
     assert [page.page for page in pages] == [0, 1]
+    assert [page.language for page in pages] == [None, None]
     assert "Invoice" in {normalise(word.text) for word in pages[0].words}
 
 
@@ -160,3 +171,4 @@ def test_a_names_table_on_the_first_page_does_not_decide_the_language() -> None:
     assert runner.models[:2] == [COMBINED, COMBINED]
     assert Counter(runner.models[2:]) == Counter({"spa": 3})
     assert [page.page for page in pages] == [0, 1, 2]
+    assert [page.language for page in pages] == ["es", "es", "es"]

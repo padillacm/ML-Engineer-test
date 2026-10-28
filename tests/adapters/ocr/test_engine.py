@@ -364,9 +364,10 @@ class TestLanguage:
     def test_hint_reads_every_page_with_that_model_only(self) -> None:
         runner = FakeTesseract(lambda languages: SPANISH)
 
-        _engine(runner).recognize(_pages(3), " ES ")
+        pages = _engine(runner).recognize(_pages(3), " ES ")
 
         assert runner.calls == ["spa", "spa", "spa"]
+        assert [page.language for page in pages] == ["es", "es", "es"]
 
     @pytest.mark.parametrize("hint", ["it", "spa", ""])
     def test_unsupported_hint_is_rejected_before_opening_the_pdf(self, hint: str) -> None:
@@ -394,6 +395,7 @@ class TestLanguage:
         assert runner.calls[2:] == ["spa", "spa", "spa"]
         assert pages[0].words == ()
         assert [page.words[0].text for page in pages[1:]] == ["spa:210", "spa:220"]
+        assert [page.language for page in pages] == ["es", "es", "es"]
 
     def test_inconclusive_detection_reads_every_page_once_with_all_languages(self) -> None:
         runner = FakeTesseract(lambda languages: NO_STOP_WORDS)
@@ -406,6 +408,7 @@ class TestLanguage:
             f"{COMBINED}:210",
             f"{COMBINED}:220",
         ]
+        assert [page.language for page in pages] == [None, None, None]
 
     def test_too_little_text_everywhere_reads_once_with_all_languages(self) -> None:
         runner = FakeTesseract(lambda languages: "el")
@@ -414,6 +417,7 @@ class TestLanguage:
 
         assert runner.calls == [COMBINED] * 3
         assert [page.page for page in pages] == [0, 1, 2]
+        assert [page.language for page in pages] == [None, None, None]
 
     def test_first_page_of_names_does_not_decide_and_later_pages_do(self) -> None:
         names = " ".join(f"Name{index} Surname{index} 2024" for index in range(15))
@@ -423,6 +427,7 @@ class TestLanguage:
 
         assert runner.calls == [COMBINED, COMBINED, "spa", "spa", "spa"]
         assert [page.words[0].text for page in pages] == ["spa:200", "spa:210", "spa:220"]
+        assert [page.language for page in pages] == ["es", "es", "es"]
 
     def test_inconclusive_pages_are_never_read_twice(self) -> None:
         runner = FakeTesseract(lambda languages: NO_STOP_WORDS)
@@ -432,15 +437,17 @@ class TestLanguage:
         assert runner.calls == [COMBINED] * 6
         assert sorted(runner.widths) == [200 + 10 * index for index in range(6)]
         assert [page.page for page in pages] == list(range(6))
+        assert {page.language for page in pages} == {None}
 
     def test_detection_gives_up_after_the_configured_pages_with_text(self) -> None:
         runner = FakeTesseract(lambda languages: NO_STOP_WORDS, page_text={230: SPANISH})
 
-        _engine(runner, detect_max_pages=2).recognize(_pages(4, blank=frozenset({0})))
+        pages = _engine(runner, detect_max_pages=2).recognize(_pages(4, blank=frozenset({0})))
 
         # Page 0 is blank and does not count; pages 1 and 2 are inconclusive: stop there,
         # so the Spanish page 3 is read with the combined model like the rest.
         assert runner.calls == [COMBINED] * 4
+        assert [page.language for page in pages] == [None] * 4
 
     def test_detection_threshold_is_configurable(self) -> None:
         runner = FakeTesseract(lambda languages: "el contrato y los pagos de las facturas")

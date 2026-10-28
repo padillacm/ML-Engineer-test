@@ -1,4 +1,5 @@
 import copy
+import multiprocessing
 import pickle
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
@@ -28,6 +29,7 @@ CASES: list[tuple[LeafError, Category, str]] = [
     (InvalidInput, Category.INVALID_INPUT, "pdf_unreadable"),
     (InvalidInput, Category.INVALID_INPUT, "unsupported_language"),
     (ProcessingFailed, Category.PROCESSING_FAILED, "ocr_failed"),
+    (ProcessingFailed, Category.PROCESSING_FAILED, "ner_failed"),
     (DependencyUnavailable, Category.DEPENDENCY_UNAVAILABLE, "llm_unavailable"),
     (DependencyTimeout, Category.DEPENDENCY_TIMEOUT, "vector_store_timeout"),
     (IncompatibleEmbedding, Category.INCOMPATIBLE_EMBEDDING, "incompatible_embedding"),
@@ -95,6 +97,7 @@ def test_registry_is_closed_and_snake_case() -> None:
         "invalid_names",
         "unsupported_language",
         "ocr_failed",
+        "ner_failed",
         "llm_unavailable",
         "llm_timeout",
         "vector_store_unavailable",
@@ -188,7 +191,9 @@ def _echo(error: ServiceError) -> ServiceError:
 def test_error_crosses_a_process_boundary() -> None:
     original = DependencyTimeout("slow", "llm_timeout")
 
-    with ProcessPoolExecutor(max_workers=1) as pool:
+    # "spawn": forking a multi-threaded process (torch threads may be alive) can deadlock.
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=1, mp_context=context) as pool:
         restored = pool.submit(_echo, original).result(timeout=60)
 
     _assert_same_error(restored, original)

@@ -1,4 +1,5 @@
-"""Reusable contract tests for the ``OcrEngine``, ``Embedder`` and ``VectorStore`` ports.
+"""Reusable contract tests for the ``OcrEngine``, ``NameRecognizer``, ``Embedder`` and
+``VectorStore`` ports.
 
 A test module subclasses a contract and overrides its factory fixtures; every real adapter added
 in later blocks runs the same test bodies as the fakes. The classes are not named ``Test*`` so
@@ -6,14 +7,16 @@ pytest only collects the concrete subclasses.
 """
 
 import dataclasses
+import itertools
 import math
 from collections.abc import Sequence
 
 import pytest
 
-from app.application.ports import Embedder, OcrEngine, VectorStore
+from app.application.ports import Embedder, NameRecognizer, OcrEngine, VectorStore
 from app.domain.errors import IncompatibleEmbedding
-from app.domain.types import Chunk, EmbeddingIdentity, OcrPage
+from app.domain.language import SUPPORTED_LANGUAGES
+from app.domain.types import Chunk, EmbeddingIdentity, OcrPage, TextSpan
 
 _IDENTITY_384 = EmbeddingIdentity("contract-model", 384, "none", True, "cosine")
 _IDENTITY_768 = dataclasses.replace(_IDENTITY_384, dimension=768)
@@ -39,7 +42,8 @@ class OcrEngineContract:
     """Behaviour every ``OcrEngine`` must show.
 
     Override ``engine``, ``sample_pdf`` (a PDF whose first page holds text) and
-    ``expected_pages`` (its page count).
+    ``expected_pages`` (its page count). Every page of one result reports the same language: the
+    hint when one is given, otherwise a supported code or ``None``.
     """
 
     @pytest.fixture
@@ -82,6 +86,69 @@ class OcrEngineContract:
         self, engine: OcrEngine, sample_pdf: bytes, expected_pages: int
     ) -> None:
         assert len(engine.recognize(sample_pdf)) == expected_pages
+
+    def test_with_a_hint_every_page_reports_the_hint(self, pages: list[OcrPage]) -> None:
+        assert {page.language for page in pages} == {"en"}
+
+    def test_without_a_hint_every_page_reports_one_language_or_none(
+        self, engine: OcrEngine, sample_pdf: bytes
+    ) -> None:
+        languages = {page.language for page in engine.recognize(sample_pdf)}
+
+        assert len(languages) == 1
+        assert languages <= {None, *SUPPORTED_LANGUAGES}
+
+
+class NameRecognizerContract:
+    """Behaviour every ``NameRecognizer`` must show.
+
+    Override ``recognizer`` and, when the recogniser cannot find the default names,
+    ``sample_text`` (a text in which it finds at least one person).
+    """
+
+    @pytest.fixture
+    def recognizer(self) -> NameRecognizer:
+        raise NotImplementedError
+
+    @pytest.fixture
+    def sample_text(self) -> str:
+        return (
+            "Maria Gonzalez of Acme Corporation met in Madrid on 3 March. "
+            "The agreement was signed by Peter Smith."
+        )
+
+    @pytest.fixture
+    def spans(self, recognizer: NameRecognizer, sample_text: str) -> list[TextSpan]:
+        return recognizer.find_persons(sample_text)
+
+    def test_finds_a_person_in_the_sample(self, spans: list[TextSpan]) -> None:
+        assert spans
+
+    def test_spans_lie_inside_the_text(self, spans: list[TextSpan], sample_text: str) -> None:
+        assert all(0 <= span.start < span.end <= len(sample_text) for span in spans)
+
+    def test_spans_are_in_order_and_do_not_overlap(self, spans: list[TextSpan]) -> None:
+        assert all(left.end <= right.start for left, right in itertools.pairwise(spans))
+
+    def test_spans_cover_text_without_surrounding_blanks(
+        self, spans: list[TextSpan], sample_text: str
+    ) -> None:
+        for span in spans:
+            covered = sample_text[span.start : span.end]
+            assert covered.strip()
+            assert covered == covered.strip()
+
+    def test_recognition_is_deterministic(
+        self, recognizer: NameRecognizer, sample_text: str, spans: list[TextSpan]
+    ) -> None:
+        assert recognizer.find_persons(sample_text) == spans
+
+    @pytest.mark.parametrize("text", ["", "   ", "\n\t "])
+    def test_blank_text_has_no_names(self, recognizer: NameRecognizer, text: str) -> None:
+        assert recognizer.find_persons(text) == []
+
+    def test_text_without_people_has_no_names(self, recognizer: NameRecognizer) -> None:
+        assert recognizer.find_persons("the agreement was signed on 3 march .") == []
 
 
 class EmbedderContract:

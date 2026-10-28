@@ -16,7 +16,7 @@ from typing import Protocol
 
 from app.domain.errors import GeometryError, ProcessingFailed
 from app.domain.geometry import PageRaster, clamp
-from app.domain.types import PageWord, PixelBox
+from app.domain.types import Box, PageWord, PixelBox
 
 _HEADER = (
     "level",
@@ -133,25 +133,35 @@ def parse_tsv(tsv: str, raster: PageRaster, page: int) -> tuple[PageWord, ...]:
     Only word rows with non-blank text and a confidence of at least 0 are kept (a non-numeric,
     non-finite or overflowing field fails with ``ocr_failed``); boxes are
     converted with ``raster`` and clipped to the page, and words left without area are dropped.
+    Each kept word gets the 0-based index of its ``(block_num, par_num, line_num)`` triple in
+    order of first appearance among the kept words, so the lines of a page are numbered
+    consecutively from 0 in reading order.
     """
     lines = tsv.splitlines()
     if not lines or tuple(lines[0].split("\t")) != _HEADER:
         raise ProcessingFailed("tesseract output has no TSV header", "ocr_failed")
+    line_indices: dict[tuple[int, int, int], int] = {}
     words: list[PageWord] = []
     for number, line in enumerate(lines[1:], start=2):
-        word = _parse_row(line, number, raster, page)
-        if word is not None:
-            words.append(word)
+        row = _parse_row(line, number, raster, page)
+        if row is not None:
+            text, box, key = row
+            index = line_indices.setdefault(key, len(line_indices))
+            words.append(PageWord(text, box, index))
     return tuple(words)
 
 
-def _parse_row(line: str, number: int, raster: PageRaster, page: int) -> PageWord | None:
+def _parse_row(
+    line: str, number: int, raster: PageRaster, page: int
+) -> tuple[str, Box, tuple[int, int, int]] | None:
+    """Return the text, page-space box and line key of a kept word row, else ``None``."""
     fields = line.split("\t", len(_HEADER) - 1)
     if len(fields) != len(_HEADER):
         raise ProcessingFailed(f"tesseract TSV line {number} is malformed", "ocr_failed")
     invalid = ProcessingFailed(f"tesseract TSV line {number} has an invalid field", "ocr_failed")
     try:
         level = int(fields[0])
+        block, paragraph, text_line = (int(value) for value in fields[2:5])
         left, top, width, height = (int(value) for value in fields[6:10])
         confidence = float(fields[10])
     except (ValueError, OverflowError) as error:
@@ -173,4 +183,4 @@ def _parse_row(line: str, number: int, raster: PageRaster, page: int) -> PageWor
         raise invalid from error
     if box.width <= 0 or box.height <= 0:
         return None
-    return PageWord(text, box)
+    return text, box, (block, paragraph, text_line)

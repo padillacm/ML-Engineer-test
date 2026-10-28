@@ -9,7 +9,9 @@ from app.domain.types import (
     ChatMessage,
     Chunk,
     EmbeddingIdentity,
+    ExtractionResult,
     FuzzyMatch,
+    NameMention,
     NamePair,
     OcrPage,
     PageWord,
@@ -50,7 +52,7 @@ def test_equal_values_compare_equal_and_hash_equal() -> None:
 
 def test_nested_values_compare_by_content() -> None:
     assert PixelBox(1, 2, 3, 4) == PixelBox(1, 2, 3, 4)
-    assert PageWord("a", Box(0, 1, 2, 3, 4)) == PageWord("a", Box(0, 1, 2, 3, 4))
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 0) == PageWord("a", Box(0, 1, 2, 3, 4), 0)
 
 
 @pytest.mark.parametrize(
@@ -58,7 +60,10 @@ def test_nested_values_compare_by_content() -> None:
     [
         (Box(0, 1, 2, 3, 4), "x"),
         (PixelBox(1, 2, 3, 4), "x"),
-        (PageWord("a", Box(0, 1, 2, 3, 4)), "text"),
+        (PageWord("a", Box(0, 1, 2, 3, 4), 0), "text"),
+        (PageWord("a", Box(0, 1, 2, 3, 4), 0), "line"),
+        (NameMention("Maria", Box(0, 1, 2, 3, 4)), "name"),
+        (ExtractionResult((), ()), "names"),
         (TextSpan(0, 1), "end"),
         (Chunk("t", 0, 0, 0, 1), "text"),
         (NamePair("a", "b"), "first_name"),
@@ -70,6 +75,45 @@ def test_nested_values_compare_by_content() -> None:
 def test_values_are_immutable(instance: object, field: str) -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         setattr(instance, field, None)
+
+
+def test_page_word_rejects_a_negative_line_index() -> None:
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 7).line == 7
+    with pytest.raises(ValueError, match="line index must be >= 0"):
+        PageWord("a", Box(0, 1, 2, 3, 4), -1)
+
+
+def test_page_words_on_different_lines_are_unequal() -> None:
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 0) != PageWord("a", Box(0, 1, 2, 3, 4), 1)
+
+
+@pytest.mark.parametrize("name", ["", " ", "\t\n"])
+def test_name_mention_rejects_a_blank_name(name: str) -> None:
+    with pytest.raises(ValueError, match="name must not be blank"):
+        NameMention(name, Box(0, 1, 2, 3, 4))
+
+
+def test_extraction_result_holds_names_and_matches_by_value() -> None:
+    mention = NameMention("Maria Gonzalez", Box(0, 1, 2, 3, 4))
+    match = FuzzyMatch("Maria Gonzalez", "Maria González", 0.95)
+
+    result = ExtractionResult(names=(mention,), matches=(match,))
+
+    assert result == ExtractionResult(
+        (NameMention("Maria Gonzalez", Box(0, 1, 2, 3, 4)),), (match,)
+    )
+    assert hash(result) == hash(ExtractionResult((mention,), (match,)))
+    assert result.names == (mention,)
+    assert result.matches == (match,)
+
+
+def test_new_values_have_no_instance_dict() -> None:
+    for instance in (
+        PageWord("a", Box(0, 1, 2, 3, 4), 0),
+        NameMention("Maria", Box(0, 1, 2, 3, 4)),
+        ExtractionResult((), ()),
+    ):
+        assert not hasattr(instance, "__dict__")
 
 
 def test_text_span_accepts_empty_and_rejects_reversed_or_negative() -> None:
@@ -133,10 +177,27 @@ def test_pixel_box_rejects_non_finite_values(field: str, bad: float) -> None:
 
 def test_ocr_page_rejects_a_word_from_another_page() -> None:
     with pytest.raises(ValueError, match="every word must be on page 1"):
-        OcrPage(page=1, width=595, height=842, words=(PageWord("a", Box(0, 1, 2, 3, 4)),))
+        OcrPage(
+            page=1,
+            width=595,
+            height=842,
+            words=(PageWord("a", Box(0, 1, 2, 3, 4), 0),),
+            language=None,
+        )
 
 
 def test_ocr_page_accepts_words_of_its_own_page() -> None:
-    word = PageWord("a", Box(1, 1, 2, 3, 4))
+    word = PageWord("a", Box(1, 1, 2, 3, 4), 0)
 
-    assert OcrPage(page=1, width=595, height=842, words=(word,)).words == (word,)
+    assert OcrPage(page=1, width=595, height=842, words=(word,), language=None).words == (word,)
+
+
+@pytest.mark.parametrize("language", [None, "en", "es", "pt", "fr", "de"])
+def test_ocr_page_accepts_no_language_or_a_supported_one(language: str | None) -> None:
+    assert OcrPage(page=0, width=595, height=842, words=(), language=language).language == language
+
+
+@pytest.mark.parametrize("language", ["", "eng", "it", "FR", "eng+fra"])
+def test_ocr_page_rejects_an_unsupported_language(language: str) -> None:
+    with pytest.raises(ValueError, match="language must be None or one of"):
+        OcrPage(page=0, width=595, height=842, words=(), language=language)

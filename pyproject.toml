@@ -16,6 +16,15 @@ dependencies = [
     "pypdfium2>=5.14.0",
     "pillow",
     "numpy",
+    # NER (block 3): Davlan/xlm-roberta-base-ner-hrl through the token-classification pipeline.
+    # torch is CPU-only, from the PyTorch CPU index (see [tool.uv.sources]).
+    "transformers>=5.21,<6",
+    "torch>=2.14,<3",
+    # The model ships only sentencepiece.bpe.model (no tokenizer.json); the fast tokenizer
+    # (character offsets) is converted from it at load time, which needs sentencepiece and
+    # protobuf (transformers' SentencePieceExtractor reads the model proto).
+    "sentencepiece>=0.2.1",
+    "protobuf>=6",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +40,16 @@ dev = [
     "pymupdf>=1.28,<2",
 ]
 
+# torch from the PyTorch CPU wheel index on every platform, so neither the Windows host nor the
+# Linux image pulls CUDA (nvidia-*, triton). `explicit` keeps every other package on PyPI.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -43,6 +62,13 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
     "tesseract: needs the Tesseract executable (skipped when it is not on PATH)",
+    "ner_model: needs the local NER model (skipped when NER_MODEL_PATH is unset or the directory is missing)",
+]
+# pytest resets the warning filters for every test, so the adapter's process-wide filter for
+# this one transformers message (see app/adapters/ner/recognizer.py) does not survive between
+# tests that share a module-scoped recogniser. Only this exact message is ignored.
+filterwarnings = [
+    "ignore:Tokenizer does not support real words, using fallback heuristic:UserWarning:transformers\\.pipelines\\.token_classification",
 ]
 
 [tool.ruff]

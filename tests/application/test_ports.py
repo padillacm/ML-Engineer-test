@@ -141,12 +141,12 @@ def test_identities_differing_in_any_field_are_unequal(change: dict[str, Any]) -
 
 
 def test_ocr_fake_returns_canned_pages_and_records_calls() -> None:
-    page = OcrPage(0, 595.0, 842.0, (PageWord("Hello", Box(0, 10, 10, 30, 12)),))
+    page = OcrPage(0, 595.0, 842.0, (PageWord("Hello", Box(0, 10, 10, 30, 12), 0),), None)
     engine = FakeOcrEngine([page])
 
-    assert engine.recognize(b"%PDF", language="eng") == [page]
+    assert engine.recognize(b"%PDF", language="en") == [dataclasses.replace(page, language="en")]
     assert engine.recognize(b"%PDF-2") == [page]
-    assert engine.calls == [(b"%PDF", "eng"), (b"%PDF-2", None)]
+    assert engine.calls == [(b"%PDF", "en"), (b"%PDF-2", None)]
 
 
 def test_name_fake_returns_spans_of_configured_names() -> None:
@@ -230,9 +230,9 @@ def test_llm_fake_raises_queued_errors_in_order() -> None:
 
 def test_new_domain_types_validate_their_fields() -> None:
     with pytest.raises(ValueError, match="page index"):
-        OcrPage(-1, 10.0, 10.0, ())
+        OcrPage(-1, 10.0, 10.0, (), None)
     with pytest.raises(ValueError, match="page width and height"):
-        OcrPage(0, 0.0, 10.0, ())
+        OcrPage(0, 0.0, 10.0, (), None)
     with pytest.raises(ValueError, match="score must be within"):
         SearchHit("d", 0, 0, "t", 1.5)
     assert SearchHit("d", 0, 0, "t", 0.0).score == 0.0

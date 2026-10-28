@@ -164,24 +164,30 @@ class TesseractOcrEngine:
         read; the whole document (those pages again included) is then read with the detected
         model. When detection is inconclusive the combined results already obtained are kept
         and only the remaining pages are read, with the combined model.
+
+        Every page reports the language it was read with: the hint, the detected language, or
+        ``None`` when detection was inconclusive (all pages then report ``None``).
         """
-        model = None if language is None else self._model_for(language)
+        code = None if language is None else self._supported(language)
         with open_pdf(pdf) as document:
             pages = render_pages(
                 document, self._config.dpi, self._config.max_page_pixels, self._transform()
             )
-            if model is not None:
-                return self._recognize_all(pages, model)
+            if code is not None:
+                return self._recognize_all(pages, code)
             return self._recognize_detecting(pages)
 
-    def _model_for(self, language: str) -> str:
+    def _supported(self, language: str) -> str:
         code = validate_language(language)
         if code not in self._config.languages:
             raise InvalidInput(
                 f"language must be one of: {', '.join(self._config.languages)}",
                 "unsupported_language",
             )
-        return TESSERACT_MODELS[code]
+        return code
+
+    def _model(self, language: str | None) -> str:
+        return self._combined if language is None else TESSERACT_MODELS[language]
 
     def _transform(self) -> ImageTransform | None:
         if not self._config.flatten:
@@ -194,21 +200,23 @@ class TesseractOcrEngine:
         texts: list[str] = []
         for rendered in pages:
             seen.append(rendered)
-            result = self._recognize_page(rendered, self._combined)
+            result = self._recognize_page(rendered, None)
             combined.append(result)
             if not _has_alphabetic_word(result):
                 continue
             texts.append(PageText.from_words(result.words).text)
             detected = detect_language(" ".join(texts), min_words=self._config.detect_min_words)
             if detected is not None and detected in self._config.languages:
-                return self._recognize_all(chain(seen, pages), TESSERACT_MODELS[detected])
+                return self._recognize_all(chain(seen, pages), detected)
             if len(texts) >= self._config.detect_max_pages:
                 break
         seen.clear()
-        return combined + self._recognize_all(pages, self._combined)
+        return combined + self._recognize_all(pages, None)
 
-    def _recognize_all(self, pages: Iterable[RenderedPage], model: str) -> list[OcrPage]:
+    def _recognize_all(self, pages: Iterable[RenderedPage], language: str | None) -> list[OcrPage]:
         """OCR ``pages`` concurrently, holding at most ``2 x workers`` rendered pages at once.
+
+        ``language`` is a supported code, or ``None`` for the combined model.
 
         The next page is rendered only when a slot is free. After the first failure no further
         page is rendered or started, running processes finish (or time out) and the failure of
@@ -225,7 +233,7 @@ class TesseractOcrEngine:
                     # Every page is submitted: wait for all of them, or for the first failure.
                     wait(futures, return_when=FIRST_EXCEPTION)
                     break
-                future = pool.submit(self._recognize_unless_stopped, window, rendered, model)
+                future = pool.submit(self._recognize_unless_stopped, window, rendered, language)
                 del rendered
                 future.add_done_callback(window.release)
                 futures.append(future)
@@ -235,13 +243,14 @@ class TesseractOcrEngine:
         return _gather(futures)
 
     def _recognize_unless_stopped(
-        self, window: "_Window", rendered: RenderedPage, model: str
+        self, window: "_Window", rendered: RenderedPage, language: str | None
     ) -> OcrPage:
         if window.failed:
             raise _Abandoned
-        return self._recognize_page(rendered, model)
+        return self._recognize_page(rendered, language)
 
-    def _recognize_page(self, rendered: RenderedPage, model: str) -> OcrPage:
+    def _recognize_page(self, rendered: RenderedPage, language: str | None) -> OcrPage:
+        model = self._model(language)
         try:
             words = parse_tsv(self._runner(rendered.png, model), rendered.raster, rendered.index)
         except ProcessingFailed as error:
@@ -249,7 +258,7 @@ class TesseractOcrEngine:
                 f"OCR failed on page {rendered.index}: {error.message}", "ocr_failed"
             ) from error
         raster = rendered.raster
-        return OcrPage(rendered.index, raster.page_width_pt, raster.page_height_pt, words)
+        return OcrPage(rendered.index, raster.page_width_pt, raster.page_height_pt, words, language)
 
 
 class _Abandoned(Exception):

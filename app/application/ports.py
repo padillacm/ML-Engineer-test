@@ -41,7 +41,7 @@ class OcrEngine(Protocol):
 class NameRecognizer(Protocol):
     """Finds person names in text.
 
-    Failures: ``ProcessingFailed`` when the model cannot process the text.
+    Failures: ``ProcessingFailed`` (code ``ner_failed``) when the model cannot process the text.
     """
 
     def find_persons(self, text: str) -> list[TextSpan]:

@@ -13,7 +13,7 @@ A4_HEIGHT = 842.0
 
 
 def _word(text: str, x: float, y: float, width: float, height: float, page: int = 0) -> PageWord:
-    return PageWord(text=text, box=Box(page=page, x=x, y=y, width=width, height=height))
+    return PageWord(text=text, box=Box(page=page, x=x, y=y, width=width, height=height), line=0)
 
 
 def _signed_by_maria_gonzalez_today() -> PageText:
