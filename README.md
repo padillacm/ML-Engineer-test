@@ -200,6 +200,30 @@ Leptonica, the language packs and `tini` (the container's PID 1, which reaps orp
 processes) are pinned to exact Debian versions; the `Dockerfile` comment explains how
 to bump them.
 
+The NER model (`Davlan/xlm-roberta-base-ner-hrl`, about 1.1 GB) is baked into the image:
+a separate `model` build stage installs a pinned `huggingface_hub`, downloads only the
+files `transformers` loads (config, tokenizer files and `model.safetensors`) plus the model
+card (`README.md`) at a pinned commit, checks every file's sha256, writes a `NOTICE` with the
+licences (model AFL-3.0, base XLM-RoBERTa MIT) and is copied read-only to
+`/models/xlm-roberta-base-ner-hrl` (`NER_MODEL_PATH`). The image sets `HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1`, so nothing is fetched at run time; to check that the whole suite
+needs no network at all, run it with networking disabled:
+
+```
+docker run --rm --network none docintel-test
+```
+
+Tests marked `ner_model` need the model directory and are skipped on a host without it.
+Loading refuses weights that do not fit the model's configuration (missing, unexpected or
+mismatched tensors) instead of running with random weights. One text sent to the model is
+capped at `max_chars` (default 50,000 characters): inference costs about 0.25 s per
+1,000 characters at 2 threads and holds the recogniser's lock. To bump the model, set
+`NER_MODEL_REVISION` and every `*_SHA256` build arg in the `Dockerfile` to the new commit and
+its file hashes (the comment above the `model` stage says where to get them), rebuild and
+rerun the suite.
+`torch` is CPU-only on every platform: `pyproject.toml` takes it from the PyTorch CPU
+wheel index (`[tool.uv.sources]`), so neither the host nor the image installs CUDA.
+
 ## Use of AI tools
 
 Using AI assistants (Copilot, Claude, ChatGPT, agents) is **allowed and

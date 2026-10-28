@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 #
 # Stages:
+#   model - downloads the NER model (Davlan/xlm-roberta-base-ner-hrl) at a pinned revision
 #   base  - Python 3.12 on Debian 13 (trixie) + Tesseract 5 with eng/spa/por/fra/deu + uv
+#           + the NER model at /models (read-only; Hugging Face offline mode)
 #   test  - project + dev dependencies; runs the full pytest suite (incl. `tesseract` tests)
 # A `runtime` stage (no dev deps) is added later on top of `base`.
 #
@@ -11,7 +13,103 @@
 
 # python:3.12-slim-trixie, pinned by digest (resolved 2026-10-27). Debian 13 ships Tesseract 5.5,
 # the version the OCR defaults were benchmarked with; bump tag and digest together.
-FROM python:3.12-slim-trixie@sha256:12316debbfb86890f6b2d825820612741ba527ad5a44e3902759141d572bfe8f AS base
+ARG PYTHON_IMAGE=python:3.12-slim-trixie@sha256:12316debbfb86890f6b2d825820612741ba527ad5a44e3902759141d572bfe8f
+
+
+# NER model, downloaded at build time so run time never touches the network. Only this stage has
+# huggingface_hub; `base` receives the model files alone.
+# To bump the revision: take the new commit "sha" from
+#   https://huggingface.co/api/models/Davlan/xlm-roberta-base-ner-hrl
+# and the "lfs.oid" (sha256) of the two LFS files from
+#   https://huggingface.co/api/models/Davlan/xlm-roberta-base-ner-hrl/tree/<sha>
+# The small files are plain git blobs (their "oid" there is a git sha1), so take their sha256 from
+#   https://huggingface.co/Davlan/xlm-roberta-base-ner-hrl/resolve/<sha>/<file>  (| sha256sum)
+# Update the revision and every *_SHA256 ARG below, rebuild and rerun the suite (the `ner_model`
+# tests use the model).
+# huggingface_hub is pinned by version only: --require-hashes would need every transitive
+# dependency hashed too, and the downloaded model files are hash-checked here anyway.
+FROM ${PYTHON_IMAGE} AS model
+
+ARG HF_HUB_VERSION=2.3.0
+ARG NER_MODEL_REPO=Davlan/xlm-roberta-base-ner-hrl
+# Commit of the Hub repository's main branch, resolved 2026-10-27.
+ARG NER_MODEL_REVISION=253f557bd8249b8515114cfd7f71974fe5fa4d2f
+ARG NER_MODEL_SAFETENSORS_SHA256=49530ba99295b5992caafa1f361a658206094d26c74bbe5248cd64a0c4270061
+ARG NER_MODEL_SPM_SHA256=cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865
+ARG NER_MODEL_CONFIG_SHA256=b39f5cdaa31793288077859feb3d4e742b2d5a1226fe3374e97fc0220c02222f
+ARG NER_MODEL_TOKENIZER_CONFIG_SHA256=25784ba43a0c3aa2afaa08cd4e89795117a2c82e56f4fff50fb0b8dcff27b29f
+ARG NER_MODEL_SPECIAL_TOKENS_SHA256=7638f5bbbe86ef6d604ef28ad3647dc690d6d117c81c0d63e885416be8da1150
+# The model card (README.md), kept next to the model for its licence and attribution.
+ARG NER_MODEL_CARD_SHA256=ded5d21f50ad65d500946602b18a0007b431971056f5542bdb7be6e6d3d03bf4
+
+ENV HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN pip install --no-cache-dir "huggingface_hub==${HF_HUB_VERSION}"
+
+# Only what transformers loads: config, tokenizer files (the repository has no tokenizer.json;
+# the fast tokenizer is converted from sentencepiece.bpe.model at load time) and the safetensors
+# weights, plus the model card (README.md). pytorch_model.bin and training_args.bin are pickles
+# and are never downloaded. Every file is checked against its pinned sha256, and a NOTICE with
+# the licences and attribution is written next to them.
+RUN python - <<'PY'
+import hashlib
+import os
+import pathlib
+import shutil
+
+from huggingface_hub import snapshot_download
+
+expected = {
+    "README.md": "NER_MODEL_CARD_SHA256",
+    "config.json": "NER_MODEL_CONFIG_SHA256",
+    "model.safetensors": "NER_MODEL_SAFETENSORS_SHA256",
+    "sentencepiece.bpe.model": "NER_MODEL_SPM_SHA256",
+    "special_tokens_map.json": "NER_MODEL_SPECIAL_TOKENS_SHA256",
+    "tokenizer_config.json": "NER_MODEL_TOKENIZER_CONFIG_SHA256",
+}
+files = sorted(expected)
+target = pathlib.Path("/models/xlm-roberta-base-ner-hrl")
+snapshot_download(
+    os.environ["NER_MODEL_REPO"], revision=os.environ["NER_MODEL_REVISION"],
+    allow_patterns=files, local_dir=target,
+)
+shutil.rmtree(target / ".cache", ignore_errors=True)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+present = sorted(p.name for p in target.iterdir())
+assert present == files, f"unexpected model files: {present}"
+for name, env in expected.items():
+    actual = sha256(target / name)
+    assert actual == os.environ[env], f"{name}: sha256 {actual} != {os.environ[env]}"
+repo, revision = os.environ["NER_MODEL_REPO"], os.environ["NER_MODEL_REVISION"]
+(target / "NOTICE").write_text(
+    f"Model: {repo}\n"
+    f"Source: https://huggingface.co/{repo} (revision {revision})\n"
+    "Author: Davlan (Hugging Face), fine-tuned for named entity recognition.\n"
+    "Licence: Academic Free License v3.0 (AFL-3.0), as declared in the model card README.md.\n"
+    "Base model: FacebookAI/xlm-roberta-base (XLM-RoBERTa, Conneau et al., 2019), MIT License.\n"
+    "The model files in this directory are redistributed unmodified.\n",
+    encoding="utf-8",
+)
+for name in sorted(p.name for p in target.iterdir()):
+    print(name, (target / name).stat().st_size)
+PY
+
+# Read-only for everyone; COPY keeps these modes (owner root), so the app user cannot change it.
+RUN chmod -R a=rX /models
+
+
+FROM ${PYTHON_IMAGE} AS base
 
 # uv 0.12.19 (same version as the host), pinned by digest.
 COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 /uv /uvx /usr/local/bin/
@@ -38,17 +136,26 @@ RUN apt-get update \
         tini=0.19.0-3+b8 \
     && rm -rf /var/lib/apt/lists/*
 
-# OMP_THREAD_LIMIT=1: one Tesseract thread per process; parallelism comes from page workers.
+# OMP_THREAD_LIMIT is deliberately not set image-wide: it would also cap torch (NER) at one
+# thread. The Tesseract runner sets OMP_THREAD_LIMIT=1 on each tesseract process instead (one
+# thread per process; parallelism comes from page workers).
 # UV_PROJECT_ENVIRONMENT keeps the venv outside the copied source tree.
+# HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE: the model is baked in, nothing is fetched at run time.
+# NER_MODEL_PATH: where the baked-in model lives (read by the `ner_model` tests and app settings).
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=0 \
-    OMP_THREAD_LIMIT=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
-    PATH="/opt/venv/bin:${PATH}"
+    PATH="/opt/venv/bin:${PATH}" \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    NER_MODEL_PATH=/models/xlm-roberta-base-ner-hrl
 
 RUN useradd --create-home --uid 10001 app
+
+COPY --from=model /models /models
 
 
 FROM base AS test
