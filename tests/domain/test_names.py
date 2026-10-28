@@ -35,6 +35,7 @@ def _page(*lines: str) -> PageText:
             text=text,
             box=Box(page=0, x=10.0 * column, y=12.0 * line, width=8, height=10),
             line=line,
+            paragraph=0,
         )
         for line, content in enumerate(lines)
         for column, text in enumerate(content.split())

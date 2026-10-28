@@ -45,6 +45,10 @@ def _lines(tsv: str) -> list[tuple[str, int]]:
     return [(word.text, word.line) for word in parse_tsv(tsv, RASTER, 0)]
 
 
+def _paragraphs(tsv: str, page: int = 0) -> list[tuple[str, int]]:
+    return [(word.text, word.paragraph) for word in parse_tsv(tsv, RASTER, page)]
+
+
 class TestParseTsv:
     def test_header_only_gives_no_words(self) -> None:
         assert parse_tsv(_fixture("header_only.tsv.txt"), RASTER, 0) == ()
@@ -53,11 +57,11 @@ class TestParseTsv:
         words = parse_tsv(_fixture("page_words.tsv.txt"), RASTER, 3)
 
         assert words == (
-            PageWord("Ramírez", Box(3, 50.0, 25.0, 100.0, 20.0), 0),
-            PageWord("Müller", Box(3, 160.0, 25.0, 50.0, 20.0), 0),
-            PageWord("São", Box(3, 300.0, 25.0, 75.0, 20.0), 0),
-            PageWord("edge", Box(3, 450.0, 230.0, 50.0, 20.0), 1),
-            PageWord("beyond", Box(3, 475.0, 240.0, 25.0, 10.0), 1),
+            PageWord("Ramírez", Box(3, 50.0, 25.0, 100.0, 20.0), 0, 0),
+            PageWord("Müller", Box(3, 160.0, 25.0, 50.0, 20.0), 0, 0),
+            PageWord("São", Box(3, 300.0, 25.0, 75.0, 20.0), 0, 0),
+            PageWord("edge", Box(3, 450.0, 230.0, 50.0, 20.0), 1, 0),
+            PageWord("beyond", Box(3, 475.0, 240.0, 25.0, 10.0), 1, 0),
         )
 
     def test_words_on_one_line_share_an_index_and_the_next_line_gets_the_next(self) -> None:
@@ -85,6 +89,29 @@ class TestParseTsv:
 
         assert [word.line for word in parse_tsv(tsv, RASTER, 0)] == [0, 1]
         assert [word.line for word in parse_tsv(tsv, RASTER, 1)] == [0, 1]
+
+    def test_lines_of_one_paragraph_share_its_index_and_the_next_gets_the_next(self) -> None:
+        tsv = _words(
+            (1, 1, 1, "Heading"), (1, 2, 1, "first"), (1, 2, 2, "second"), (1, 3, 1, "third")
+        )
+
+        assert _paragraphs(tsv) == [("Heading", 0), ("first", 1), ("second", 1), ("third", 2)]
+
+    def test_a_paragraph_is_the_block_paragraph_pair(self) -> None:
+        tsv = _words((1, 1, 1, "a"), (2, 1, 1, "b"), (2, 1, 2, "c"), (3, 4, 7, "d"))
+
+        assert _paragraphs(tsv) == [("a", 0), ("b", 1), ("c", 1), ("d", 2)]
+
+    def test_paragraphs_whose_words_are_all_dropped_take_no_index(self) -> None:
+        tsv = _words((1, 1, 1, "kept"), (1, 2, 1, " "), (1, 3, 1, "next"))
+
+        assert _paragraphs(tsv) == [("kept", 0), ("next", 1)]
+
+    def test_paragraph_numbering_restarts_on_every_page(self) -> None:
+        tsv = _words((2, 3, 1, "late"), (4, 1, 1, "later"))
+
+        assert _paragraphs(tsv, page=0) == [("late", 0), ("later", 1)]
+        assert _paragraphs(tsv, page=1) == [("late", 0), ("later", 1)]
 
     def test_blank_negative_confidence_and_empty_boxes_are_dropped(self) -> None:
         texts = [word.text for word in parse_tsv(_fixture("page_words.tsv.txt"), RASTER, 0)]

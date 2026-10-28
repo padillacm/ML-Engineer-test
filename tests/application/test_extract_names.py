@@ -31,7 +31,7 @@ def make_page(page: int, lines: Sequence[str], language: str | None = None) -> O
         for text in line.split():
             width = CHAR_WIDTH * len(text)
             box = Box(page=page, x=x, y=y, width=width, height=WORD_HEIGHT)
-            words.append(PageWord(text=text, box=box, line=line_index))
+            words.append(PageWord(text=text, box=box, line=line_index, paragraph=0))
             x += width + CHAR_WIDTH
     return OcrPage(
         page=page, width=PAGE_WIDTH, height=PAGE_HEIGHT, words=tuple(words), language=language
@@ -166,7 +166,7 @@ def test_blank_pages_are_skipped_without_calling_the_recognizer() -> None:
         page=1,
         width=PAGE_WIDTH,
         height=PAGE_HEIGHT,
-        words=(PageWord(text="  ", box=Box(1, 10.0, 10.0, 5.0, 5.0), line=0),),
+        words=(PageWord(text="  ", box=Box(1, 10.0, 10.0, 5.0, 5.0), line=0, paragraph=0),),
         language=None,
     )
     text_page = make_page(2, ["Signed by Maria Gonzalez"])
@@ -221,8 +221,8 @@ def test_without_a_hint_or_a_detected_language_m_stays_an_initial() -> None:
 
 def test_box_is_clamped_to_the_page() -> None:
     words = (
-        PageWord(text="Maria", box=Box(0, 560.0, 50.0, 40.0, 12.0), line=0),
-        PageWord(text="Gonzalez", box=Box(0, 604.0, 50.0, 30.0, 12.0), line=0),
+        PageWord(text="Maria", box=Box(0, 560.0, 50.0, 40.0, 12.0), line=0, paragraph=0),
+        PageWord(text="Gonzalez", box=Box(0, 604.0, 50.0, 30.0, 12.0), line=0, paragraph=0),
     )
     page = OcrPage(page=0, width=PAGE_WIDTH, height=PAGE_HEIGHT, words=words, language=None)
     use_case, _, _ = extract([page], ["Maria Gonzalez"])

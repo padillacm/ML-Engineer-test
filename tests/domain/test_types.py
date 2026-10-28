@@ -5,12 +5,14 @@ import pytest
 
 from app.domain.errors import GeometryError
 from app.domain.types import (
+    Answer,
     Box,
     ChatMessage,
     Chunk,
     EmbeddingIdentity,
     ExtractionResult,
     FuzzyMatch,
+    IngestResult,
     NameMention,
     NamePair,
     OcrPage,
@@ -52,7 +54,7 @@ def test_equal_values_compare_equal_and_hash_equal() -> None:
 
 def test_nested_values_compare_by_content() -> None:
     assert PixelBox(1, 2, 3, 4) == PixelBox(1, 2, 3, 4)
-    assert PageWord("a", Box(0, 1, 2, 3, 4), 0) == PageWord("a", Box(0, 1, 2, 3, 4), 0)
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 0, 0) == PageWord("a", Box(0, 1, 2, 3, 4), 0, 0)
 
 
 @pytest.mark.parametrize(
@@ -60,8 +62,9 @@ def test_nested_values_compare_by_content() -> None:
     [
         (Box(0, 1, 2, 3, 4), "x"),
         (PixelBox(1, 2, 3, 4), "x"),
-        (PageWord("a", Box(0, 1, 2, 3, 4), 0), "text"),
-        (PageWord("a", Box(0, 1, 2, 3, 4), 0), "line"),
+        (PageWord("a", Box(0, 1, 2, 3, 4), 0, 0), "text"),
+        (PageWord("a", Box(0, 1, 2, 3, 4), 0, 0), "line"),
+        (PageWord("a", Box(0, 1, 2, 3, 4), 0, 0), "paragraph"),
         (NameMention("Maria", Box(0, 1, 2, 3, 4)), "name"),
         (ExtractionResult((), ()), "names"),
         (TextSpan(0, 1), "end"),
@@ -70,6 +73,8 @@ def test_nested_values_compare_by_content() -> None:
         (FuzzyMatch("a", "b", 0.5), "score"),
         (ChatMessage("user", "hi"), "content"),
         (EmbeddingIdentity("m", 3, "none", True, "cosine"), "dimension"),
+        (IngestResult("doc", 1, already_indexed=False), "chunks_stored"),
+        (Answer("a", ()), "sources"),
     ],
 )
 def test_values_are_immutable(instance: object, field: str) -> None:
@@ -78,13 +83,23 @@ def test_values_are_immutable(instance: object, field: str) -> None:
 
 
 def test_page_word_rejects_a_negative_line_index() -> None:
-    assert PageWord("a", Box(0, 1, 2, 3, 4), 7).line == 7
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 7, 0).line == 7
     with pytest.raises(ValueError, match="line index must be >= 0"):
-        PageWord("a", Box(0, 1, 2, 3, 4), -1)
+        PageWord("a", Box(0, 1, 2, 3, 4), -1, 0)
 
 
 def test_page_words_on_different_lines_are_unequal() -> None:
-    assert PageWord("a", Box(0, 1, 2, 3, 4), 0) != PageWord("a", Box(0, 1, 2, 3, 4), 1)
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 0, 0) != PageWord("a", Box(0, 1, 2, 3, 4), 1, 0)
+
+
+def test_page_word_rejects_a_negative_paragraph_index() -> None:
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 0, 3).paragraph == 3
+    with pytest.raises(ValueError, match="paragraph index must be >= 0"):
+        PageWord("a", Box(0, 1, 2, 3, 4), 0, -1)
+
+
+def test_page_words_in_different_paragraphs_are_unequal() -> None:
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 0, 0) != PageWord("a", Box(0, 1, 2, 3, 4), 0, 1)
 
 
 @pytest.mark.parametrize("name", ["", " ", "\t\n"])
@@ -109,7 +124,7 @@ def test_extraction_result_holds_names_and_matches_by_value() -> None:
 
 def test_new_values_have_no_instance_dict() -> None:
     for instance in (
-        PageWord("a", Box(0, 1, 2, 3, 4), 0),
+        PageWord("a", Box(0, 1, 2, 3, 4), 0, 0),
         NameMention("Maria", Box(0, 1, 2, 3, 4)),
         ExtractionResult((), ()),
     ):
@@ -181,13 +196,13 @@ def test_ocr_page_rejects_a_word_from_another_page() -> None:
             page=1,
             width=595,
             height=842,
-            words=(PageWord("a", Box(0, 1, 2, 3, 4), 0),),
+            words=(PageWord("a", Box(0, 1, 2, 3, 4), 0, 0),),
             language=None,
         )
 
 
 def test_ocr_page_accepts_words_of_its_own_page() -> None:
-    word = PageWord("a", Box(1, 1, 2, 3, 4), 0)
+    word = PageWord("a", Box(1, 1, 2, 3, 4), 0, 0)
 
     assert OcrPage(page=1, width=595, height=842, words=(word,), language=None).words == (word,)
 
@@ -201,3 +216,42 @@ def test_ocr_page_accepts_no_language_or_a_supported_one(language: str | None) -
 def test_ocr_page_rejects_an_unsupported_language(language: str) -> None:
     with pytest.raises(ValueError, match="language must be None or one of"):
         OcrPage(page=0, width=595, height=842, words=(), language=language)
+
+
+def test_ingest_result_holds_its_values() -> None:
+    result = IngestResult(document_id="doc", chunks_stored=3, already_indexed=True)
+
+    assert (result.document_id, result.chunks_stored, result.already_indexed) == ("doc", 3, True)
+    assert IngestResult("doc", 0, already_indexed=False).chunks_stored == 0
+
+
+@pytest.mark.parametrize("document_id", ["", "  "])
+def test_ingest_result_rejects_a_blank_document_id(document_id: str) -> None:
+    with pytest.raises(ValueError, match="document_id"):
+        IngestResult(document_id, 1, already_indexed=False)
+
+
+def test_ingest_result_rejects_a_negative_count() -> None:
+    with pytest.raises(ValueError, match="chunks_stored"):
+        IngestResult("doc", -1, already_indexed=False)
+
+
+def test_ingest_result_rejects_an_already_indexed_document_without_chunks() -> None:
+    with pytest.raises(ValueError, match="already indexed"):
+        IngestResult("doc", 0, already_indexed=True)
+
+
+def test_answer_holds_text_and_sources_by_value() -> None:
+    assert Answer("Maria", ("chunk a", "chunk b")) == Answer("Maria", ("chunk a", "chunk b"))
+    assert Answer("Maria", ()).sources == ()
+
+
+@pytest.mark.parametrize("text", ["", " \t "])
+def test_answer_rejects_blank_text(text: str) -> None:
+    with pytest.raises(ValueError, match="blank"):
+        Answer(text, ())
+
+
+def test_answer_rejects_sources_that_are_not_a_tuple() -> None:
+    with pytest.raises(ValueError, match="tuple"):
+        Answer("Maria", ["chunk"])  # type: ignore[arg-type]

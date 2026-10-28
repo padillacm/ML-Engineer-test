@@ -6,15 +6,18 @@ parametrised factory) that overrides the same fixtures.
 
 import pytest
 
-from app.application.ports import Embedder, NameRecognizer, OcrEngine, VectorStore
+from app.application.ports import Embedder, LLMClient, NameRecognizer, OcrEngine, VectorStore
+from app.domain.errors import DependencyUnavailable
 from app.domain.types import Box, EmbeddingIdentity, OcrPage, PageWord
 from tests.application.contracts import (
     EmbedderContract,
+    LLMClientContract,
     NameRecognizerContract,
     OcrEngineContract,
     VectorStoreContract,
 )
 from tests.fakes.embedder import FakeEmbedder
+from tests.fakes.llm import FakeLLMClient
 from tests.fakes.names import FakeNameRecognizer
 from tests.fakes.ocr import FakeOcrEngine
 from tests.fakes.vector_store import FakeVectorStore
@@ -26,7 +29,7 @@ class TestFakeOcrEngineContract(OcrEngineContract):
         return FakeOcrEngine(
             [
                 OcrPage(
-                    0, 595.0, 842.0, (PageWord("Memo", Box(0, 72.0, 72.0, 40.0, 12.0), 0),), None
+                    0, 595.0, 842.0, (PageWord("Memo", Box(0, 72.0, 72.0, 40.0, 12.0), 0, 0),), None
                 ),
                 OcrPage(1, 842.0, 595.0, (), None),
             ]
@@ -73,3 +76,13 @@ class TestFakeVectorStoreContract(VectorStoreContract):
     @pytest.fixture
     def store(self) -> VectorStore:
         return FakeVectorStore()
+
+
+class TestFakeLLMClientContract(LLMClientContract):
+    @pytest.fixture
+    def client(self) -> LLMClient:
+        return FakeLLMClient()
+
+    @pytest.fixture
+    def failing_client(self) -> LLMClient:
+        return FakeLLMClient([DependencyUnavailable("LLM is down", "llm_unavailable")])

@@ -1,5 +1,5 @@
-"""Reusable contract tests for the ``OcrEngine``, ``NameRecognizer``, ``Embedder`` and
-``VectorStore`` ports.
+"""Reusable contract tests for the ``OcrEngine``, ``NameRecognizer``, ``Embedder``,
+``VectorStore`` and ``LLMClient`` ports.
 
 A test module subclasses a contract and overrides its factory fixtures; every real adapter added
 in later blocks runs the same test bodies as the fakes. The classes are not named ``Test*`` so
@@ -9,14 +9,16 @@ pytest only collects the concrete subclasses.
 import dataclasses
 import itertools
 import math
+import threading
 from collections.abc import Sequence
 
 import pytest
 
-from app.application.ports import Embedder, NameRecognizer, OcrEngine, VectorStore
-from app.domain.errors import IncompatibleEmbedding
+from app.application.ports import Embedder, LLMClient, NameRecognizer, OcrEngine, VectorStore
+from app.domain.errors import DependencyTimeout, DependencyUnavailable, IncompatibleEmbedding
 from app.domain.language import SUPPORTED_LANGUAGES
-from app.domain.types import Chunk, EmbeddingIdentity, OcrPage, TextSpan
+from app.domain.types import ChatMessage, Chunk, EmbeddingIdentity, OcrPage, TextSpan
+from tests.fakes.vector_store import FakeVectorStore
 
 _IDENTITY_384 = EmbeddingIdentity("contract-model", 384, "none", True, "cosine")
 _IDENTITY_768 = dataclasses.replace(_IDENTITY_384, dimension=768)
@@ -31,6 +33,30 @@ def one_hot(dimension: int, index: int) -> list[float]:
 def make_chunks(*texts: str) -> list[Chunk]:
     """Chunks of one page, numbered from 0 in the order given."""
     return [Chunk(text, 0, sequence, 0, len(text)) for sequence, text in enumerate(texts)]
+
+
+def page_texts_of(chunks: Sequence[Chunk]) -> dict[int, str]:
+    """Page texts that contain every chunk: each page is its chunks' texts joined by spaces."""
+    pages: dict[int, list[str]] = {}
+    for chunk in chunks:
+        pages.setdefault(chunk.page, []).append(chunk.text)
+    return {page: " ".join(texts) for page, texts in pages.items()}
+
+
+def upsert(
+    store: VectorStore,
+    document_id: str,
+    chunks: Sequence[Chunk],
+    vectors: Sequence[Sequence[float]],
+) -> None:
+    """``store.upsert`` with page texts built from the chunks and a hash derived from the id."""
+    store.upsert(
+        document_id,
+        chunks,
+        vectors,
+        page_texts=page_texts_of(chunks),
+        content_hash=f"sha256-of-{document_id}",
+    )
 
 
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -169,8 +195,10 @@ class EmbedderContract:
 
         assert len(vectors) == len(texts)
         assert all(len(vector) == embedder.identity.dimension for vector in vectors)
+        # Batching pads inputs, which changes the shape of the matrix products and so the last
+        # float bits of real models (~1e-7); equality is checked to 1e-5.
         for text, vector in zip(texts, vectors, strict=True):
-            assert vector == embedder.embed_passages([text])[0]
+            assert vector == pytest.approx(embedder.embed_passages([text])[0], abs=1e-5)
 
     def test_no_passages_give_no_vectors(self, embedder: Embedder) -> None:
         assert embedder.embed_passages([]) == []
@@ -204,11 +232,30 @@ class VectorStoreContract:
     """Behaviour every ``VectorStore`` must show.
 
     Override the ``store`` fixture so it returns a fresh, empty store with no collection yet.
+    The hooks ``drop_chunk``, ``writer_failing_after`` and ``other_writer`` default to what
+    ``FakeVectorStore`` offers; adapters override them.
     """
 
     @pytest.fixture
     def store(self) -> VectorStore:
         raise NotImplementedError
+
+    def drop_chunk(self, store: VectorStore, document_id: str, sequence: int) -> None:
+        """Lose one stored chunk behind the store's back (as an interrupted write would)."""
+        assert isinstance(store, FakeVectorStore), "override drop_chunk for this store"
+        store.drop_chunk(document_id, sequence)
+
+    def writer_failing_after(self, store: VectorStore, stored: int) -> VectorStore:
+        """A ready store over ``store``'s data whose next ``upsert`` stores ``stored`` chunks and
+        then fails with ``DependencyUnavailable``."""
+        assert isinstance(store, FakeVectorStore), "override writer_failing_after for this store"
+        store.fail_upsert_after(stored, DependencyUnavailable("down", "vector_store_unavailable"))
+        return store
+
+    def other_writer(self, store: VectorStore) -> VectorStore:
+        """A ready store over ``store``'s data that another thread may use."""
+        assert isinstance(store, FakeVectorStore), "override other_writer for this store"
+        return store
 
     @pytest.fixture
     def identity(self) -> EmbeddingIdentity:
@@ -231,7 +278,7 @@ class VectorStoreContract:
         ]
         close = [0.0] * 384
         close[0], close[1] = 1.0, 1.0
-        ready.upsert("doc", chunks, [one_hot(384, 0), close, one_hot(384, 7)])
+        upsert(ready, "doc", chunks, [one_hot(384, 0), close, one_hot(384, 7)])
 
         hits = ready.search(one_hot(384, 0), top_k=2)
 
@@ -244,7 +291,8 @@ class VectorStoreContract:
 
     def test_scores_stay_within_zero_and_one(self, ready: VectorStore) -> None:
         opposite = [-value for value in one_hot(384, 0)]
-        ready.upsert(
+        upsert(
+            ready,
             "doc",
             make_chunks("same", "orthogonal", "opposite"),
             [
@@ -264,7 +312,7 @@ class VectorStoreContract:
     def test_reopening_with_same_identity_keeps_chunks_searchable(
         self, ready: VectorStore, identity: EmbeddingIdentity
     ) -> None:
-        ready.upsert("doc", make_chunks("stored text"), [one_hot(384, 3)])
+        upsert(ready, "doc", make_chunks("stored text"), [one_hot(384, 3)])
 
         ready.ensure_collection(dataclasses.replace(identity))
 
@@ -274,7 +322,7 @@ class VectorStoreContract:
     def test_reopening_with_another_dimension_fails_and_changes_nothing(
         self, ready: VectorStore
     ) -> None:
-        ready.upsert("doc", make_chunks("stored text"), [one_hot(384, 3)])
+        upsert(ready, "doc", make_chunks("stored text"), [one_hot(384, 3)])
 
         with pytest.raises(IncompatibleEmbedding):
             ready.ensure_collection(_IDENTITY_768)
@@ -291,15 +339,16 @@ class VectorStoreContract:
     def test_adding_vectors_of_another_dimension_fails_and_changes_nothing(
         self, ready: VectorStore
     ) -> None:
-        ready.upsert("doc", make_chunks("stored text"), [one_hot(384, 3)])
+        upsert(ready, "doc", make_chunks("stored text"), [one_hot(384, 3)])
 
         with pytest.raises(IncompatibleEmbedding):
-            ready.upsert("doc", make_chunks("wrong size"), [one_hot(768, 3)])
+            upsert(ready, "doc", make_chunks("wrong size"), [one_hot(768, 3)])
 
         assert [hit.text for hit in ready.search(one_hot(384, 3), top_k=5)] == ["stored text"]
 
     def test_reingesting_a_document_keeps_only_the_latest_chunks(self, ready: VectorStore) -> None:
-        ready.upsert(
+        upsert(
+            ready,
             "doc",
             make_chunks("old one", "old two", "old three"),
             [
@@ -309,39 +358,39 @@ class VectorStoreContract:
             ],
         )
 
-        ready.upsert("doc", make_chunks("new one", "new two"), [one_hot(384, 4), one_hot(384, 5)])
+        upsert(ready, "doc", make_chunks("new one", "new two"), [one_hot(384, 4), one_hot(384, 5)])
 
         assert ready.count() == 2
         texts = {hit.text for hit in ready.search(one_hot(384, 0), top_k=10)}
         assert texts == {"new one", "new two"}
 
     def test_two_documents_stay_retrievable(self, ready: VectorStore) -> None:
-        ready.upsert("doc-a", make_chunks("from a"), [one_hot(384, 0)])
-        ready.upsert("doc-b", make_chunks("from b"), [one_hot(384, 1)])
+        upsert(ready, "doc-a", make_chunks("from a"), [one_hot(384, 0)])
+        upsert(ready, "doc-b", make_chunks("from b"), [one_hot(384, 1)])
 
         assert ready.count() == 2
         assert ready.search(one_hot(384, 0), top_k=1)[0].document_id == "doc-a"
         assert ready.search(one_hot(384, 1), top_k=1)[0].document_id == "doc-b"
 
     def test_reingesting_one_document_leaves_another_untouched(self, ready: VectorStore) -> None:
-        ready.upsert("doc-a", make_chunks("from a"), [one_hot(384, 0)])
-        ready.upsert("doc-b", make_chunks("b before"), [one_hot(384, 1)])
+        upsert(ready, "doc-a", make_chunks("from a"), [one_hot(384, 0)])
+        upsert(ready, "doc-b", make_chunks("b before"), [one_hot(384, 1)])
 
-        ready.upsert("doc-b", make_chunks("b after"), [one_hot(384, 2)])
+        upsert(ready, "doc-b", make_chunks("b after"), [one_hot(384, 2)])
 
         hits = {hit.document_id: hit.text for hit in ready.search(one_hot(384, 0), top_k=10)}
         assert hits == {"doc-a": "from a", "doc-b": "b after"}
 
     def test_same_sequence_in_two_documents_does_not_collide(self, ready: VectorStore) -> None:
-        ready.upsert("doc-a", make_chunks("a first"), [one_hot(384, 0)])
-        ready.upsert("doc-b", make_chunks("b first"), [one_hot(384, 0)])
+        upsert(ready, "doc-a", make_chunks("a first"), [one_hot(384, 0)])
+        upsert(ready, "doc-b", make_chunks("b first"), [one_hot(384, 0)])
 
         assert ready.count() == 2
 
     def test_searching_with_a_vector_of_another_dimension_fails_and_changes_nothing(
         self, ready: VectorStore
     ) -> None:
-        ready.upsert("doc", make_chunks("stored text"), [one_hot(384, 3)])
+        upsert(ready, "doc", make_chunks("stored text"), [one_hot(384, 3)])
 
         with pytest.raises(IncompatibleEmbedding):
             ready.search(one_hot(768, 3), top_k=5)
@@ -351,7 +400,7 @@ class VectorStoreContract:
 
     @pytest.mark.parametrize("top_k", [0, -1])
     def test_top_k_below_one_is_rejected(self, ready: VectorStore, top_k: int) -> None:
-        ready.upsert("doc", make_chunks("stored text"), [one_hot(384, 3)])
+        upsert(ready, "doc", make_chunks("stored text"), [one_hot(384, 3)])
 
         with pytest.raises(ValueError):  # noqa: PT011 - type only, per port contract
             ready.search(one_hot(384, 3), top_k=top_k)
@@ -359,11 +408,11 @@ class VectorStoreContract:
     def test_duplicate_sequences_in_one_upsert_fail_and_keep_existing_data(
         self, ready: VectorStore
     ) -> None:
-        ready.upsert("doc", make_chunks("stored text"), [one_hot(384, 3)])
+        upsert(ready, "doc", make_chunks("stored text"), [one_hot(384, 3)])
         duplicated = [Chunk("first", 0, 0, 0, 5), Chunk("second", 0, 0, 6, 12)]
 
         with pytest.raises(ValueError):  # noqa: PT011 - type only, per port contract
-            ready.upsert("doc", duplicated, [one_hot(384, 0), one_hot(384, 1)])
+            upsert(ready, "doc", duplicated, [one_hot(384, 0), one_hot(384, 1)])
 
         assert ready.count() == 1
         assert [hit.text for hit in ready.search(one_hot(384, 3), top_k=5)] == ["stored text"]
@@ -371,12 +420,12 @@ class VectorStoreContract:
     def test_chunks_and_vectors_of_different_length_fail_and_keep_existing_data(
         self, ready: VectorStore
     ) -> None:
-        ready.upsert("doc", make_chunks("stored text"), [one_hot(384, 3)])
+        upsert(ready, "doc", make_chunks("stored text"), [one_hot(384, 3)])
 
         with pytest.raises(ValueError):  # noqa: PT011 - type only, per port contract
-            ready.upsert("doc", make_chunks("one", "two"), [one_hot(384, 0)])
+            upsert(ready, "doc", make_chunks("one", "two"), [one_hot(384, 0)])
         with pytest.raises(ValueError):  # noqa: PT011 - type only, per port contract
-            ready.upsert("doc", make_chunks("one"), [one_hot(384, 0), one_hot(384, 1)])
+            upsert(ready, "doc", make_chunks("one"), [one_hot(384, 0), one_hot(384, 1)])
 
         assert ready.count() == 1
         assert [hit.text for hit in ready.search(one_hot(384, 3), top_k=5)] == ["stored text"]
@@ -385,7 +434,7 @@ class VectorStoreContract:
         self, store: VectorStore
     ) -> None:
         with pytest.raises(RuntimeError):
-            store.upsert("doc", make_chunks("text"), [one_hot(384, 0)])
+            upsert(store, "doc", make_chunks("text"), [one_hot(384, 0)])
 
     def test_search_before_ensure_collection_is_a_programming_error(
         self, store: VectorStore
@@ -394,11 +443,219 @@ class VectorStoreContract:
             store.search(one_hot(384, 0), top_k=1)
 
     def test_delete_document_removes_only_that_document(self, ready: VectorStore) -> None:
-        ready.upsert("doc-a", make_chunks("from a"), [one_hot(384, 0)])
-        ready.upsert("doc-b", make_chunks("from b"), [one_hot(384, 1)])
+        upsert(ready, "doc-a", make_chunks("from a"), [one_hot(384, 0)])
+        upsert(ready, "doc-b", make_chunks("from b"), [one_hot(384, 1)])
 
         ready.delete_document("doc-a")
         ready.delete_document("never-stored")
 
         assert [hit.document_id for hit in ready.search(one_hot(384, 0), top_k=10)] == ["doc-b"]
         assert ready.count() == 1
+
+    def test_hits_carry_the_page_text_of_their_chunk(self, ready: VectorStore) -> None:
+        chunks = [Chunk("first half", 0, 0, 0, 10), Chunk("other page", 1, 1, 0, 10)]
+        page_texts = {0: "first half and second half", 1: "other page text", 2: "unused page"}
+        ready.upsert(
+            "doc",
+            chunks,
+            [one_hot(384, 0), one_hot(384, 1)],
+            page_texts=page_texts,
+            content_hash="abc123",
+        )
+
+        hits = ready.search(one_hot(384, 0), top_k=2)
+
+        assert [(hit.page, hit.text, hit.page_text) for hit in hits] == [
+            (0, "first half", "first half and second half"),
+            (1, "other page", "other page text"),
+        ]
+
+    def test_document_chunk_count_is_zero_for_unknown_documents(self, ready: VectorStore) -> None:
+        upsert(ready, "doc-a", make_chunks("from a"), [one_hot(384, 0)])
+
+        assert ready.document_chunk_count("never-stored") == 0
+
+    def test_document_chunk_count_counts_only_that_document(self, ready: VectorStore) -> None:
+        upsert(ready, "doc-a", make_chunks("a1", "a2", "a3"), [one_hot(384, i) for i in range(3)])
+        upsert(ready, "doc-b", make_chunks("b1"), [one_hot(384, 5)])
+
+        assert ready.document_chunk_count("doc-a") == 3
+        assert ready.document_chunk_count("doc-b") == 1
+
+    def test_document_chunk_count_after_reupsert_is_replaced_not_added(
+        self, ready: VectorStore
+    ) -> None:
+        upsert(ready, "doc", make_chunks("a1", "a2", "a3"), [one_hot(384, i) for i in range(3)])
+        upsert(ready, "doc", make_chunks("a1", "a2", "a3"), [one_hot(384, i) for i in range(3)])
+        assert ready.document_chunk_count("doc") == 3
+
+        upsert(ready, "doc", make_chunks("only"), [one_hot(384, 9)])
+        assert ready.document_chunk_count("doc") == 1
+
+    def test_document_chunk_count_after_delete_is_zero(self, ready: VectorStore) -> None:
+        upsert(ready, "doc-a", make_chunks("a1", "a2"), [one_hot(384, 0), one_hot(384, 1)])
+        upsert(ready, "doc-b", make_chunks("b1"), [one_hot(384, 2)])
+
+        ready.delete_document("doc-a")
+
+        assert ready.document_chunk_count("doc-a") == 0
+        assert ready.document_chunk_count("doc-b") == 1
+
+    def test_document_chunk_count_before_ensure_collection_is_a_programming_error(
+        self, store: VectorStore
+    ) -> None:
+        with pytest.raises(RuntimeError):
+            store.document_chunk_count("doc")
+
+    def test_missing_page_text_fails_and_keeps_existing_data(self, ready: VectorStore) -> None:
+        upsert(ready, "doc", make_chunks("stored text"), [one_hot(384, 3)])
+        chunks = [Chunk("on page 0", 0, 0, 0, 9), Chunk("on page 1", 1, 1, 0, 9)]
+
+        with pytest.raises(ValueError):  # noqa: PT011 - type only, per port contract
+            ready.upsert(
+                "doc",
+                chunks,
+                [one_hot(384, 0), one_hot(384, 1)],
+                page_texts={0: "on page 0"},
+                content_hash="abc123",
+            )
+
+        assert ready.count() == 1
+        assert ready.document_chunk_count("doc") == 1
+        hits = ready.search(one_hot(384, 3), top_k=5)
+        assert [(hit.text, hit.page_text) for hit in hits] == [("stored text", "stored text")]
+
+    def test_empty_content_hash_fails_and_keeps_existing_data(self, ready: VectorStore) -> None:
+        upsert(ready, "doc", make_chunks("stored text"), [one_hot(384, 3)])
+
+        with pytest.raises(ValueError):  # noqa: PT011 - type only, per port contract
+            ready.upsert(
+                "doc",
+                make_chunks("new text"),
+                [one_hot(384, 0)],
+                page_texts={0: "new text"},
+                content_hash="",
+            )
+
+        assert [hit.text for hit in ready.search(one_hot(384, 3), top_k=5)] == ["stored text"]
+
+    def test_a_document_missing_a_chunk_counts_as_zero(self, ready: VectorStore) -> None:
+        upsert(ready, "doc", make_chunks("a1", "a2", "a3"), [one_hot(384, i) for i in range(3)])
+        upsert(ready, "other", make_chunks("b1"), [one_hot(384, 5)])
+
+        self.drop_chunk(ready, "doc", 1)
+
+        assert ready.document_chunk_count("doc") == 0
+        assert ready.document_chunk_count("other") == 1
+
+    def test_storing_an_incomplete_document_again_completes_it(self, ready: VectorStore) -> None:
+        chunks = make_chunks("a1", "a2", "a3")
+        upsert(ready, "doc", chunks, [one_hot(384, i) for i in range(3)])
+        self.drop_chunk(ready, "doc", 0)
+
+        upsert(ready, "doc", chunks, [one_hot(384, i) for i in range(3)])
+
+        assert ready.document_chunk_count("doc") == 3
+        assert ready.count() == 3
+
+    def test_a_write_failing_part_way_leaves_an_incomplete_document(
+        self, ready: VectorStore
+    ) -> None:
+        chunks = make_chunks("a1", "a2", "a3", "a4")
+        vectors = [one_hot(384, i) for i in range(4)]
+        failing = self.writer_failing_after(ready, 2)
+
+        with pytest.raises(DependencyUnavailable):
+            upsert(failing, "doc", chunks, vectors)
+
+        assert ready.document_chunk_count("doc") == 0
+        upsert(ready, "doc", chunks, vectors)
+        assert ready.document_chunk_count("doc") == 4
+        assert ready.count() == 4
+
+    def test_a_failed_second_writer_leaves_the_first_complete(self, ready: VectorStore) -> None:
+        chunks = make_chunks("a1", "a2", "a3", "a4")
+        vectors = [one_hot(384, i) for i in range(4)]
+        upsert(ready, "doc", chunks, vectors)
+        failing = self.writer_failing_after(ready, 2)
+
+        with pytest.raises(DependencyUnavailable):
+            upsert(failing, "doc", chunks, vectors)
+
+        assert ready.document_chunk_count("doc") == 4
+        texts = {hit.text for hit in ready.search(one_hot(384, 0), top_k=10)}
+        assert texts == {"a1", "a2", "a3", "a4"}
+
+    def test_concurrent_writes_of_a_document_keep_it_visible_and_leave_one_copy(
+        self, ready: VectorStore
+    ) -> None:
+        chunks = make_chunks("a1", "a2", "a3", "a4")
+        vectors = [one_hot(384, i) for i in range(4)]
+        upsert(ready, "doc", chunks, vectors)
+        writers = [self.other_writer(ready) for _ in range(2)]
+        errors: list[BaseException] = []
+
+        def rewrite(writer: VectorStore) -> None:
+            try:
+                for _ in range(5):
+                    upsert(writer, "doc", chunks, vectors)
+            except BaseException as error:  # noqa: BLE001 - reported by the main thread
+                errors.append(error)
+
+        threads = [threading.Thread(target=rewrite, args=(writer,)) for writer in writers]
+        for thread in threads:
+            thread.start()
+        seen: set[int] = set()
+        while any(thread.is_alive() for thread in threads):
+            seen.add(ready.document_chunk_count("doc"))
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert seen <= {4}
+        assert ready.document_chunk_count("doc") == 4
+        assert ready.count() == 4
+
+
+class LLMClientContract:
+    """Behaviour every ``LLMClient`` must show.
+
+    Override ``client`` (a working client) and ``failing_client`` (one whose model cannot answer,
+    however the adapter experiences that).
+    """
+
+    @pytest.fixture
+    def client(self) -> LLMClient:
+        raise NotImplementedError
+
+    @pytest.fixture
+    def failing_client(self) -> LLMClient:
+        raise NotImplementedError
+
+    @staticmethod
+    def conversation() -> list[ChatMessage]:
+        return [
+            ChatMessage("system", "Answer briefly."),
+            ChatMessage("user", "What is the capital of France?"),
+        ]
+
+    def test_satisfies_the_port(self, client: LLMClient) -> None:
+        assert isinstance(client, LLMClient)
+
+    def test_simple_conversation_returns_text(self, client: LLMClient) -> None:
+        assert isinstance(client.complete(self.conversation()), str)
+
+    def test_messages_are_not_modified(self, client: LLMClient) -> None:
+        messages = self.conversation()
+        before = list(messages)
+
+        client.complete(messages)
+
+        assert messages == before
+
+    def test_only_dependency_errors_escape(self, failing_client: LLMClient) -> None:
+        with pytest.raises((DependencyUnavailable, DependencyTimeout)) as info:
+            failing_client.complete(self.conversation())
+
+        assert info.value.code in {"llm_unavailable", "llm_timeout"}
+        assert "capital of France" not in str(info.value)

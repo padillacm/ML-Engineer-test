@@ -6,7 +6,7 @@ into ``ServiceError`` subclasses with fixed messages; the failure contract of ea
 which ones.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 from app.domain.types import (
@@ -53,8 +53,9 @@ class NameRecognizer(Protocol):
 class Embedder(Protocol):
     """Turns text into embedding vectors; query and passage prefixes live inside the adapter.
 
-    Failures: ``DependencyUnavailable`` or ``DependencyTimeout`` when the model or the remote
-    service cannot answer.
+    Failures: ``ProcessingFailed`` (code ``embedding_failed``) when the model itself fails on the
+    input (an inference error, or a text over the model's limit); ``DependencyUnavailable`` or
+    ``DependencyTimeout`` when the model or the remote service cannot answer.
     """
 
     @property
@@ -84,8 +85,9 @@ class VectorStore(Protocol):
 
     Programming errors raise ``ValueError``/``RuntimeError``, not ``ServiceError``: ``upsert``
     raises ``ValueError`` when ``chunks`` and ``vectors`` differ in length or when two chunks
-    share a ``sequence`` (nothing is modified); ``search`` raises ``ValueError`` when
-    ``top_k < 1``; ``upsert`` and ``search`` raise ``RuntimeError`` when called before
+    share a ``sequence``, when ``page_texts`` lacks the page of a chunk or when ``content_hash``
+    is empty (nothing is modified); ``search`` raises ``ValueError`` when ``top_k < 1``;
+    ``upsert``, ``search`` and ``document_chunk_count`` raise ``RuntimeError`` when called before
     ``ensure_collection``.
     """
 
@@ -98,11 +100,23 @@ class VectorStore(Protocol):
         document_id: str,
         chunks: Sequence[Chunk],
         vectors: Sequence[Sequence[float]],
+        *,
+        page_texts: Mapping[int, str],
+        content_hash: str,
     ) -> None:
         """Store ``chunks`` with their ``vectors`` (parallel sequences) for ``document_id``.
 
-        All chunks previously stored under the same ``document_id`` are replaced; other
-        documents are untouched.
+        ``page_texts`` maps each chunk's page index to the cleaned text of that page; it is
+        stored with the chunk and returned as ``SearchHit.page_text``. ``content_hash``
+        identifies the source file's bytes and is stored with every chunk, and so is the chunk
+        total ``len(chunks)`` of this write.
+
+        Idempotent and safe against concurrent writers of the same document: chunks are
+        overwritten by id without deleting the document first, and only once all of them are
+        written are the document's other chunks (those beyond the new chunk count) removed; other
+        documents are untouched. If writing fails part-way, nothing is removed and the error is
+        raised: the document may then be incomplete (``document_chunk_count`` returns 0) or still
+        hold a complete copy written by another writer; storing it again completes it.
         """
         ...
 
@@ -115,6 +129,15 @@ class VectorStore(Protocol):
 
     def delete_document(self, document_id: str) -> None:
         """Remove every chunk of ``document_id``; unknown documents are ignored."""
+        ...
+
+    def document_chunk_count(self, document_id: str) -> int:
+        """Return the number of chunks of a completely stored ``document_id``.
+
+        Complete means every stored chunk of the document records the same chunk total and that
+        many chunks are stored. Returns 0 when the document is unknown or incomplete (for example
+        after an interrupted ``upsert``).
+        """
         ...
 
     def count(self) -> int:

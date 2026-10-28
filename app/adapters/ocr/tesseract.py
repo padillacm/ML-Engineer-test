@@ -135,19 +135,22 @@ def parse_tsv(tsv: str, raster: PageRaster, page: int) -> tuple[PageWord, ...]:
     converted with ``raster`` and clipped to the page, and words left without area are dropped.
     Each kept word gets the 0-based index of its ``(block_num, par_num, line_num)`` triple in
     order of first appearance among the kept words, so the lines of a page are numbered
-    consecutively from 0 in reading order.
+    consecutively from 0 in reading order; its paragraph index is that of its
+    ``(block_num, par_num)`` pair, numbered the same way.
     """
     lines = tsv.splitlines()
     if not lines or tuple(lines[0].split("\t")) != _HEADER:
         raise ProcessingFailed("tesseract output has no TSV header", "ocr_failed")
     line_indices: dict[tuple[int, int, int], int] = {}
+    paragraph_indices: dict[tuple[int, int], int] = {}
     words: list[PageWord] = []
     for number, line in enumerate(lines[1:], start=2):
         row = _parse_row(line, number, raster, page)
         if row is not None:
             text, box, key = row
-            index = line_indices.setdefault(key, len(line_indices))
-            words.append(PageWord(text, box, index))
+            line_index = line_indices.setdefault(key, len(line_indices))
+            paragraph_index = paragraph_indices.setdefault(key[:2], len(paragraph_indices))
+            words.append(PageWord(text, box, line_index, paragraph_index))
     return tuple(words)
 
 

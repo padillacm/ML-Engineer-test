@@ -67,16 +67,20 @@ class PageWord:
 
     ``line`` is the 0-based index of the text line the word belongs to on its page, as
     segmented by the recognition engine, with lines numbered in reading order. Words on the same
-    printed line share an index.
+    printed line share an index. ``paragraph`` is the 0-based index of the paragraph the word
+    belongs to on its page, numbered the same way; words of the same printed paragraph share it.
     """
 
     text: str
     box: Box
     line: int
+    paragraph: int
 
     def __post_init__(self) -> None:
         if self.line < 0:
             raise ValueError(f"line index must be >= 0, got {self.line}")
+        if self.paragraph < 0:
+            raise ValueError(f"paragraph index must be >= 0, got {self.paragraph}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,14 +195,58 @@ class OcrPage:
 
 @dataclass(frozen=True, slots=True)
 class SearchHit:
-    """A stored chunk returned by a similarity search; ``score`` is cosine similarity in 0..1."""
+    """A stored chunk returned by a similarity search; ``score`` is cosine similarity in 0..1.
+
+    ``page_text`` is the cleaned text of the whole page the chunk comes from (its parent page).
+    """
 
     document_id: str
     page: int
     sequence: int
     text: str
+    page_text: str
     score: float
 
     def __post_init__(self) -> None:
+        if self.page < 0:
+            raise ValueError(f"page index must be >= 0, got {self.page}")
+        if self.sequence < 0:
+            raise ValueError(f"sequence must be >= 0, got {self.sequence}")
         if not 0.0 <= self.score <= 1.0:
             raise ValueError(f"score must be within 0..1, got {self.score}")
+
+
+@dataclass(frozen=True, slots=True)
+class IngestResult:
+    """Outcome of ingesting one PDF.
+
+    ``chunks_stored`` is the number of chunks held for ``document_id`` after the call. When
+    ``already_indexed`` is true the file's content was found in the store and nothing was
+    recognised, embedded or written, so at least one chunk is stored for it.
+    """
+
+    document_id: str
+    chunks_stored: int
+    already_indexed: bool
+
+    def __post_init__(self) -> None:
+        if not self.document_id.strip():
+            raise ValueError("document_id must not be blank")
+        if self.chunks_stored < 0:
+            raise ValueError(f"chunks_stored must be >= 0, got {self.chunks_stored}")
+        if self.already_indexed and self.chunks_stored == 0:
+            raise ValueError("an already indexed document must have stored chunks")
+
+
+@dataclass(frozen=True, slots=True)
+class Answer:
+    """A grounded answer and the exact texts of the retrieved chunks it was given, best first."""
+
+    text: str
+    sources: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.text.strip():
+            raise ValueError("answer text must not be blank")
+        if not isinstance(self.sources, tuple):
+            raise ValueError("sources must be a tuple")

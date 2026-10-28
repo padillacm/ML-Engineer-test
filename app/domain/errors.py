@@ -21,6 +21,7 @@ KNOWN_CODES: frozenset[str] = frozenset(
         "unsupported_language",
         "ocr_failed",
         "ner_failed",
+        "embedding_failed",
         "llm_unavailable",
         "llm_timeout",
         "vector_store_unavailable",

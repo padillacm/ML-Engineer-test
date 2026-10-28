@@ -40,7 +40,13 @@ def ingest_and_answer(
 ) -> str:
     """A use-case-shaped function: index the chunks, retrieve context, ask the model."""
     store.ensure_collection(embedder.identity)
-    store.upsert(document_id, chunks, embedder.embed_passages([chunk.text for chunk in chunks]))
+    store.upsert(
+        document_id,
+        chunks,
+        embedder.embed_passages([chunk.text for chunk in chunks]),
+        page_texts={chunk.page: chunk.text for chunk in chunks},
+        content_hash=f"hash-{document_id}",
+    )
     hits = store.search(embedder.embed_query(question), top_k=2)
     context = "\n".join(hit.text for hit in hits)
     return llm.complete(
@@ -141,7 +147,7 @@ def test_identities_differing_in_any_field_are_unequal(change: dict[str, Any]) -
 
 
 def test_ocr_fake_returns_canned_pages_and_records_calls() -> None:
-    page = OcrPage(0, 595.0, 842.0, (PageWord("Hello", Box(0, 10, 10, 30, 12), 0),), None)
+    page = OcrPage(0, 595.0, 842.0, (PageWord("Hello", Box(0, 10, 10, 30, 12), 0, 0),), None)
     engine = FakeOcrEngine([page])
 
     assert engine.recognize(b"%PDF", language="en") == [dataclasses.replace(page, language="en")]
@@ -191,15 +197,23 @@ def test_vector_store_fake_requires_collection_first() -> None:
 def test_vector_store_fake_fail_next_raises_then_recovers_without_changes() -> None:
     store = FakeVectorStore()
     store.ensure_collection(EmbeddingIdentity("m", 2, "none", True, "cosine"))
-    store.fail_next(2, DependencyUnavailable("down", code="vector_store_unavailable"))
+    store.fail_next(3, DependencyUnavailable("down", code="vector_store_unavailable"))
 
     for _ in range(2):
         with pytest.raises(DependencyUnavailable):
-            store.upsert("doc", [Chunk("t", 0, 0, 0, 1)], [[1.0, 0.0]])
+            store.upsert(
+                "doc", [Chunk("t", 0, 0, 0, 1)], [[1.0, 0.0]], page_texts={0: "t"}, content_hash="h"
+            )
+    with pytest.raises(DependencyUnavailable):
+        store.document_chunk_count("doc")
 
     assert store.count() == 0
-    store.upsert("doc", [Chunk("t", 0, 0, 0, 1)], [[1.0, 0.0]])
+    store.upsert(
+        "doc", [Chunk("t", 0, 0, 0, 1)], [[1.0, 0.0]], page_texts={0: "t"}, content_hash="h"
+    )
     assert store.count() == 1
+    assert store.document_chunk_count("doc") == 1
+    assert store.content_hashes("doc") == {"h"}
 
 
 def test_llm_fake_uses_queue_then_default_and_records_messages() -> None:
@@ -234,5 +248,10 @@ def test_new_domain_types_validate_their_fields() -> None:
     with pytest.raises(ValueError, match="page width and height"):
         OcrPage(0, 0.0, 10.0, (), None)
     with pytest.raises(ValueError, match="score must be within"):
-        SearchHit("d", 0, 0, "t", 1.5)
-    assert SearchHit("d", 0, 0, "t", 0.0).score == 0.0
+        SearchHit("d", 0, 0, "t", "page t", 1.5)
+    with pytest.raises(ValueError, match="page index"):
+        SearchHit("d", -1, 0, "t", "page t", 0.5)
+    with pytest.raises(ValueError, match="sequence"):
+        SearchHit("d", 0, -1, "t", "page t", 0.5)
+    hit = SearchHit("d", 0, 0, "t", "page t", 0.0)
+    assert (hit.page_text, hit.score) == ("page t", 0.0)
