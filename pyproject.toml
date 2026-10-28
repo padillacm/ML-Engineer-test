@@ -25,6 +25,11 @@ dependencies = [
     # protobuf (transformers' SentencePieceExtractor reads the model proto).
     "sentencepiece>=0.2.1",
     "protobuf>=6",
+    # RAG (block 4). Embeddings: intfloat/multilingual-e5-base through transformers AutoModel
+    # (no new dependency). Vector store: Qdrant; qdrant-client requires grpcio unconditionally
+    # (the adapter uses the REST/HTTP path). LLM: one httpx client for OpenAI-compatible APIs.
+    "qdrant-client>=1.20,<2",
+    "httpx>=0.28,<1",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +68,9 @@ pythonpath = ["."]
 markers = [
     "tesseract: needs the Tesseract executable (skipped when it is not on PATH)",
     "ner_model: needs the local NER model (skipped when NER_MODEL_PATH is unset or the directory is missing)",
+    "embedding_model: needs the local embedding model (skipped when EMBEDDING_MODEL_PATH is unset or the directory is missing)",
+    "qdrant_server: needs a Qdrant server (skipped when QDRANT_URL is unset)",
+    "llm_server: needs an OpenAI-compatible LLM server (skipped when LLM_BASE_URL is unset)",
 ]
 # pytest resets the warning filters for every test, so the adapter's process-wide filter for
 # this one transformers message (see app/adapters/ner/recognizer.py) does not survive between
