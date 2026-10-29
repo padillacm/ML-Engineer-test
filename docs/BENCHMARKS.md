@@ -2180,7 +2180,7 @@ These are OCR noise rather than instructions. A flagged page's chunks are kept b
    - Combined, the false-positive rate is 0.39 % of corpus pages and 0.18 % of chunks, all on OCR noise, and 0 of the 750 sample questions are flagged.
    - `INJECTION_THRESHOLD=0.5` is kept.
 5. **The model costs a lot of ingestion throughput on CPU.** Sequential ingestion falls by 38 % (+1.36 s per page) and ingestion with 12 clients by 59 %, where the detector's pool of 2 is the bottleneck. A question costs about 130 ms. The patterns cost about 2 ms per page.
-6. **The detector moves to the GPU in a follow-up change.** The user decided this because of the ingestion cost on CPU. This section (22.4 and 22.5, on `docintel-test:hard2`) is the CPU baseline that change will be compared against: the same 60-document sample, the same six cells and the same suite and benign sets.
+6. **The detector moves to the GPU in a follow-up change** (done in `add-gpu-inference`, section 23). The user decided this because of the ingestion cost on CPU. This section (22.4 and 22.5, on `docintel-test:hard2`) is the CPU baseline that change will be compared against: the same 60-document sample, the same six cells and the same suite and benign sets.
 7. **The chunk cap changed 83 of 659 contexts** and raised model refusals on them. Its accuracy effect is within the noise. It is kept for D9's security argument, not for quality.
 
 **Caveats.**
@@ -2343,7 +2343,7 @@ Everything on, i.e. the image's defaults: detector model and patterns. Stage tim
 
 - Every request of every cell returned 200.
 - The CPU image reproduces section 22.5: 9.7 against 9.85 docs/min sequential, 35.3 against 36.4 with 12 clients, and 15.6 / 85.8 against 15.78 / 87.8 with the detector off.
-- **Per page, the GPU is 10x faster for NER** (563 -> 54 ms), **16x for screening** (1,541 -> 94 ms) and **34x for embedding** (551 -> 16 ms) sequentially. With 12 jobs the gaps widen to 9x, 107x and 49x: on the CPU these stages also wait for pool slots.
+- **Per page, the GPU is 10x faster for NER** (563 -> 54 ms in fp16; 102 ms, 5.5x, in the fp32 now used, 23.11), **16x for screening** (1,541 -> 94 ms) and **34x for embedding** (551 -> 16 ms) sequentially. With 12 jobs the gaps widen to 9x, 107x and 49x: on the CPU these stages also wait for pool slots.
 - **OCR is now the whole cost.** It is unchanged at about 1.62 s per page sequentially and 2.5-2.7 s with 12 jobs (CPU contention between 12 Tesseract jobs). On the GPU image OCR is 94 % of a document's ingestion time sequentially (mean 1,795 of 1,914 ms per page), against 48 % on the CPU image.
 - **The GPU is mostly idle.** Its mean utilisation was 7-16 % in every GPU cell (maximum 44-100 % in bursts).
 - Store stays at 4-7 ms per document.
