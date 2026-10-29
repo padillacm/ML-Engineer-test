@@ -35,6 +35,7 @@ EXPECTED_STATUS = {
     "ocr_failed": 500,
     "ner_failed": 500,
     "embedding_failed": 500,
+    "detector_failed": 500,
     "llm_unavailable": 503,
     "llm_timeout": 504,
     "vector_store_unavailable": 503,

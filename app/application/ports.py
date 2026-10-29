@@ -158,6 +158,33 @@ class VectorStore(Protocol):
 
 
 @runtime_checkable
+class InjectionDetector(Protocol):
+    """Scores texts for being an instruction aimed at a language model (prompt injection).
+
+    ``screen`` returns one score in 0..1 per text, in order; a text longer than the model's
+    window is scored by its windows, keeping the highest. A service without a detector model
+    uses ``NoDetector`` (every score 0). ``screen_query`` scores a question the same way, ahead
+    of waiting page screenings, as ``Embedder.embed_query`` does for the embedder.
+
+    Failures: ``ProcessingFailed`` (code ``detector_failed``) when the model cannot score.
+    """
+
+    @property
+    def configured(self) -> bool:
+        """Whether a model backs the scores (``False`` for the stand-in that scores 0)."""
+        ...
+
+    def screen(self, texts: Sequence[str]) -> list[float]:
+        """Return the injection score of each text, in the order given."""
+        ...
+
+    def screen_query(self, text: str) -> float:
+        """Return the injection score of one question; scored as by ``screen``, but a question
+        does not wait behind page screenings for a free slot of the model."""
+        ...
+
+
+@runtime_checkable
 class LLMClient(Protocol):
     """Completes a chat conversation with a language model.
 

@@ -10,18 +10,21 @@ from typing import Any
 
 import numpy as np
 import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 import pytest
 
 from app.adapters.ocr import TesseractOcrConfig, TesseractOcrEngine
+from app.adapters.ocr.engine import recognised_length
 from app.adapters.ocr.preprocess import flatten_illumination
 from app.adapters.ocr.rendering import open_pdf, render_pages
 from app.adapters.ocr.tesseract import TesseractCli
+from app.application.ingest_document import _raw_page_text
 from app.application.ports import OcrEngine
 from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from app.domain.errors import ConfigurationError, InvalidInput, ProcessingFailed
-from app.domain.types import Box, OcrPage
+from app.domain.types import Box, OcrPage, PageWord
 from tests.adapters.ocr.conftest import RenderSpy
-from tests.adapters.ocr.fake_runner import FakeTesseract, decode
+from tests.adapters.ocr.fake_runner import FakeTesseract, decode, tsv
 from tests.adapters.ocr.pdfs import (
     A4,
     PageSpec,
@@ -285,21 +288,21 @@ class TestFailures:
         inside = 0
         overlaps: list[int] = []
         guard = threading.Lock()
-        real_render = pdfium.PdfPage.render
+        real_start = pdfium_c.FPDF_RenderPageBitmap_Start
 
-        def render(page: pdfium.PdfPage, *args: Any, **kwargs: Any) -> Any:
+        def start(*args: Any) -> Any:
             nonlocal inside
             with guard:
                 inside += 1
                 overlaps.append(inside)
             try:
                 time.sleep(0.002)
-                return real_render(page, *args, **kwargs)
+                return real_start(*args)
             finally:
                 with guard:
                     inside -= 1
 
-        monkeypatch.setattr(pdfium.PdfPage, "render", render)
+        monkeypatch.setattr(pdfium_c, "FPDF_RenderPageBitmap_Start", start)
         counts = (3, 4, 5, 6)
         documents = {
             count: build_pdf(
@@ -430,6 +433,95 @@ class TestPageLimit:
         assert caught.value.message == ("the PDF has more than 50 pages; at most 50 are accepted")
         assert rendered_pages.indexes == []
         assert runner.calls == []
+
+
+class TestPageText:
+    """The cap on one page's recognised text (``max_page_chars``)."""
+
+    # With the fake runner every word of a page sits on one line of one paragraph, so the
+    # recognised text is the tag word ``eng:<width>`` and the words of the text, space-joined.
+    @staticmethod
+    def _text_of_length(width: int, length: int) -> str:
+        tag = f"eng:{width}"
+        assert length > len(tag) + 1
+        return "x" * (length - len(tag) - 1)
+
+    def test_a_page_one_character_over_the_limit_fails_the_document_as_too_large(
+        self, rendered_pages: RenderSpy
+    ) -> None:
+        limit = 40
+        runner = FakeTesseract(page_text={210: self._text_of_length(210, limit + 1)})
+
+        with pytest.raises(InvalidInput) as caught:
+            _engine(runner, max_page_chars=limit, workers=1).recognize(_pages(2), "en")
+
+        assert caught.value.code == "too_large"
+        assert caught.value.message == "page 1 has more text than the limit of 40 characters"
+        assert rendered_pages.indexes == [0, 1]
+
+    def test_a_page_at_the_limit_is_accepted(self) -> None:
+        limit = 40
+        runner = FakeTesseract(page_text={200: self._text_of_length(200, limit)})
+
+        pages = _engine(runner, max_page_chars=limit).recognize(_pages(1), "en")
+
+        assert recognised_length(pages[0].words) == limit
+
+    def test_the_cap_applies_while_the_language_is_detected(self) -> None:
+        runner = FakeTesseract(lambda languages: "words " * 20)
+
+        with pytest.raises(InvalidInput) as caught:
+            _engine(runner, max_page_chars=50).recognize(_pages(3))
+
+        assert caught.value.code == "too_large"
+        assert caught.value.message == "page 0 has more text than the limit of 50 characters"
+        assert runner.calls == [COMBINED]
+
+    def test_recognised_length_is_the_length_of_the_text_ingestion_assembles(self) -> None:
+        def word(text: str, line: int, paragraph: int) -> PageWord:
+            return PageWord(text, Box(0, 1.0, 1.0, 2.0, 2.0), line, paragraph)
+
+        words = (
+            word("Dear", 0, 0),
+            word("Maria,", 0, 0),
+            word(" ", 0, 0),
+            word("thanks", 1, 0),
+            word("Regards", 2, 1),
+            word("\t", 2, 1),
+            word("John", 3, 1),
+            word("Carter", 3, 1),
+        )
+        page = OcrPage(0, 100.0, 100.0, words, "en")
+
+        assert _raw_page_text(page) == "Dear Maria,\nthanks\n\nRegards\nJohn Carter"
+        assert recognised_length(words) == len(_raw_page_text(page))
+        assert recognised_length(()) == 0
+        assert recognised_length(words[:1]) == 4
+
+    @pytest.mark.parametrize(
+        ("second_block", "length"), [(1, 3), (2, 4)], ids=["same-paragraph", "new-paragraph"]
+    )
+    def test_the_count_follows_the_paragraphs_tesseract_reports(
+        self, second_block: int, length: int
+    ) -> None:
+        # Two one-letter words; the second in block 1 (same line: "a b") or in block 2 (a new
+        # paragraph: "a\n\nb").
+        tsv_text = tsv([("a", (0, 0, 8, 8)), ("b", (0, 0, 8, 8))]).replace(
+            "5\t1\t1\t1\t1\t2", f"5\t1\t{second_block}\t1\t1\t2"
+        )
+
+        def runner(png: bytes, languages: str, *, cancel: Cancellation = NEVER_CANCELLED) -> str:
+            return tsv_text
+
+        engine = TesseractOcrEngine(dataclasses.replace(FAST, max_page_chars=length), runner)
+        (page,) = engine.recognize(_pages(1), "en")
+        assert recognised_length(page.words) == length
+
+        tight = TesseractOcrEngine(dataclasses.replace(FAST, max_page_chars=length - 1), runner)
+        with pytest.raises(InvalidInput) as caught:
+            tight.recognize(_pages(1), "en")
+
+        assert caught.value.code == "too_large"
 
 
 class TestLanguage:

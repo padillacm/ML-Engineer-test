@@ -1,15 +1,18 @@
 """Use case: turn an uploaded PDF into stored, retrievable chunks identified by its content."""
 
+import dataclasses
 import hashlib
 import logging
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
-from app.application.ports import Embedder, OcrEngine, VectorStore
+from app.application.no_detector import NoDetector
+from app.application.ports import Embedder, InjectionDetector, OcrEngine, VectorStore
 from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from app.domain.chunking import ChunkingConfig, chunk_page, clean_page_text
 from app.domain.errors import ConfigurationError, ProcessingFailed
+from app.domain.guardrails import DEFAULT_INJECTION_THRESHOLD, validate_threshold
 from app.domain.types import Chunk, IngestResult, OcrPage
 
 DOCUMENT_NAMESPACE = uuid.UUID("6f1c3a52-2d4e-5b8a-9c71-0e4d2b9f8a13")
@@ -43,17 +46,31 @@ class IngestDocument:
     line between recognised paragraphs, and cleaned with ``clean_page_text`` (so words
     hyphenated across a line break are joined and paragraphs stay separated). That cleaned
     text is both what the chunk offsets refer to and the page text stored with the chunks.
-    Every vector is computed before anything is written, so a failing embedder leaves the store
-    untouched. Port errors propagate unchanged.
+
+    Right after chunking, and before anything is embedded, every page's cleaned text is scored
+    by the injection detector (pages in order, in batches of ``batch_size``, like the embedder);
+    every chunk of a page scoring at or above ``injection_threshold`` is stored ``flagged``. The
+    page is the unit because it is what a question's context holds: the context is the full
+    parent page of each retrieved chunk, so flagging only the chunk that carries an instruction
+    would still let the instruction in through a neighbouring chunk of the same page. Scoring
+    the page (one or two detector windows) also costs a third of scoring its chunks one by one.
+    Flagged chunks are embedded and stored like the others, so the document stays complete
+    (its chunk total, the already-indexed check and the repair of an interrupted write all
+    count them) while the store never returns them from a search; ``IngestResult.chunks_flagged``
+    reports how many this call flagged. Screening comes first so that a detector failure
+    (``ProcessingFailed``, code ``detector_failed``) stores nothing, as a failing embedder does:
+    every score and every vector is computed before anything is written. Port errors propagate
+    unchanged.
 
     A successful call logs one ``OUTCOME_MESSAGE`` line: ``size_bytes``, ``document_id``,
-    ``already_indexed``, ``chunks_stored`` and ``duration_ms``, plus ``pages`` and ``ocr_ms``
-    when OCR ran and ``embed_ms`` and ``store_ms`` when chunks were embedded and stored. No
-    text of the document is logged.
+    ``already_indexed``, ``chunks_stored``, ``chunks_flagged`` and ``duration_ms``, plus
+    ``pages`` and ``ocr_ms`` when OCR ran and ``screen_ms``, ``embed_ms`` and ``store_ms`` when
+    chunks were screened, embedded and stored. No text of the document is logged, and no
+    per-chunk score: only the count of flagged chunks.
 
     ``cancel`` is passed to the OCR engine and checked again before the OCR results are
-    processed, before each embedding batch and just before storing; once storing has begun
-    it runs to the end, so a cancelled ingest never leaves a partly stored document. A
+    processed, before each screening and embedding batch and just before storing; once storing
+    has begun it runs to the end, so a cancelled ingest never leaves a partly stored document. A
     cancelled call raises ``ProcessingFailed`` (code ``request_cancelled``) and logs one
     ``CANCELLED_MESSAGE`` line instead of the outcome line (``code``, ``size_bytes``,
     ``document_id``, ``duration_ms``).
@@ -66,6 +83,9 @@ class IngestDocument:
         store: VectorStore,
         chunking: ChunkingConfig | None = None,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        *,
+        detector: InjectionDetector | None = None,
+        injection_threshold: float = DEFAULT_INJECTION_THRESHOLD,
     ) -> None:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ConfigurationError(f"batch_size must be an integer >= 1, got {batch_size!r}")
@@ -74,6 +94,8 @@ class IngestDocument:
         self._store = store
         self._chunking = chunking if chunking is not None else ChunkingConfig()
         self._batch_size = batch_size
+        self._detector: InjectionDetector = detector if detector is not None else NoDetector()
+        self._injection_threshold = validate_threshold("injection_threshold", injection_threshold)
 
     def __call__(self, pdf: bytes, *, cancel: Cancellation = NEVER_CANCELLED) -> IngestResult:
         started = time.perf_counter()
@@ -98,6 +120,7 @@ class IngestDocument:
                 "document_id": result.document_id,
                 "already_indexed": result.already_indexed,
                 "chunks_stored": result.chunks_stored,
+                "chunks_flagged": result.chunks_flagged,
                 **timings,
                 "duration_ms": _elapsed_ms(started, time.perf_counter()),
             },
@@ -112,7 +135,7 @@ class IngestDocument:
         timings: dict[str, int | float],
         cancel: Cancellation,
     ) -> IngestResult:
-        """Recognise, chunk, embed and store ``pdf``; record page count and stage timings."""
+        """Recognise, chunk, screen, embed and store ``pdf``; record page count and timings."""
         begin = time.perf_counter()
         pages = self._ocr.recognize(pdf, cancel=cancel)
         timings["pages"] = len(pages)
@@ -125,6 +148,9 @@ class IngestDocument:
         if not chunks:
             return IngestResult(document_id, 0, already_indexed=False)
 
+        begin = time.perf_counter()
+        chunks = self._screen(page_texts, chunks, cancel)
+        timings["screen_ms"] = _elapsed_ms(begin, time.perf_counter())
         begin = time.perf_counter()
         vectors = self._embed([chunk.text for chunk in chunks], cancel)
         timings["embed_ms"] = _elapsed_ms(begin, time.perf_counter())
@@ -140,7 +166,34 @@ class IngestDocument:
             content_hash=content_hash,
         )
         timings["store_ms"] = _elapsed_ms(begin, time.perf_counter())
-        return IngestResult(document_id, len(chunks), already_indexed=False)
+        flagged = sum(1 for chunk in chunks if chunk.flagged)
+        return IngestResult(document_id, len(chunks), already_indexed=False, chunks_flagged=flagged)
+
+    def _screen(
+        self, page_texts: Mapping[int, str], chunks: Sequence[Chunk], cancel: Cancellation
+    ) -> list[Chunk]:
+        """``chunks`` with ``flagged`` set on every chunk of a page the detector scores at or
+        above the threshold.
+
+        Pages are scored in order, in batches of ``batch_size``, so a long document never holds
+        every score at once; the scores themselves are not kept. Pages without chunks (blank
+        text) are not scored.
+        """
+        pages = sorted({chunk.page for chunk in chunks})
+        flagged_pages: set[int] = set()
+        for start in range(0, len(pages), self._batch_size):
+            cancel.raise_if_cancelled()
+            batch = pages[start : start + self._batch_size]
+            scores = self._detector.screen([page_texts[page] for page in batch])
+            flagged_pages.update(
+                page
+                for page, score in zip(batch, scores, strict=True)
+                if score >= self._injection_threshold
+            )
+        return [
+            dataclasses.replace(chunk, flagged=True) if chunk.page in flagged_pages else chunk
+            for chunk in chunks
+        ]
 
     def _embed(self, texts: Sequence[str], cancel: Cancellation) -> list[list[float]]:
         vectors: list[list[float]] = []

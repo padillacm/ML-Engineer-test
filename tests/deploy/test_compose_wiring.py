@@ -26,12 +26,15 @@ ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ROOT / "docker-compose.yml"
 
 # Settings compose does not pass from .env: the image sets the model paths and revision and the
-# pdf.js directory (a host path for a run outside compose would not exist in the container), the
-# store target and the key files are fixed below, and the keys arrive only as secret files.
+# pdf.js directory (a host path for a run outside compose would not exist in the container; the
+# detector's path only in an image built with the model, so the opt-out image runs with detection
+# off), the store target and the key files are fixed below, and the keys arrive only as secret
+# files.
 NOT_PASSED = {
     "ner_model_path",
     "embedding_model_path",
     "embedding_model_revision",
+    "injection_model_path",
     "pdfjs_dir",
     "qdrant_location",
     "llm_api_key",

@@ -1,0 +1,33 @@
+# The torch variant of an image built by the other compose files: not a stack of its own (never
+# pass it with -f). docker-compose.yml's `app` and docker-compose.test.yml's `tests` extend one of
+# these services, chosen by interpolating the service name:
+#   app:   torch-${TORCH_VARIANT:-${COMPOSE_PROFILES:+cuda}}   (the `gpu` profile means cuda)
+#   tests: torch-${TORCH_VARIANT:-cpu}
+# Compose interpolates `extends` before it merges, so the variant decides both the build argument
+# and the GPU reservation in one place: the CPU variant has no reservation (the stack starts on a
+# host without a GPU or NVIDIA runtime), the CUDA variant reserves the GPU like Ollama does. Only
+# the extended service is read from this file; a TORCH_VARIANT other than cpu or cuda names no
+# service here and compose stops with `service "torch-<value>" not found`.
+# What the extending service declares itself (hardening, limits, other build arguments) is
+# merged with this, not replaced (tests/deploy/test_torch_variant.py).
+
+x-torch-cpu: &torch-cpu
+  build:
+    args:
+      TORCH_VARIANT: cpu
+
+services:
+  # Neither TORCH_VARIANT nor COMPOSE_PROFILES set: the default, the CPU build.
+  torch-: *torch-cpu
+  torch-cpu: *torch-cpu
+  torch-cuda:
+    build:
+      args:
+        TORCH_VARIANT: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

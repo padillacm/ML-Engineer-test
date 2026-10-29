@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.adapters.device import is_device_name
 from app.domain.errors import ConfigurationError
 
 AGGREGATIONS: frozenset[str] = frozenset({"simple", "first", "average", "max"})
@@ -41,6 +42,8 @@ class TransformersNerConfig:
     one. Each running call uses ``threads`` intra-op threads, so up to ``pool_size`` x ``threads``
     CPUs are busy. The default 8 is the measured best end to end with 2 threads, mostly for
     long documents (BENCHMARKS 14 and 15).
+    ``device`` is where the model runs, ``"cpu"`` or ``"cuda[:<index>]"`` (in half precision
+    there, ``app.adapters.device``); the service resolves the ``DEVICE`` setting into it.
     Invalid values raise ``ConfigurationError``.
     """
 
@@ -52,6 +55,7 @@ class TransformersNerConfig:
     batch_size: int = 8
     max_chars: int = 50_000
     pool_size: int = 8
+    device: str = "cpu"
 
     def __post_init__(self) -> None:
         _require(
@@ -69,6 +73,7 @@ class TransformersNerConfig:
         _require(_is_positive_int(self.batch_size), "batch_size must be a positive integer")
         _require(_is_positive_int(self.max_chars), "max_chars must be a positive integer")
         _require(_is_positive_int(self.pool_size), "pool_size must be a positive integer")
+        _require(is_device_name(self.device), "device must be 'cpu', 'cuda' or 'cuda:<index>'")
         _validate_model_directory(self.path)
         max_length = _declared_max_length(self.path)
         _require(

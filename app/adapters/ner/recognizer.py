@@ -1,4 +1,4 @@
-"""``NameRecognizer`` backed by a local ``transformers`` token-classification model on CPU.
+"""``NameRecognizer`` backed by a local ``transformers`` token-classification model.
 
 The model is loaded once, when the recogniser is created, from ``TransformersNerConfig.path``
 with ``local_files_only=True``: nothing is fetched from the network, and a missing or unusable
@@ -23,6 +23,17 @@ included) then uses that many intra-op threads; the last torch adapter created w
 service gives both the same value (``TORCH_THREADS``). A failed creation leaves the thread count
 unchanged. ``pool_size`` concurrent calls use up to ``pool_size`` x ``threads``.
 
+Device: the model runs on ``config.device``. On a GPU its weights are moved there once, in
+float32 (``app.adapters.device.place`` with ``half=False``: in half precision its spans differed
+from the CPU's at name boundaries on 6 of 1,030 corpus pages, design D2), and every pipeline of
+the pool is built on that device over the same weights, so the pool holds one copy of them in
+VRAM; the pipeline moves each window's tokens to the device and brings the logits back to the
+CPU, in float32, before its aggregation (transformers 5 takes a given model's dtype as it is, so
+the dtype is set on the model, not passed to the pipeline). Tokenising and grouping stay on the
+CPU, as do the threads above. On the CPU the model is used as loaded, as before. A CUDA out-of-
+memory error during a call fails it with ``ner_failed`` after the cached GPU memory is released,
+and the next call runs normally.
+
 Input size: a text longer than ``config.max_chars`` is refused before the model runs (inference
 time grows linearly with the text and holds a pipeline; see ``TransformersNerConfig``).
 """
@@ -34,6 +45,7 @@ from typing import Any, TypeGuard
 
 import torch
 
+from app.adapters.device import place, release_after_failure
 from app.adapters.ner.config import TransformersNerConfig
 from app.adapters.slots import FifoSlots
 from app.domain.errors import ConfigurationError, ProcessingFailed, ServiceError
@@ -105,6 +117,7 @@ class TransformersNameRecognizer:
         except ServiceError:
             raise
         except Exception as error:  # every vendor failure becomes one fixed error
+            release_after_failure(error)
             raise ProcessingFailed("NER model could not process the text", "ner_failed") from error
         finally:
             self._release(classify)
@@ -176,6 +189,7 @@ def load_pipelines(config: TransformersNerConfig) -> list[TokenClassifier]:
             f"NER model weights do not match its configuration ({problems}): {path}"
         )
     model.eval()
+    place(model, config.device, half=False)  # fp16 moved name boundaries (BENCHMARKS 23)
     groups = {_entity_group(str(tag)) for tag in model.config.id2label.values()}
     missing = sorted(set(config.labels) - groups)
     if missing:
@@ -200,7 +214,7 @@ def load_pipelines(config: TransformersNerConfig) -> list[TokenClassifier]:
             tokenizer=tokenizer,
             aggregation_strategy=config.aggregation,
             stride=config.stride,
-            device="cpu",
+            device=config.device,
         )
         _serialise_tokenizer_steps(classifier, tokenizer_lock)
         classifiers.append(_batched(classifier, config.batch_size))

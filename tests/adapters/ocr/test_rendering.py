@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pymupdf
 import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 import pytest
 
 from app.adapters.ocr.rendering import (
@@ -25,9 +26,11 @@ from tests.adapters.ocr.pdfs import (
     SMALL,
     PageSpec,
     build_pdf,
+    cropped_pdf,
     declare_page_count,
     encrypted_pdf,
     image_only_pdf,
+    inherited_boxes_pdf,
     page_tree_pdf,
 )
 from tests.architecture.scan import collect_imports
@@ -449,28 +452,12 @@ def test_checking_the_pages_does_not_parse_their_content() -> None:
     assert opening * 10 < page_load
 
 
-def _rotated_page_tree(rotation: int) -> bytes:
-    """One page inheriting its MediaBox, CropBox and /Rotate from the page tree."""
-    return page_tree_pdf(
-        [b"<< /Type /Page /Parent 2 0 R >>"],
-        tree_entries=b"/MediaBox [0 0 595 842] /CropBox [50 40 350 540] /Rotate %d" % rotation,
-    )
-
-
-def _cropped(rotation: int) -> bytes:
-    with pymupdf.open(stream=build_pdf([PageSpec(size=A4)]), filetype="pdf") as document:
-        document[0].set_cropbox(pymupdf.Rect(10, 20, 310, 420))
-        document[0].set_rotation(rotation)
-        data: bytes = document.tobytes()
-        return data
-
-
 @pytest.mark.parametrize(
     "pdf",
     [
         *(build_pdf([PageSpec(size=A4, rotation=rotation)]) for rotation in (0, 90, 180, 270)),
-        *(_cropped(rotation) for rotation in (0, 90, 180, 270)),
-        *(_rotated_page_tree(rotation) for rotation in (0, 90, 180, 270, -90, 450)),
+        *(cropped_pdf(rotation) for rotation in (0, 90, 180, 270)),
+        *(inherited_boxes_pdf(rotation) for rotation in (0, 90, 180, 270, -90, 450)),
     ],
     ids=[
         *(f"rotate-{rotation}" for rotation in (0, 90, 180, 270)),
@@ -524,7 +511,7 @@ def test_oversized_page_is_rejected_before_any_page_is_rendered(
     def no_rendering(*args: object, **kwargs: object) -> None:
         raise AssertionError("rendered before the budget check")
 
-    monkeypatch.setattr(pdfium.PdfPage, "render", no_rendering)
+    monkeypatch.setattr(pdfium_c, "FPDF_RenderPageBitmap_Start", no_rendering)
 
     with pytest.raises(InvalidInput) as caught, open_pdf(pdf) as document:
         next(render_pages(document, 200, 40_000_000))
@@ -545,7 +532,7 @@ def test_render_failure_is_reported_as_unreadable(monkeypatch: pytest.MonkeyPatc
     def broken(*args: object, **kwargs: object) -> None:
         raise pdfium.PdfiumError("content stream is damaged")
 
-    monkeypatch.setattr(pdfium.PdfPage, "render", broken)
+    monkeypatch.setattr(pdfium_c, "FPDF_RenderPageBitmap_Start", broken)
 
     with pytest.raises(InvalidInput) as caught:
         _render(build_pdf([PageSpec()]), 72)

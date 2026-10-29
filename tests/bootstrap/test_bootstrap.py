@@ -672,7 +672,7 @@ def test_an_invalid_resolved_size_names_its_variable(
     )
 
     with pytest.raises(ConfigurationError) as caught:
-        adapter_configs(bootstrap_settings(models), dataclasses.replace(valid, **{field: 0}))
+        adapter_configs(bootstrap_settings(models), dataclasses.replace(valid, **{field: 0}))  # type: ignore[arg-type]
 
     assert caught.value.message.startswith(f"{variable}: ")
 
@@ -696,7 +696,9 @@ def test_building_logs_the_concurrency_in_use_once(
         "max_concurrent_jobs": 10,
         "ner_pool_size": 4,
         "embedding_pool_size": 2,
+        "injection_pool_size": 2,
         "ocr_workers": 4,
+        "device": "cpu",
     }
     assert _warnings(caplog) == []
 

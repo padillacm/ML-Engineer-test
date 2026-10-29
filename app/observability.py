@@ -58,15 +58,20 @@ ALLOWED_FIELDS: frozenset[str] = frozenset(
         "size_bytes",
         "document_id",
         "chunks_stored",
+        "chunks_flagged",
         "already_indexed",
         "hits",
         "hits_kept",
         "top_score",
         "refused",
+        "injection_score",
+        "support_share",
+        "filter_reason",
         "refusal_reason",
         "llm_ms",
         "ocr_ms",
         "ner_ms",
+        "screen_ms",
         "embed_ms",
         "store_ms",
         "search_ms",
@@ -79,7 +84,11 @@ ALLOWED_FIELDS: frozenset[str] = frozenset(
         "max_concurrent_jobs",
         "ner_pool_size",
         "embedding_pool_size",
+        "injection_pool_size",
         "ocr_workers",
+        "device",
+        "gpu_name",
+        "gpu_memory_mib",
         "model",
         "max_tokens",
     }
@@ -89,7 +98,8 @@ ALLOWED_FIELDS: frozenset[str] = frozenset(
 Each holds a count, size, duration (``*_ms``), status, code, id, score, boolean or a short
 fixed enum (``category``, ``refusal_reason``, ``check``): the access line (``app.access``), the
 error lines, the one outcome line each use case writes (``app.application.*``), the
-start-up concurrency line and CPU warnings (``app.bootstrap``) and the language model client's
+start-up concurrency line with its device (``device``, ``gpu_name``: the GPU's model name,
+``gpu_memory_mib``) and CPU warnings (``app.bootstrap``) and the language model client's
 warning for a reply cut at its token limit (``model``, the configured model name, and
 ``max_tokens``, the configured limit).
 """

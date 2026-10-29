@@ -17,10 +17,12 @@ from qdrant_client import QdrantClient, models
 from app.adapters.vector_store import QdrantStoreConfig, QdrantVectorStore
 from app.adapters.vector_store.qdrant_store import (
     CHUNK_ID_NAMESPACE,
+    FLAGGED_FIELD,
     IDENTITY_METADATA_KEY,
     canonical_identity,
     chunk_id,
     collection_name,
+    unflagged_filter,
 )
 from app.domain.errors import DependencyTimeout, DependencyUnavailable, IncompatibleEmbedding
 from app.domain.types import Chunk, EmbeddingIdentity
@@ -446,6 +448,106 @@ def test_points_are_stored_under_their_chunk_ids_with_the_full_payload() -> None
     )
 
 
+# --- flagged chunks (D6) ---------------------------------------------------------------------
+
+
+def _ids(points: list[models.Record] | list[models.ScoredPoint]) -> set[str]:
+    return {str(point.id) for point in points}
+
+
+def test_flagged_is_written_only_on_flagged_chunks() -> None:
+    store, flaky = ready_store()
+    chunks = [Chunk("clean", 0, 0, 0, 5), Chunk("injected", 0, 1, 6, 14, flagged=True)]
+    upsert(store, "doc", chunks, [one_hot(8, 0), one_hot(8, 1)])
+    assert store.collection is not None
+
+    points = flaky.inner.retrieve(
+        store.collection, [chunk_id("doc", 0), chunk_id("doc", 1)], with_payload=True
+    )
+
+    payloads = {str(point.id): point.payload or {} for point in points}
+    assert FLAGGED_FIELD not in payloads[chunk_id("doc", 0)]
+    assert payloads[chunk_id("doc", 1)][FLAGGED_FIELD] is True
+
+
+def test_the_search_filter_excludes_only_points_flagged_true() -> None:
+    assert unflagged_filter() == models.Filter(
+        must_not=[models.FieldCondition(key="flagged", match=models.MatchValue(value=True))]
+    )
+
+
+def _write_raw_point(
+    client: QdrantClient,
+    collection: str,
+    document_id: str,
+    sequence: int,
+    payload: dict[str, Any],
+    vector: list[float],
+) -> None:
+    client.upsert(
+        collection,
+        points=[
+            models.PointStruct(
+                id=chunk_id(document_id, sequence),
+                vector=vector,
+                payload={
+                    "document_id": document_id,
+                    "page": 0,
+                    "sequence": sequence,
+                    "text": f"chunk {sequence}",
+                    "page_text": "page",
+                    "start": 0,
+                    "end": 7,
+                    "content_hash": "h",
+                    "chunk_total": 3,
+                    **payload,
+                },
+            )
+        ],
+        wait=True,
+    )
+
+
+def test_points_written_before_the_flagged_field_existed_are_all_searchable() -> None:
+    store, flaky = ready_store()
+    assert store.collection is not None
+    for sequence in range(3):  # the payload shape of points stored before this change
+        _write_raw_point(flaky.inner, store.collection, "old", sequence, {}, one_hot(8, sequence))
+
+    hits = store.search(one_hot(8, 1), top_k=10)
+
+    assert [hit.sequence for hit in hits] == [1, 0, 2] or {hit.sequence for hit in hits} == {
+        0,
+        1,
+        2,
+    }
+    assert hits[0].sequence == 1
+    assert store.document_chunk_count("old") == 3
+
+
+def test_a_point_flagged_false_explicitly_is_searchable_and_flagged_true_is_not() -> None:
+    store, flaky = ready_store()
+    assert store.collection is not None
+    _write_raw_point(flaky.inner, store.collection, "doc", 0, {"flagged": False}, one_hot(8, 0))
+    _write_raw_point(flaky.inner, store.collection, "doc", 1, {"flagged": True}, one_hot(8, 1))
+    _write_raw_point(flaky.inner, store.collection, "doc", 2, {}, one_hot(8, 2))
+
+    assert [hit.sequence for hit in store.search(one_hot(8, 0), top_k=1)] == [0]
+    assert [hit.sequence for hit in store.search(one_hot(8, 1), top_k=1)] != [1]
+    assert {hit.sequence for hit in store.search(one_hot(8, 1), top_k=10)} == {0, 2}
+    assert store.document_chunk_count("doc") == 3
+
+
+def test_a_flagged_chunk_is_excluded_whatever_its_score() -> None:
+    store, _ = ready_store()
+    chunks = [Chunk("injected", 0, 0, 0, 8, flagged=True), Chunk("other", 0, 1, 9, 14)]
+    upsert(store, "doc", chunks, [one_hot(8, 0), one_hot(8, 5)])
+
+    hits = store.search(one_hot(8, 0), top_k=5)  # identical to the flagged vector
+
+    assert [(hit.sequence, hit.score) for hit in hits] == [(1, 0.0)]
+
+
 def test_upserting_no_chunks_removes_the_document() -> None:
     store, _ = ready_store()
     upsert(store, "doc", make_chunks("a", "b"), [one_hot(8, 0), one_hot(8, 1)])
@@ -829,6 +931,53 @@ def test_the_server_collection_has_a_keyword_index_on_document_id(
 
 
 @pytest.mark.qdrant_server
+def test_the_server_collection_has_a_bool_index_on_flagged(
+    server_store: QdrantVectorStore,
+) -> None:
+    server_store.ensure_collection(IDENTITY)
+    server_store.ensure_collection(IDENTITY)  # creating the existing index again is a no-op
+    assert server_store.collection is not None
+
+    client = QdrantClient(url=os.environ["QDRANT_URL"])
+    info = client.get_collection(server_store.collection)
+    client.close()
+
+    assert info.payload_schema[FLAGGED_FIELD].data_type == models.PayloadSchemaType.BOOL
+    assert info.payload_schema["document_id"].data_type == models.PayloadSchemaType.KEYWORD
+
+
+@pytest.mark.qdrant_server
+def test_a_server_collection_without_the_flagged_index_gains_it_on_first_use(
+    server_store: QdrantVectorStore,
+) -> None:
+    # A collection created by the previous version: identity metadata and the document_id
+    # index only, with points that have no flagged field.
+    name = collection_name(server_store.config.collection_prefix, IDENTITY)
+    admin = QdrantClient(url=os.environ["QDRANT_URL"])
+    admin.create_collection(
+        name,
+        vectors_config=models.VectorParams(size=8, distance=models.Distance.COSINE),
+        metadata={IDENTITY_METADATA_KEY: canonical_identity(IDENTITY)},
+    )
+    admin.create_payload_index(name, "document_id", models.PayloadSchemaType.KEYWORD, wait=True)
+    _write_raw_point(admin, name, "old", 0, {}, one_hot(8, 0))
+
+    server_store.ensure_collection(IDENTITY)
+    upsert(
+        server_store,
+        "new",
+        [Chunk("injected", 0, 0, 0, 8, flagged=True), Chunk("clean", 0, 1, 9, 14)],
+        [one_hot(8, 1), one_hot(8, 2)],
+    )
+
+    info = admin.get_collection(name)
+    admin.close()
+    assert info.payload_schema[FLAGGED_FIELD].data_type == models.PayloadSchemaType.BOOL
+    hits = server_store.search(one_hot(8, 1), top_k=10)
+    assert {(hit.document_id, hit.sequence) for hit in hits} == {("old", 0), ("new", 1)}
+
+
+@pytest.mark.qdrant_server
 def test_a_collection_lost_on_the_server_is_recreated_with_its_index(
     server_store: QdrantVectorStore,
 ) -> None:
@@ -846,6 +995,7 @@ def test_a_collection_lost_on_the_server_is_recreated_with_its_index(
     admin.close()
     assert info.config.metadata == {IDENTITY_METADATA_KEY: canonical_identity(IDENTITY)}
     assert info.payload_schema["document_id"].data_type == models.PayloadSchemaType.KEYWORD
+    assert info.payload_schema[FLAGGED_FIELD].data_type == models.PayloadSchemaType.BOOL
 
 
 def _prefixed_collections(prefix: str) -> list[str]:

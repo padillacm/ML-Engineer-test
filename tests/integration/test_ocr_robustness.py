@@ -6,13 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from app.adapters.ocr import TesseractOcrEngine
+from app.adapters.ocr import TesseractOcrConfig, TesseractOcrEngine
+from app.adapters.ocr.engine import recognised_length
 from app.domain.errors import InvalidInput
 from tests.adapters.ocr.pdfs import encrypted_pdf
 
 pytestmark = pytest.mark.tesseract
 
-SAMPLE = Path(__file__).resolve().parents[2] / "sample_pdfs" / "company_memo.pdf"
+SAMPLES_DIR = Path(__file__).resolve().parents[2] / "sample_pdfs"
+SAMPLE = SAMPLES_DIR / "company_memo.pdf"
 REQUIRED_MODELS = {"eng", "spa", "por", "fra", "deu"}
 
 
@@ -69,3 +71,16 @@ def test_recognising_creates_no_file_in_the_temp_or_working_directory(
     assert pages[0].words
     assert list(temp_dir.iterdir()) == []
     assert list(work_dir.iterdir()) == []
+
+
+def test_the_densest_sample_page_is_within_the_default_text_limit() -> None:
+    engine = TesseractOcrEngine()
+    lengths: dict[str, int] = {}
+    for path in sorted(SAMPLES_DIR.glob("*.pdf")):
+        for page in engine.recognize(path.read_bytes(), "en"):
+            lengths[f"{path.name}:{page.page}"] = recognised_length(page.words)
+    densest = max(lengths, key=lambda key: lengths[key])
+    print(f"recognised page lengths: {lengths}; densest: {densest} ({lengths[densest]} chars)")
+
+    assert lengths[densest] > 1_000
+    assert lengths[densest] <= TesseractOcrConfig().max_page_chars

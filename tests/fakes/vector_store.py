@@ -1,4 +1,8 @@
-"""In-memory vector store with the identity binding and idempotent, completeness-aware upsert."""
+"""In-memory vector store with the identity binding and idempotent, completeness-aware upsert.
+
+Like the Qdrant adapter it keeps each chunk's ``flagged`` mark, never returns a flagged chunk
+from ``search`` and counts, deletes and repairs flagged chunks like any other.
+"""
 
 import math
 import threading
@@ -24,6 +28,7 @@ class FakeVectorStore:
     Like the real adapter, ``upsert`` writes chunk by chunk without deleting first and removes
     the document's other chunks only after writing all of them, so a write that fails part-way
     leaves an incomplete document (``document_chunk_count`` 0) or another writer's complete one.
+    A chunk stored with ``flagged`` set is kept (and counted) but excluded from every search.
     Safe to share between threads.
     """
 
@@ -112,6 +117,7 @@ class FakeVectorStore:
                 )
                 for document_id, entries in self._documents.items()
                 for entry in entries.values()
+                if not entry.chunk.flagged
             ]
         hits.sort(key=lambda hit: (-hit.score, hit.document_id, hit.sequence))
         return hits[:top_k]
@@ -131,6 +137,18 @@ class FakeVectorStore:
             return 0
         (total,) = totals
         return total if len(entries) == total else 0
+
+    def chunks_of(self, document_id: str) -> list[Chunk]:
+        """Test helper: the stored chunks of ``document_id``, in sequence order."""
+        with self._lock:
+            entries = self._documents.get(document_id, {})
+            return [entries[sequence].chunk for sequence in sorted(entries)]
+
+    def flagged_sequences(self, document_id: str) -> set[int]:
+        """Test helper: the sequences of the flagged chunks of ``document_id``."""
+        with self._lock:
+            entries = self._documents.get(document_id, {})
+            return {sequence for sequence, entry in entries.items() if entry.chunk.flagged}
 
     def content_hashes(self, document_id: str) -> set[str]:
         """Test helper: the content hashes stored with the chunks of ``document_id``."""

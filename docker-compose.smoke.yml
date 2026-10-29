@@ -2,15 +2,23 @@
 # docker-compose.yml (with COMPOSE_PROFILES=gpu to test the stack with the local model):
 #
 #   docker compose -f docker-compose.yml -f docker-compose.smoke.yml run --rm smoke
+#   docker compose -f docker-compose.yml -f docker-compose.smoke.yml run --rm hardening
 #   docker compose -f docker-compose.yml -f docker-compose.smoke.yml run --rm hygiene
 #
 # `smoke` builds the test image (docintel-test), starts the stack if it is not running, waits
 # until the app is healthy and runs tests/deploy (marker deployed_service) against
 # http://app:8000 over the internal network. The tests ingest the sample PDFs into the stack's
-# store. `hygiene` runs the runtime image without a network and fails if it contains test or
-# development code, uv, a .env file, Playwright or a browser, runs as root, can download models,
-# lets the service change its own code or its pdf.js files, or carries pdf.js files other than
-# those pinned in deploy/pdfjs.lock.
+# store. `hardening` runs the same image with the Docker socket mounted read-only and checks
+# the running app and Qdrant containers through the Engine API (tests/deploy/
+# test_hardening_smoke.py): read-only root, every capability dropped, no-new-privileges, the
+# process and memory limits, tmpfs scratch, no token in the environment, and a write outside
+# tmpfs refused inside the app container. (From the host, with the docker command on PATH, the
+# same tests run with SERVICE_URL set.) `hygiene` runs the runtime image without a network and
+# fails if it contains test or development code, uv, a .env file, Playwright or a browser, runs
+# as root, can download models, lets the service change its own code, its pdf.js files or the
+# detector model, carries pdf.js files other than those pinned in deploy/pdfjs.lock, or holds a
+# Hugging Face token, or a torch other than its TORCH_VARIANT (the CPU image with an NVIDIA
+# library or CUDA support).
 
 services:
   smoke:
@@ -18,6 +26,13 @@ services:
     build:
       context: .
       target: test
+      # The detector model, as for the app's build in docker-compose.yml (the test image carries
+      # it too; the `injection_model` tests need it). INJECTION_MODEL=0 builds without it.
+      args:
+        INJECTION_MODEL: ${INJECTION_MODEL:-1}
+      secrets:
+        - source: hf_token${HF_TOKEN:+_from_env}
+          target: hf_token
     image: ${TEST_IMAGE:-docintel-test}
     environment:
       SERVICE_URL: http://app:8000
@@ -28,6 +43,35 @@ services:
         condition: service_healthy
     command:
       ["pytest", "-q", "-rs", "-p", "no:cacheprovider", "-m", "deployed_service", "tests/deploy"]
+    restart: "no"
+
+  hardening:
+    profiles: [smoke]
+    image: ${TEST_IMAGE:-docintel-test}
+    # Built by `smoke`; never pulled.
+    pull_policy: never
+    environment:
+      SERVICE_URL: http://app:8000
+      DOCKER_SOCKET: /var/run/docker.sock
+    # The Engine's socket, for `docker inspect` and `docker exec` of the stack's containers (the
+    # test image has no docker command). Read-only mount; the socket still accepts connections,
+    # and the API it serves is the host's Docker, so this service is for a test run only. The
+    # tests run as the image's user (10001) with the socket's group added: root (0) on Docker
+    # Desktop, where the socket is root:root 0660; on a Linux host whose socket belongs to the
+    # `docker` group, put that group's id here.
+    group_add: ["0"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - backend
+    depends_on:
+      app:
+        condition: service_healthy
+    command:
+      [
+        "pytest", "-q", "-rs", "-p", "no:cacheprovider", "-m", "deployed_service",
+        "tests/deploy/test_hardening_smoke.py",
+      ]
     restart: "no"
 
   hygiene:
@@ -60,6 +104,12 @@ services:
         check "MALLOC_ARENA_MAX=2" '[ "$$MALLOC_ARENA_MAX" = 2 ]'
         check "service code is read-only" '! touch /app/app/main.py'
         check "models are read-only" '! touch /models/multilingual-e5-base/config.json'
+        check "detector model: at INJECTION_MODEL_PATH with its NOTICE, read-only (or opted out)" \
+          '[ -z "$$INJECTION_MODEL_PATH" ] || (
+            [ -f "$$INJECTION_MODEL_PATH/model.safetensors" ] && [ -f "$$INJECTION_MODEL_PATH/LICENSE" ] &&
+            grep -q "Built with Llama" "$$INJECTION_MODEL_PATH/NOTICE" && ! touch "$$INJECTION_MODEL_PATH/config.json" )'
+        check "no Hugging Face token" '[ -z "$$HF_TOKEN" ] && [ ! -e /run/secrets/hf_token ] && [ ! -e /root/.cache/huggingface/token ]'
+        check "scratch paths under /tmp" '[ "$$TMPDIR" = /tmp ] && [ "$$HF_HOME" = /tmp/huggingface ] && [ "$$TORCH_HOME" = /tmp/torch ]'
         check "pdf.js: at PDFJS_DIR, each file with its hash in deploy/pdfjs.lock, no other file" \
           '[ "$$PDFJS_DIR" = /app/vendor/pdfjs ] && [ "$$(ls -A /app/vendor/pdfjs | wc -l)" = 9 ] && (
             . /run/pdfjs.lock && cd /app/vendor/pdfjs && printf "%s  %s\n" \
@@ -76,5 +126,6 @@ services:
           '[ -z "$$(find /app/vendor ! -user 0)" ] && ! touch /app/vendor/pdfjs/pdf.min.mjs && ! touch /app/vendor/pdfjs/new.mjs'
         check "no Playwright or browser" \
           '! python -c "import playwright" && [ ! -e /ms-playwright ] && [ -z "$$(find / -xdev \( -name chrome -o -name headless_shell -o -name "chromium*" \) -print -quit 2>/dev/null)" ]'
+        check "torch matches TORCH_VARIANT (cpu: no CUDA, no nvidia-*/cuda-*/triton package; cuda: a CUDA build)"           'python -I -c "import importlib.metadata as m, os, sys, torch; v = os.environ[\"TORCH_VARIANT\"]; gpu = [d.metadata[\"Name\"] for d in m.distributions() if (d.metadata[\"Name\"] or \"\").lower().startswith((\"nvidia-\", \"cuda-\", \"triton\"))]; sys.exit(not ((v == \"cpu\" and not gpu and torch.version.cuda is None and not torch.cuda.is_available()) or (v == \"cuda\" and torch.version.cuda is not None)))"'
         check "the service imports" 'python -c "import app.main"'
         exit $$failed

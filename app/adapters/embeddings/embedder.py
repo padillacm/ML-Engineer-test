@@ -1,4 +1,4 @@
-"""``Embedder`` backed by a local ``intfloat/multilingual-e5-base`` model on CPU.
+"""``Embedder`` backed by a local ``intfloat/multilingual-e5-base`` model.
 
 The recipe is the model card's: the ``passage: `` / ``query: `` prefix, ``AutoModel``, mean
 pooling of the last hidden state over the attention mask and L2 normalisation, implemented here
@@ -31,6 +31,16 @@ many intra-op threads, and the last torch adapter created wins, so the service g
 same value (``TORCH_THREADS``). A failed creation leaves it unchanged. ``pool_size`` concurrent
 batches use up to ``pool_size`` x ``threads`` CPUs, and a query in the reserved slot ``threads``
 more for about 50 ms.
+
+Device: the model runs on ``config.device``. On a GPU it is moved there once in half precision
+(``app.adapters.device.place``; the e5 fp16 equivalence is measured in BENCHMARKS 5), each
+batch's tokens are moved to it, and the last hidden state is cast to float32 before the mean
+pooling and the L2 normalisation, which then run in full precision; the vectors come back to the
+CPU. The identity does not name the device: vectors of either device are the same model's and a
+collection written on one is searched from the other. Tokenising stays on the CPU, as do the
+threads above. On the CPU the model is used as loaded and nothing is cast, as before. A CUDA
+out-of-memory error during a call fails it with ``embedding_failed`` after the cached GPU memory
+is released, and the next call runs normally.
 """
 
 import threading
@@ -39,6 +49,7 @@ from dataclasses import dataclass
 
 import torch
 
+from app.adapters.device import is_cuda, place, release_after_failure
 from app.adapters.embeddings.config import E5EmbedderConfig
 from app.adapters.slots import FifoSlots
 from app.domain.errors import ConfigurationError, ProcessingFailed, ServiceError
@@ -166,6 +177,7 @@ class E5Embedder:
         except ServiceError:
             raise
         except Exception as error:  # every vendor failure becomes one fixed error
+            release_after_failure(error)
             raise ProcessingFailed(
                 "embedding model could not process the text", "embedding_failed"
             ) from error
@@ -217,8 +229,11 @@ def load_encoder(config: E5EmbedderConfig) -> LoadedEncoder:
             f"embedding model weights do not match its configuration ({problems}): {path}"
         )
     model.eval()
+    place(model, config.device)
     dimension = int(model.config.hidden_size)
     max_length = config.max_length
+    device = config.device
+    on_gpu = is_cuda(device)
     tokenizer_lock = threading.Lock()
 
     def encode(texts: Sequence[str]) -> list[list[float]]:
@@ -230,10 +245,14 @@ def load_encoder(config: E5EmbedderConfig) -> LoadedEncoder:
                 max_length=max_length,
                 return_tensors="pt",
             )
+        if on_gpu:
+            inputs = inputs.to(device)
         with torch.inference_mode():
             hidden = model(**inputs).last_hidden_state
+            if on_gpu:  # pooling and normalisation in full precision
+                hidden = hidden.float()
             vectors = normalize(mean_pool(hidden, inputs["attention_mask"]))
-        result: list[list[float]] = vectors.tolist()
+        result: list[list[float]] = vectors.cpu().tolist()
         return result
 
     # Every call passes the same tokenizer settings, so after this first call the tokenizer's

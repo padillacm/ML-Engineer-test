@@ -7,6 +7,7 @@ import weakref
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -42,7 +43,7 @@ class RecordingEncoder:
 
 
 def make_embedder(
-    model_dir: Path, encode: Callable[[Sequence[str]], list[list[float]]], **settings: int
+    model_dir: Path, encode: Callable[[Sequence[str]], list[list[float]]], **settings: Any
 ) -> E5Embedder:
     config = E5EmbedderConfig(model_dir, REVISION, **settings)
     return E5Embedder(config, model_factory=lambda config: LoadedEncoder(DIMENSION, encode))

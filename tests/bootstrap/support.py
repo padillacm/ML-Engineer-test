@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from app.adapters.embeddings.config import E5EmbedderConfig
+from app.adapters.injection.config import InjectionDetectorConfig
 from app.adapters.llm.config import LLMClientConfig
 from app.adapters.ner.config import TransformersNerConfig
 from app.adapters.ocr.engine import TesseractOcrConfig
@@ -14,6 +15,7 @@ from app.application.ports import OcrEngine
 from app.bootstrap import AdapterFactories
 from app.domain.types import ChatMessage
 from app.settings import Settings, load_settings
+from tests.fakes.detector import FakeInjectionDetector
 from tests.fakes.embedder import FakeEmbedder
 from tests.fakes.llm import FakeLLMClient
 from tests.fakes.names import FakeNameRecognizer
@@ -41,6 +43,12 @@ def bootstrap_settings(models: Path, **overrides: Any) -> Settings:
         "qdrant_location": ":memory:",
         "llm_base_url": None,
         "llm_model": None,
+        # The images set INJECTION_MODEL_PATH; these tests start without a detector unless
+        # they say so, so the environment's value must not leak in.
+        "injection_model_path": None,
+        # Pinned to the CPU so a host with a GPU derives the same sizes; the device resolution
+        # is tested with a patched probe.
+        "device": "cpu",
     }
     values.update(overrides)
     return load_settings(_env_file=None, **values)
@@ -85,6 +93,18 @@ class RecordingEmbedder(FakeEmbedder):
         self.events.append("embedder.close")
 
 
+class RecordingDetector(FakeInjectionDetector):
+    """``FakeInjectionDetector`` whose ``close`` is recorded."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+
+    def close(self) -> None:
+        super().close()
+        self.events.append("detector.close")
+
+
 class RecordingLLM(FakeLLMClient):
     """``FakeLLMClient`` with ``close``."""
 
@@ -117,6 +137,7 @@ class Recorder:
             embedder=self._embedder,
             store=self._store,
             llm=self._llm,
+            detector=self._detector,
         )
 
     def _record(self, name: str, config: object) -> None:
@@ -140,6 +161,10 @@ class Recorder:
     def _store(self, config: QdrantStoreConfig) -> RecordingStore:
         self._record("store", config)
         return RecordingStore(self.events, down=self.store_down)
+
+    def _detector(self, config: InjectionDetectorConfig) -> RecordingDetector:
+        self._record("detector", config)
+        return RecordingDetector(self.events)
 
     def _llm(self, config: LLMClientConfig) -> RecordingLLM:
         self._record("llm", config)

@@ -8,8 +8,15 @@ ignored. The
 defaults are the benchmarked configuration and mirror the defaults of the adapter configs and
 use cases (a test keeps them equal); only the values that identify a deployment (model paths
 and revision, vector store target) are required. ``MAX_CONCURRENT_JOBS``, ``NER_POOL_SIZE``,
-``EMBEDDING_POOL_SIZE`` and ``OCR_WORKERS`` are ``None`` when unset: the composition root
-derives them from the CPUs available (``app.bootstrap.resolve_concurrency``); a set value wins.
+``EMBEDDING_POOL_SIZE``, ``INJECTION_POOL_SIZE`` and ``OCR_WORKERS`` are ``None`` when unset:
+the composition root derives them from the CPUs available, or takes the GPU defaults for the
+three model pools when the models run on the GPU (``app.bootstrap.resolve_concurrency``); a
+set value wins.
+
+``DEVICE`` (``cpu``, ``cuda`` or ``auto``, case-insensitive) is where the recogniser, the
+embedder and the injection detector run; the composition root resolves it once
+(``app.bootstrap.resolve_device``: ``auto`` is the GPU when one is visible, else the CPU, and
+``cuda`` without a visible GPU fails start-up), because only it may probe the hardware.
 
 Settings only parse types and check ranges. The detailed rules (model directory contents, URL
 shapes, cross-field limits) stay in the adapter config dataclasses, which the composition root
@@ -39,6 +46,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.domain.errors import ConfigurationError
 
 PositiveInt = Annotated[int, Field(gt=0)]
+NonNegativeInt = Annotated[int, Field(ge=0)]
 PositiveSeconds = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 Threshold = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 NonBlank = Annotated[str, Field(min_length=1)]
@@ -47,6 +55,7 @@ LogLevel = Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
 LogFormat = Literal["json", "text"]
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 MaxTokensField = Literal["max_tokens", "max_completion_tokens"]
+DeviceChoice = Literal["cpu", "cuda", "auto"]
 
 MAX_BUSY_WAIT_S = 300.0
 """Upper bound of ``BUSY_WAIT_S``, in seconds."""
@@ -102,7 +111,10 @@ class Settings(BaseSettings):
     # Torch intra-op threads, process-wide: shared by the recogniser and the embedder; ``None``
     # means ``DEFAULT_TORCH_THREADS``, at most the CPUs available (the composition root decides).
     torch_threads: PositiveInt | None = None
-    # Concurrent recognitions and embedding batches; ``None`` derives them from the CPUs.
+    # Where the three in-process models run; ``auto`` is the GPU when one is visible.
+    device: DeviceChoice = "auto"
+    # Concurrent recognitions and embedding batches; ``None`` derives them from the CPUs (or
+    # takes the GPU defaults on the GPU).
     ner_pool_size: PositiveInt | None = None
     embedding_pool_size: PositiveInt | None = None
     embedding_batch_size: PositiveInt = 16
@@ -116,6 +128,11 @@ class Settings(BaseSettings):
     ocr_timeout_s: PositiveSeconds = 60.0
     ocr_flatten: bool = True
     max_pages: PositiveInt = 50
+    # Time budget of one page render, the decoded image pixels a page may hold before it is
+    # rendered, and the longest recognised text of one page (a denser page is refused).
+    ocr_render_timeout_s: PositiveSeconds = 10.0
+    ocr_max_image_pixels: PositiveInt = 80_000_000
+    max_page_chars: PositiveInt = 30_000
 
     # Matching
     match_threshold: Threshold = 0.90
@@ -129,6 +146,20 @@ class Settings(BaseSettings):
     rag_top_k: PositiveInt = 5
     rag_max_chunks: PositiveInt = 3
     rag_max_context_chars: PositiveInt = 6000
+    # Answer guardrails: the share of an answer's content tokens that must appear in the
+    # context, and how many context chunks one document may give when others also matched.
+    rag_support_min_share: Threshold = 0.6
+    rag_max_chunks_per_document: PositiveInt = 2
+
+    # Injection detector: unset path means no detector (every score 0); the threshold at or
+    # above which a chunk is flagged or a question refused; concurrent calls on one model
+    # (``None``: the adapter's default on the CPU, the GPU default on the GPU).
+    injection_model_path: NonBlank | None = None
+    injection_threshold: Threshold = 0.5
+    injection_pool_size: PositiveInt | None = None
+    # The instruction patterns next to the model (score 1 on a match); false leaves the model
+    # alone, or nothing when it is unset too.
+    injection_patterns: bool = True
 
     # Vector store: exactly one of ``qdrant_url`` and ``qdrant_location``.
     qdrant_url: NonBlank | None = None
@@ -162,6 +193,14 @@ class Settings(BaseSettings):
     # Limits
     max_upload_mb: PositiveInt = 20
     max_names: PositiveInt = 1000
+    # Per client address: sustained requests per minute and burst, for the upload routes and
+    # for questions, and the jobs one address may hold at once; a rate or cap of 0 turns that
+    # limit off (a burst is always at least 1).
+    rate_limit_uploads_per_minute: NonNegativeInt = 60
+    rate_limit_uploads_burst: PositiveInt = 20
+    rate_limit_questions_per_minute: NonNegativeInt = 240
+    rate_limit_questions_burst: PositiveInt = 60
+    max_jobs_per_client: NonNegativeInt = 4
     # ``None`` derives the job limit from the CPUs.
     max_concurrent_jobs: PositiveInt | None = None
     # Questions wait mostly on the language model (I/O); they have their own slots and threads.
@@ -179,6 +218,9 @@ class Settings(BaseSettings):
     # where ``scripts/fetch_pdfjs.py`` puts them (the images set ``/app/vendor/pdfjs``).
     audit_viewer_enabled: bool = True
     pdfjs_dir: NonBlank | None = None
+
+    # API documentation (``/docs``, ``/redoc``, ``/openapi.json``): off, they answer 404.
+    expose_docs: bool = False
 
     # Logging
     log_level: LogLevel = "INFO"
@@ -206,7 +248,9 @@ class Settings(BaseSettings):
     def _upper_level(cls, value: object) -> object:
         return value.strip().upper() if isinstance(value, str) else value
 
-    @field_validator("log_format", "llm_reasoning_effort", "llm_max_tokens_field", mode="before")
+    @field_validator(
+        "log_format", "llm_reasoning_effort", "llm_max_tokens_field", "device", mode="before"
+    )
     @classmethod
     def _lower_choice(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value

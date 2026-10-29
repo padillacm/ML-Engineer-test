@@ -18,6 +18,12 @@ Thread safety: ``recognize`` may be called from several threads at once. PDFium 
 thread-safe, so every PDFium call (open, render, close) is serialised by the module-level lock
 of ``app.adapters.ocr.rendering``; the Tesseract processes of all calls still run concurrently.
 
+Bounds: besides the page count and the pixel budget, each page's render has a time budget and
+an image pre-check (``app.adapters.ocr.rendering``), and each page's recognised text is capped
+at ``max_page_chars`` characters as soon as its words are parsed, so a document with an
+over-long page fails with ``too_large`` before ``recognize`` returns and nothing downstream
+(name recognition, chunking, embedding) runs on it.
+
 Coordinates: word boxes are in points in the displayed frame of the page (after ``/Rotate``,
 relative to the CropBox, origin at the top-left). Drawing or redacting on a rotated page needs
 the page's derotation matrix (PyMuPDF ``page.derotation_matrix``) to map boxes back.
@@ -33,13 +39,19 @@ from itertools import chain
 from math import isfinite
 
 from app.adapters.ocr.preprocess import flatten_illumination
-from app.adapters.ocr.rendering import ImageTransform, RenderedPage, open_pdf, render_pages
+from app.adapters.ocr.rendering import (
+    ImageTransform,
+    RenderedPage,
+    RenderLimits,
+    open_pdf,
+    render_pages,
+)
 from app.adapters.ocr.tesseract import TesseractCli, TesseractRunner, parse_tsv
 from app.domain.cancellation import NEVER_CANCELLED, Cancellation
 from app.domain.errors import ConfigurationError, InvalidInput, ProcessingFailed
 from app.domain.geometry import PageText
 from app.domain.language import SUPPORTED_LANGUAGES, detect_language, validate_language
-from app.domain.types import OcrPage
+from app.domain.types import OcrPage, PageWord
 
 TESSERACT_MODELS: dict[str, str] = {
     "en": "eng",
@@ -66,7 +78,12 @@ class TesseractOcrConfig:
     quota is not seen; the service passes the value it derives from the CPUs available to the
     process, quota included). ``max_pages`` is the largest page
     count accepted; a longer document is refused after opening, before any page is loaded or
-    rendered. Invalid values raise ``ConfigurationError``.
+    rendered. ``render_timeout_s`` is the time budget of one page's render (``pdf_unreadable``
+    once spent), ``max_image_pixels`` the largest sum of declared image pixels a page may hold
+    (``too_large``, checked before the page is drawn) and ``max_page_chars`` the longest
+    recognised text of one page (``too_large``, checked as soon as the page is read, before
+    anything downstream sees the document; see ``recognised_length``). Invalid values raise
+    ``ConfigurationError``.
     """
 
     dpi: int = 200
@@ -80,6 +97,9 @@ class TesseractOcrConfig:
     workers: int | None = None
     max_page_pixels: int = 40_000_000
     max_pages: int = 50
+    render_timeout_s: float = 10.0
+    max_image_pixels: int = 80_000_000
+    max_page_chars: int = 30_000
     tesseract_cmd: str = "tesseract"
 
     def __post_init__(self) -> None:
@@ -97,6 +117,12 @@ class TesseractOcrConfig:
         )
         _require(_is_positive_int(self.max_page_pixels), "max_page_pixels must be >= 1")
         _require(_is_positive_int(self.max_pages), "max_pages must be a positive integer")
+        _require(
+            _is_positive_number(self.render_timeout_s),
+            "render_timeout_s must be a finite number > 0",
+        )
+        _require(_is_positive_int(self.max_image_pixels), "max_image_pixels must be >= 1")
+        _require(_is_positive_int(self.max_page_chars), "max_page_chars must be >= 1")
         _require(
             isinstance(self.tesseract_cmd, str) and bool(self.tesseract_cmd.strip()),
             "tesseract_cmd must be a non-empty string",
@@ -191,17 +217,22 @@ class TesseractOcrEngine:
         ``None`` when detection was inconclusive (all pages then report ``None``).
 
         A document with more than ``max_pages`` pages raises ``InvalidInput`` (code
-        ``too_many_pages``) before any page is rendered or read.
+        ``too_many_pages``) before any page is rendered or read. A page whose render exceeds
+        ``render_timeout_s`` fails the document with ``pdf_unreadable``; one declaring more
+        than ``max_image_pixels`` image pixels, or whose recognised text is longer than
+        ``max_page_chars``, fails it with ``too_large``, all naming the page.
 
         ``cancel`` is checked before each page is rendered, before each is recognised and while
         Tesseract runs; once cancelled, running Tesseract processes are stopped, no further
         page starts and ``ProcessingFailed`` (code ``request_cancelled``) is raised.
         """
         code = None if language is None else self._supported(language)
-        with open_pdf(pdf, max_pages=self._config.max_pages) as document:
+        config = self._config
+        limits = RenderLimits(config.render_timeout_s, config.max_image_pixels)
+        with open_pdf(pdf, max_pages=config.max_pages) as document:
             pages = _until_cancelled(
                 render_pages(
-                    document, self._config.dpi, self._config.max_page_pixels, self._transform()
+                    document, config.dpi, config.max_page_pixels, self._transform(), limits
                 ),
                 cancel,
             )
@@ -306,8 +337,35 @@ class TesseractOcrEngine:
             raise ProcessingFailed(
                 f"OCR failed on page {rendered.index}: {error.message}", "ocr_failed"
             ) from error
+        limit = self._config.max_page_chars
+        if recognised_length(words) > limit:
+            raise InvalidInput(
+                f"page {rendered.index} has more text than the limit of {limit} characters",
+                "too_large",
+            )
         raster = rendered.raster
         return OcrPage(rendered.index, raster.page_width_pt, raster.page_height_pt, words, language)
+
+
+def recognised_length(words: Iterable[PageWord]) -> int:
+    """The length of a page's recognised text as ingestion assembles it from its words.
+
+    The rule: non-blank words joined by one space within a line, lines by one line break
+    within a paragraph and paragraphs by a blank line (two line breaks), so the result is the
+    sum of the word lengths plus one separator per word after the first (two when the word
+    opens a paragraph). Counted here, without assembling the text, so the engine can refuse a
+    page before the document reaches name recognition, chunking or embedding.
+    """
+    length = 0
+    paragraph: int | None = None
+    for word in words:
+        if not word.text.strip():
+            continue
+        if paragraph is not None:
+            length += 2 if word.paragraph != paragraph else 1
+        length += len(word.text)
+        paragraph = word.paragraph
+    return length
 
 
 class _Abandoned(Exception):

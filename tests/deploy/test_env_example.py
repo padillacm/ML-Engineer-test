@@ -64,6 +64,7 @@ def test_the_compose_files_are_found() -> None:
         "docker-compose.e2e.yml",
         "docker-compose.smoke.yml",
         "docker-compose.test.yml",
+        "docker-compose.torch.yml",
         "docker-compose.yml",
     ]
 

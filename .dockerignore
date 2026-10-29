@@ -3,6 +3,7 @@
 .gitignore
 .gitattributes
 .venv
+.venv-cuda
 venv
 **/__pycache__
 **/*.py[cod]

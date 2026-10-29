@@ -80,7 +80,11 @@ def test_readiness_without_a_language_model_is_still_ready(
     assert response.json()["checks"]["llm"] == "not_configured"
 
 
-def test_openapi_documents_the_endpoints_and_the_ingest_addition(client: TestClient) -> None:
+def test_openapi_documents_the_endpoints_and_the_ingest_addition(
+    make_client: ClientFactory,
+) -> None:
+    client = make_client(expose_docs=True)  # off by default (spec: http-api)
+
     schema = client.get("/openapi.json").json()
 
     assert set(schema["paths"]) == {

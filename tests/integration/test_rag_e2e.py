@@ -36,7 +36,7 @@ pytestmark = [pytest.mark.tesseract, pytest.mark.embedding_model, pytest.mark.qd
 SAMPLES_DIR = Path(__file__).resolve().parents[2] / "sample_pdfs"
 MEMO = "company_memo.pdf"
 REPORT = "research_report.pdf"
-SCRIPTED_REPLY = "Robert Chen (scripted reply)."
+SCRIPTED_REPLY = "Robert Chen."  # only context tokens: the support check keeps it
 TOP_K = 5
 ANSWER_THRESHOLD = 0.70
 

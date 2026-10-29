@@ -22,8 +22,14 @@ would orphan every stored point, so it must never change.
 
 Payload of every point: ``document_id``, ``page``, ``sequence``, ``text``, ``page_text``,
 ``start``, ``end``, ``content_hash`` and ``chunk_total`` (the number of chunks of the write that
-stored it); a keyword payload index on ``document_id`` (server mode only, the embedded local mode
-has no payload indexes) serves deletion and counting.
+stored it), plus ``flagged: true`` on the chunks the injection detector flagged (D6). The field
+is written only when true, so points stored before it existed (no field) read as not flagged
+and stay searchable. ``search`` adds ``must_not: [flagged = true]`` to every query, so a flagged
+chunk is never returned whatever its similarity; counting, deletion and the chunk total ignore
+the flag, so a document with flagged chunks is complete, idempotent and repairable like any
+other. Payload indexes (server mode only, the embedded local mode has none and filters without
+them): keyword on ``document_id`` for deletion and counting, bool on ``flagged`` for the search
+filter; both are created on first use and verified on later ones.
 
 Upsert is idempotent and never deletes before writing: it overwrites the document's points by id
 in batches with ``wait=True``, then deletes only the document's points that this write did not
@@ -72,6 +78,13 @@ CHUNK_ID_NAMESPACE = uuid.UUID("af2c2b75-7ad5-5066-9b3f-0a70af9f6a3f")
 IDENTITY_METADATA_KEY = "embedding_identity"
 DOCUMENT_ID_FIELD = "document_id"
 CHUNK_TOTAL_FIELD = "chunk_total"
+FLAGGED_FIELD = "flagged"
+"""Payload field of a chunk the injection detector flagged; present (``True``) only on those."""
+
+_PAYLOAD_INDEXES: tuple[tuple[str, models.PayloadSchemaType], ...] = (
+    (DOCUMENT_ID_FIELD, models.PayloadSchemaType.KEYWORD),
+    (FLAGGED_FIELD, models.PayloadSchemaType.BOOL),
+)
 
 _HASH_LENGTH = 12
 _HTTP_CONFLICT = 409
@@ -229,6 +242,8 @@ class QdrantVectorStore:
                     "end": chunk.end,
                     "content_hash": content_hash,
                     CHUNK_TOTAL_FIELD: total,
+                    # Only when flagged: an absent field is "not flagged", as in older points.
+                    **({FLAGGED_FIELD: True} if chunk.flagged else {}),
                 },
             )
             for chunk, vector in zip(chunks, vectors, strict=True)
@@ -259,7 +274,11 @@ class QdrantVectorStore:
         query = [float(value) for value in vector]
         response = self._on_collection(
             lambda: self._client.query_points(
-                collection_name=name, query=query, limit=top_k, with_payload=True
+                collection_name=name,
+                query=query,
+                query_filter=unflagged_filter(),
+                limit=top_k,
+                with_payload=True,
             )
         )
         return [_to_hit(point) for point in response.points]
@@ -349,7 +368,7 @@ class QdrantVectorStore:
             self._verify(name, identity, expected)
         else:
             self._create(name, identity, expected)
-        self._ensure_document_index(name)
+        self._ensure_payload_indexes(name)
 
     def _create(self, name: str, identity: EmbeddingIdentity, expected: str) -> None:
         params = models.VectorParams(size=identity.dimension, distance=models.Distance.COSINE)
@@ -380,20 +399,27 @@ class QdrantVectorStore:
         ):
             raise IncompatibleEmbedding("the collection's vector size or distance differs")
 
-    def _ensure_document_index(self, name: str) -> None:
+    def _ensure_payload_indexes(self, name: str) -> None:
+        """Create each missing index of ``_PAYLOAD_INDEXES``; creating an existing one is safe.
+
+        A collection created before the ``flagged`` index existed gains it here on first use.
+        """
         if self._config.location is not None:
             return  # local mode: payload indexes have no effect (and qdrant-client warns)
         info = self._settle.call(lambda: self._client.get_collection(name))
-        if DOCUMENT_ID_FIELD in (info.payload_schema or {}):
-            return
-        self._call(
-            lambda: self._client.create_payload_index(
-                collection_name=name,
-                field_name=DOCUMENT_ID_FIELD,
-                field_schema=models.PayloadSchemaType.KEYWORD,
-                wait=True,
+        present = info.payload_schema or {}
+        for field, schema in _PAYLOAD_INDEXES:
+            if field in present:
+                continue
+            self._call(
+                partial(
+                    self._client.create_payload_index,
+                    collection_name=name,
+                    field_name=field,
+                    field_schema=schema,
+                    wait=True,
+                )
             )
-        )
 
 
 def _build_client(config: QdrantStoreConfig) -> QdrantClient:
@@ -451,6 +477,17 @@ def _is_initialising(error: BaseException) -> bool:
         isinstance(error, UnexpectedResponse)
         and error.status_code == _HTTP_SERVER_ERROR
         and _INITIALISING_MARKER in error.content
+    )
+
+
+def unflagged_filter() -> models.Filter:
+    """The search filter: ``must_not: [flagged = true]``.
+
+    A point without the field does not match the condition, so it passes the filter: points
+    written before the field existed stay searchable.
+    """
+    return models.Filter(
+        must_not=[models.FieldCondition(key=FLAGGED_FIELD, match=models.MatchValue(value=True))]
     )
 
 

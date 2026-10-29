@@ -125,6 +125,9 @@ def test_the_viewer_goes_through_the_service_middleware(
 
 
 def test_the_api_gets_no_viewer_headers(client: TestClient) -> None:
+    """The policy is the viewer's alone; ``nosniff`` and ``no-referrer`` are also on the API
+    responses, set by the request context middleware (spec: http-api), so an unknown path
+    outside the API is where none of the three appears."""
     responses = [
         client.get("/health"),
         client.post(
@@ -137,10 +140,13 @@ def test_the_api_gets_no_viewer_headers(client: TestClient) -> None:
 
     assert [response.status_code for response in responses] == [200, 200, 404]
     for response in responses:
-        assert set(SECURITY).isdisjoint(response.headers)
+        assert "content-security-policy" not in response.headers
+    assert set(SECURITY).isdisjoint(responses[-1].headers)
 
 
-def test_the_viewer_is_not_in_the_api_schema(client: TestClient) -> None:
+def test_the_viewer_is_not_in_the_api_schema(make_viewer: ViewerClient) -> None:
+    client = make_viewer(expose_docs=True)
+
     paths = client.get("/openapi.json").json()["paths"]
 
     assert [path for path in paths if path.startswith("/audit")] == []

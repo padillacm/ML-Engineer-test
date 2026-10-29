@@ -8,7 +8,12 @@ trace) and writes one access line per request: at INFO, except a successful requ
 below 400) to one of its ``probe_routes`` (the health endpoints), which is logged at DEBUG. The
 container's healthcheck probes readiness every 15 s, and an orchestrator's probes as often, so
 at INFO they would bury the client requests; a failing probe (503) stays at INFO, next to the
-readiness warning naming the failed check, and ``LOG_LEVEL=DEBUG`` shows every probe.
+readiness warning naming the failed check, and ``LOG_LEVEL=DEBUG`` shows every probe. It also
+adds ``PROTECTIVE_HEADERS`` (``Cache-Control: no-store``, ``X-Content-Type-Options: nosniff``,
+``Referrer-Policy: no-referrer``) to every response, success or error (its own 500 included),
+of the API routes: the paths under ``/api/`` and the health routes. Those responses are JSON
+about one request (never to be cached or sniffed) and nothing links from them; the audit viewer
+sets its own caching and security headers, which are left alone, as is any other path.
 
 ``BodyLimitMiddleware`` applies the limit ``limit(scope)`` chooses for the request's path (the
 upload routes accept a PDF, the others a small JSON body or none): it rejects a request whose
@@ -57,6 +62,16 @@ UNMATCHED_ROUTE = "unmatched"
 
 _REQUEST_ID_KEY = REQUEST_ID_HEADER.lower().encode("latin-1")
 _CONNECTION_KEY = b"connection"
+
+PROTECTIVE_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"cache-control", b"no-store"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+)
+"""On every response of the API routes (``protected_path``), replacing any of the same name."""
+_PROTECTIVE_KEYS = frozenset(key for key, _ in PROTECTIVE_HEADERS)
+API_PREFIX = "/api/"
+HEALTH_PATH = "/health"
 _TOO_LARGE_STATUS = 413
 _FIRST_ERROR_STATUS = 400
 _CANCELLED_STATUS = 499  # the request was cancelled before any response (client gone, shutdown)
@@ -95,6 +110,7 @@ class RequestContextMiddleware:
             await self.app(scope, receive, send)
             return
         request_id = accept_request_id(Headers(scope=scope).get(REQUEST_ID_HEADER))
+        protected = protected_path(route_path(scope))
         status = 500
         started = False
 
@@ -103,12 +119,15 @@ class RequestContextMiddleware:
             if message["type"] == "http.response.start":
                 started = True
                 status = int(message["status"])
+                replaced = {_REQUEST_ID_KEY, *(_PROTECTIVE_KEYS if protected else ())}
                 headers = [
                     (key, value)
                     for key, value in message.get("headers", [])
-                    if key.lower() != _REQUEST_ID_KEY
+                    if key.lower() not in replaced
                 ]
                 headers.append((_REQUEST_ID_KEY, request_id.encode("latin-1")))
+                if protected:
+                    headers.extend(PROTECTIVE_HEADERS)
                 message["headers"] = headers
             await send(message)
 
@@ -273,6 +292,12 @@ def route_path(scope: Scope) -> str:
     if root and path.startswith(root):
         path = path[len(root) :]
     return path.rstrip("/") or "/"
+
+
+def protected_path(path: str) -> bool:
+    """Whether ``path`` (as ``route_path`` gives it) is an API route, whose responses carry
+    ``PROTECTIVE_HEADERS``: under ``/api/``, or ``/health`` and the paths under it."""
+    return path.startswith(API_PREFIX) or path == HEALTH_PATH or path.startswith(HEALTH_PATH + "/")
 
 
 def _route_template(scope: Scope) -> str:

@@ -12,15 +12,27 @@ never contain a secret.
 intra-op thread count is process-wide, so each adapter's creation sets it for the whole process
 and they must agree. Unset, it is ``DEFAULT_TORCH_THREADS`` lowered to the CPUs available.
 
-Concurrency: ``MAX_CONCURRENT_JOBS``, ``NER_POOL_SIZE``, ``EMBEDDING_POOL_SIZE`` and
-``OCR_WORKERS`` that are not set are derived from the CPUs available to the process
-(``available_cpus``: affinity and the cgroup v2 or v1 quota) by ``concurrency_for``; a set value
-is used as given. ``resolve_concurrency`` is the one place that does this, and every consumer (the
-adapter configurations here, the HTTP job limiter in ``app.main``) uses its result. Building the
-container logs the values in use in one line, and one warning per pool whose size x
-``TORCH_THREADS`` (the CPUs its concurrent calls can use) exceeds the available CPUs; nothing is
-changed. The pools are checked one by one: a job uses one of them at a time, and the job limit
-bounds them together.
+Device: ``DEVICE`` is resolved here once, by ``resolve_device`` (``auto``: the first GPU when
+torch sees one, else the CPU; ``cuda`` without a visible GPU is a ``ConfigurationError``), and
+the resolved name ("cpu" or "cuda:0") goes into the three model configurations, so the adapters
+never probe the hardware and always agree. The device is part of ``Concurrency`` because the
+pool sizes depend on it.
+
+Concurrency: ``MAX_CONCURRENT_JOBS``, ``NER_POOL_SIZE``, ``EMBEDDING_POOL_SIZE``,
+``INJECTION_POOL_SIZE`` and ``OCR_WORKERS`` that are not set are derived from the CPUs available
+to the process (``available_cpus``: affinity and the cgroup v2 or v1 quota) and the device by
+``concurrency_for``; a set value is used as given. ``resolve_concurrency`` is the one place
+that does this, and every consumer (the adapter configurations here, the HTTP job limiter in
+``app.main``) uses its result. Building the container logs the values in use and the device
+(with the GPU's name and memory on the GPU) in one line, and, on the CPU only, one warning per
+pool whose size x ``TORCH_THREADS`` (the CPUs its concurrent calls can use) exceeds the
+available CPUs; nothing is changed. The pools are checked one by one: a job uses one of them at
+a time, and the job limit bounds them together. On the GPU the pools' forward passes do not run
+on the CPUs, so that product says nothing.
+
+The injection detector is the Prompt Guard adapter when ``INJECTION_MODEL_PATH`` is set and
+``NoDetector`` otherwise; with ``INJECTION_PATTERNS`` (the default) it is wrapped with the
+instruction patterns in a ``CompositeDetector`` that keeps the higher score (design D5b).
 
 Without ``LLM_BASE_URL`` the questions use case gets an ``UnconfiguredLLM`` and readiness
 reports the language model as ``not_configured``. Nothing contacts the vector store here, so the
@@ -35,8 +47,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from app.adapters.device import CPU, gpu_description, gpu_visible
 from app.adapters.embeddings.config import E5EmbedderConfig
 from app.adapters.embeddings.embedder import E5Embedder
+from app.adapters.injection.config import InjectionDetectorConfig
+from app.adapters.injection.detector import PromptGuardDetector
 from app.adapters.llm.config import LLMClientConfig
 from app.adapters.llm.openai_compatible import OpenAICompatibleClient
 from app.adapters.llm.secret import Secret
@@ -48,11 +63,20 @@ from app.adapters.vector_store.qdrant_store import QdrantVectorStore
 from app.application.ask_question import AskQuestion
 from app.application.extract_names import ExtractNames
 from app.application.ingest_document import IngestDocument
-from app.application.ports import Embedder, LLMClient, NameRecognizer, OcrEngine, VectorStore
+from app.application.no_detector import NoDetector
+from app.application.pattern_detector import CompositeDetector, PatternDetector
+from app.application.ports import (
+    Embedder,
+    InjectionDetector,
+    LLMClient,
+    NameRecognizer,
+    OcrEngine,
+    VectorStore,
+)
 from app.application.unconfigured_llm import UnconfiguredLLM
 from app.domain.chunking import ChunkingConfig
 from app.domain.errors import ConfigurationError
-from app.settings import DEFAULT_TORCH_THREADS, Settings
+from app.settings import DEFAULT_TORCH_THREADS, DeviceChoice, Settings
 
 type ReadinessCheck = Callable[[], str]
 """Returns the check's status ("ok", "configured", ...) when it passes and raises otherwise."""
@@ -70,6 +94,20 @@ MAX_DERIVED_EMBEDDING_POOL = 4
 throughput on 16 CPUs (BENCHMARKS 18.5)."""
 MAX_DERIVED_OCR_WORKERS = 4
 """Largest derived ``OCR_WORKERS``: the adapter's own ``min(4, CPUs)`` (BENCHMARKS 15.2)."""
+CPU_INJECTION_POOL = 2
+"""``INJECTION_POOL_SIZE`` on the CPU when unset: the detector adapter's default."""
+GPU_NER_POOL = 1
+"""``NER_POOL_SIZE`` on the GPU when unset. Measured (BENCHMARKS 23, design D3): pools of 1, 2, 4
+and 8 came within 3 % of each other, because OCR on the CPUs bounds the jobs and the GPU stays
+mostly idle, so the rule of BENCHMARKS 18 (the smallest pool within the best band) gives 1."""
+GPU_EMBEDDING_POOL = 1
+"""``EMBEDDING_POOL_SIZE`` on the GPU when unset: pools of 1, 2 and 4 within 3 % (BENCHMARKS
+23), so the smallest, as ``GPU_NER_POOL``. Queries keep their reserved slot on top of it."""
+GPU_INJECTION_POOL = 1
+"""``INJECTION_POOL_SIZE`` on the GPU when unset: pools of 1 and 2 within 3 % (BENCHMARKS 23), so
+the smallest. Questions keep their reserved slot on top of it."""
+GPU_INDEX = 0
+"""The GPU the models use when the device is the GPU (multi-GPU is out of scope)."""
 
 CGROUP_CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
 """The cgroup v2 CPU quota of the process's cgroup (``"<quota> <period>"`` or ``"max ..."``)."""
@@ -107,13 +145,39 @@ class ManagedEmbedder(Embedder, Protocol):
     def close(self) -> None: ...
 
 
+class ManagedInjectionDetector(InjectionDetector, Protocol):
+    """An ``InjectionDetector`` holding a loaded model that must be released."""
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceDevice:
+    """Where the in-process models run: ``name`` ("cpu" or "cuda:<index>") and, on a GPU, its
+    name and total memory in MiB (reported in the start-up line)."""
+
+    name: str = CPU
+    gpu_name: str | None = None
+    gpu_memory_mib: int | None = None
+
+    @property
+    def on_gpu(self) -> bool:
+        """The models run on a GPU."""
+        return self.name != CPU
+
+
+CPU_DEVICE = InferenceDevice()
+"""The CPU, the device of every host without a visible GPU."""
+
+
 @dataclass(frozen=True, slots=True)
 class Concurrency:
-    """How much work runs at once, resolved from ``Settings`` and the CPUs (``cpus``).
+    """How much work runs at once, resolved from ``Settings``, the CPUs (``cpus``) and the device.
 
     ``torch_threads`` torch intra-op threads, ``max_concurrent_jobs`` extraction and ingestion
     jobs, ``ner_pool_size`` concurrent recognitions, ``embedding_pool_size`` concurrent passage
-    batches and ``ocr_workers`` Tesseract processes per document.
+    batches, ``ocr_workers`` Tesseract processes per document, ``injection_pool_size``
+    concurrent detector batches and ``device`` where the three models run.
     """
 
     cpus: int
@@ -122,6 +186,8 @@ class Concurrency:
     embedding_pool_size: int
     ocr_workers: int
     torch_threads: int = DEFAULT_TORCH_THREADS
+    injection_pool_size: int = CPU_INJECTION_POOL
+    device: InferenceDevice = CPU_DEVICE
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,11 +201,13 @@ class AdapterFactories:
     embedder: Callable[[E5EmbedderConfig], ManagedEmbedder] = E5Embedder
     store: Callable[[QdrantStoreConfig], ManagedVectorStore] = QdrantVectorStore
     llm: Callable[[LLMClientConfig], ManagedLLMClient] = OpenAICompatibleClient
+    detector: Callable[[InjectionDetectorConfig], ManagedInjectionDetector] = PromptGuardDetector
 
 
 @dataclass(frozen=True, slots=True)
 class AdapterConfigs:
-    """Every adapter configuration derived from ``Settings``; ``llm`` is ``None`` without one."""
+    """Every adapter configuration derived from ``Settings``; ``llm`` is ``None`` without a
+    language model and ``injection`` is ``None`` without a detector model."""
 
     ocr: TesseractOcrConfig
     ner: TransformersNerConfig
@@ -147,6 +215,7 @@ class AdapterConfigs:
     store: QdrantStoreConfig
     llm: LLMClientConfig | None
     chunking: ChunkingConfig
+    injection: InjectionDetectorConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,12 +245,16 @@ _OCR_VARIABLES = {
     "flatten": "OCR_FLATTEN",
     "timeout_s": "OCR_TIMEOUT_S",
     "workers": "OCR_WORKERS",
+    "render_timeout_s": "OCR_RENDER_TIMEOUT_S",
+    "max_image_pixels": "OCR_MAX_IMAGE_PIXELS",
+    "max_page_chars": "MAX_PAGE_CHARS",
     "max_pages": "MAX_PAGES",
 }
 _NER_VARIABLES = {
     "model_path": "NER_MODEL_PATH",
     "threads": "TORCH_THREADS",
     "pool_size": "NER_POOL_SIZE",
+    "device": "DEVICE",
 }
 _EMBEDDER_VARIABLES = {
     "model_path": "EMBEDDING_MODEL_PATH",
@@ -189,6 +262,7 @@ _EMBEDDER_VARIABLES = {
     "batch_size": "EMBEDDING_BATCH_SIZE",
     "threads": "TORCH_THREADS",
     "pool_size": "EMBEDDING_POOL_SIZE",
+    "device": "DEVICE",
 }
 _STORE_VARIABLES = {
     "url": "QDRANT_URL",
@@ -219,6 +293,20 @@ _ASK_VARIABLES = {
     "top_k": "RAG_TOP_K",
     "max_chunks": "RAG_MAX_CHUNKS",
     "max_context_chars": "RAG_MAX_CONTEXT_CHARS",
+    "support_min_share": "RAG_SUPPORT_MIN_SHARE",
+    "max_chunks_per_document": "RAG_MAX_CHUNKS_PER_DOCUMENT",
+    "injection_threshold": "INJECTION_THRESHOLD",
+}
+_INGEST_VARIABLES = {
+    "batch_size": "EMBEDDING_BATCH_SIZE",
+    "injection_threshold": "INJECTION_THRESHOLD",
+}
+_DETECTOR_VARIABLES = {
+    "model_path": "INJECTION_MODEL_PATH",
+    "threads": "TORCH_THREADS",
+    "pool_size": "INJECTION_POOL_SIZE",
+    "batch_size": "EMBEDDING_BATCH_SIZE",
+    "device": "DEVICE",
 }
 
 
@@ -238,6 +326,9 @@ def adapter_configs(settings: Settings, concurrency: Concurrency | None = None) 
                 timeout_s=settings.ocr_timeout_s,
                 workers=sizes.ocr_workers,
                 max_pages=settings.max_pages,
+                render_timeout_s=settings.ocr_render_timeout_s,
+                max_image_pixels=settings.ocr_max_image_pixels,
+                max_page_chars=settings.max_page_chars,
             ),
         ),
         ner=_named(
@@ -246,6 +337,7 @@ def adapter_configs(settings: Settings, concurrency: Concurrency | None = None) 
                 model_path=settings.ner_model_path,
                 threads=sizes.torch_threads,
                 pool_size=sizes.ner_pool_size,
+                device=sizes.device.name,
             ),
             fallback="NER_MODEL_PATH",
         ),
@@ -257,6 +349,7 @@ def adapter_configs(settings: Settings, concurrency: Concurrency | None = None) 
                 batch_size=settings.embedding_batch_size,
                 threads=sizes.torch_threads,
                 pool_size=sizes.embedding_pool_size,
+                device=sizes.device.name,
             ),
             fallback="EMBEDDING_MODEL_PATH",
         ),
@@ -272,6 +365,23 @@ def adapter_configs(settings: Settings, concurrency: Concurrency | None = None) 
                 max_chars=settings.chunk_size, overlap_ratio=settings.chunk_overlap
             ),
         ),
+        injection=_detector_config(settings, sizes),
+    )
+
+
+def _detector_config(settings: Settings, sizes: Concurrency) -> InjectionDetectorConfig | None:
+    if settings.injection_model_path is None:
+        return None
+    return _named(
+        _DETECTOR_VARIABLES,
+        lambda: InjectionDetectorConfig(
+            model_path=settings.injection_model_path or "",
+            threads=sizes.torch_threads,
+            pool_size=sizes.injection_pool_size,
+            batch_size=settings.embedding_batch_size,
+            device=sizes.device.name,
+        ),
+        fallback="INJECTION_MODEL_PATH",
     )
 
 
@@ -312,18 +422,41 @@ def build_container(
             fallback="EMBEDDING_MODEL_PATH",
         )
         closers.insert(0, embedder.close)
+        detector: InjectionDetector = NoDetector()
+        if configs.injection is not None:
+            injection_config = configs.injection
+            loaded = _named(
+                _DETECTOR_VARIABLES,
+                lambda: make.detector(injection_config),
+                fallback="INJECTION_MODEL_PATH",
+            )
+            closers.insert(0, loaded.close)
+            detector = loaded
+        else:
+            _logger.info("injection detection off (INJECTION_MODEL_PATH is unset)")
+        if settings.injection_patterns:
+            detector = CompositeDetector([PatternDetector(), detector])
+            _logger.info("injection patterns on")
+        else:
+            _logger.info("injection patterns off (INJECTION_PATTERNS is false)")
         container = Container(
             extract=_named(
                 {"threshold": "MATCH_THRESHOLD"},
                 lambda: ExtractNames(ocr, recognizer, settings.match_threshold),
             ),
             ingest=_named(
-                {"batch_size": "EMBEDDING_BATCH_SIZE"},
+                _INGEST_VARIABLES,
                 lambda: IngestDocument(
-                    ocr, embedder, store, configs.chunking, settings.embedding_batch_size
+                    ocr,
+                    embedder,
+                    store,
+                    configs.chunking,
+                    settings.embedding_batch_size,
+                    detector=detector,
+                    injection_threshold=settings.injection_threshold,
                 ),
             ),
-            ask=_named(_ASK_VARIABLES, lambda: _ask(settings, embedder, store, llm)),
+            ask=_named(_ASK_VARIABLES, lambda: _ask(settings, embedder, store, llm, detector)),
             readiness=(
                 ("vector_store", _store_check(store)),
                 ("llm", _llm_check(configured=configs.llm is not None)),
@@ -337,43 +470,84 @@ def build_container(
     return container
 
 
-def concurrency_for(cpus: int, torch_threads: int) -> Concurrency:
-    """The concurrency derived for ``cpus`` available CPUs and ``torch_threads``: the rule.
+def resolve_device(
+    choice: DeviceChoice,
+    visible: Callable[[], bool] = gpu_visible,
+    describe: Callable[[int], tuple[str, int]] = gpu_description,
+) -> InferenceDevice:
+    """The device of the ``DEVICE`` setting ``choice``: ``cpu``, ``cuda`` (the first GPU) or
+    ``auto``.
+
+    ``auto`` is the first GPU when ``visible()`` (torch sees a GPU) and the CPU otherwise. On a
+    GPU, ``describe`` gives its name and total memory for the start-up line. Raises
+    ``ConfigurationError`` naming ``DEVICE`` for ``cuda`` without a visible GPU. ``visible`` and
+    ``describe`` replace the torch calls (tests).
+    """
+    if choice == "cpu":
+        return CPU_DEVICE
+    if not visible():
+        if choice == "cuda":
+            raise ConfigurationError("DEVICE: cuda requested but no GPU is visible")
+        return CPU_DEVICE
+    name, memory_mib = describe(GPU_INDEX)
+    return InferenceDevice(f"cuda:{GPU_INDEX}", gpu_name=name, gpu_memory_mib=memory_mib)
+
+
+def concurrency_for(
+    cpus: int, torch_threads: int, device: InferenceDevice = CPU_DEVICE
+) -> Concurrency:
+    """The concurrency derived for ``cpus`` available CPUs, ``torch_threads`` and ``device``.
 
     - jobs: three quarters of the CPUs rounded up, at most ``MAX_DERIVED_JOBS``;
     - NER pool: CPUs / ``torch_threads`` rounded down, at most ``MAX_DERIVED_NER_POOL``;
     - embedder pool: CPUs / (2 x ``torch_threads``) rounded down, at most
       ``MAX_DERIVED_EMBEDDING_POOL``;
+    - detector pool: ``CPU_INJECTION_POOL``;
     - OCR workers: the CPUs, at most ``MAX_DERIVED_OCR_WORKERS``;
 
-    each at least 1. With 2 threads this gives the measured sizing (BENCHMARKS 17.4 and 18):
+    each at least 1. On a GPU the three model pools are instead ``GPU_NER_POOL``,
+    ``GPU_EMBEDDING_POOL`` and ``GPU_INJECTION_POOL``, measured (BENCHMARKS 23, design D3): the
+    forward passes share the one device instead of the CPUs. Jobs
+    and OCR workers keep the CPU rule there, because OCR stays on the CPUs and bounds the jobs.
+    With 2 threads the CPU rule gives the measured sizing (BENCHMARKS 17.4 and 18):
     16 CPUs 12 / 8 / 4 / 4, 8 CPUs 6 / 4 / 2 / 4, 4 CPUs 3 / 2 / 1 / 4. Jobs round up because
     one job too few cost more than one too many where measured (4 CPUs: 2 jobs -22 %, 4 jobs
     -3 %); the pools round down so that a derived pool never exceeds the CPUs (no warning).
     """
     jobs = (3 * cpus + 3) // 4
+    if device.on_gpu:
+        ner_pool, embedding_pool = GPU_NER_POOL, GPU_EMBEDDING_POOL
+        injection_pool = GPU_INJECTION_POOL
+    else:
+        ner_pool = min(cpus // torch_threads, MAX_DERIVED_NER_POOL)
+        embedding_pool = min(cpus // (2 * torch_threads), MAX_DERIVED_EMBEDDING_POOL)
+        injection_pool = CPU_INJECTION_POOL
     return Concurrency(
         cpus=cpus,
         torch_threads=torch_threads,
         max_concurrent_jobs=_at_least_one(min(jobs, MAX_DERIVED_JOBS)),
-        ner_pool_size=_at_least_one(min(cpus // torch_threads, MAX_DERIVED_NER_POOL)),
-        embedding_pool_size=_at_least_one(
-            min(cpus // (2 * torch_threads), MAX_DERIVED_EMBEDDING_POOL)
-        ),
+        ner_pool_size=_at_least_one(ner_pool),
+        embedding_pool_size=_at_least_one(embedding_pool),
         ocr_workers=_at_least_one(min(cpus, MAX_DERIVED_OCR_WORKERS)),
+        injection_pool_size=_at_least_one(injection_pool),
+        device=device,
     )
 
 
-def resolve_concurrency(settings: Settings, cpus: int | None = None) -> Concurrency:
-    """The concurrency in use: each of ``settings``' four values as set, or else derived.
+def resolve_concurrency(
+    settings: Settings, cpus: int | None = None, device: InferenceDevice | None = None
+) -> Concurrency:
+    """The concurrency in use: each of ``settings``' five sizes as set, or else derived.
 
-    Unset values come from ``concurrency_for`` with ``cpus`` (default ``available_cpus()``)
-    and ``TORCH_THREADS`` (unset: ``DEFAULT_TORCH_THREADS``, at most ``cpus``); a set value
-    always wins.
+    Unset values come from ``concurrency_for`` with ``cpus`` (default ``available_cpus()``),
+    ``TORCH_THREADS`` (unset: ``DEFAULT_TORCH_THREADS``, at most ``cpus``) and ``device``
+    (default ``resolve_device(settings.device)``, the one probe of the hardware); a set value
+    always wins. Raises ``ConfigurationError`` when ``DEVICE=cuda`` and no GPU is visible.
     """
     available = available_cpus() if cpus is None else cpus
+    resolved = resolve_device(settings.device) if device is None else device
     threads = _given(settings.torch_threads, min(DEFAULT_TORCH_THREADS, available))
-    derived = concurrency_for(available, threads)
+    derived = concurrency_for(available, threads, resolved)
     return Concurrency(
         cpus=available,
         torch_threads=threads,
@@ -381,6 +555,8 @@ def resolve_concurrency(settings: Settings, cpus: int | None = None) -> Concurre
         ner_pool_size=_given(settings.ner_pool_size, derived.ner_pool_size),
         embedding_pool_size=_given(settings.embedding_pool_size, derived.embedding_pool_size),
         ocr_workers=_given(settings.ocr_workers, derived.ocr_workers),
+        injection_pool_size=_given(settings.injection_pool_size, derived.injection_pool_size),
+        device=resolved,
     )
 
 
@@ -470,6 +646,10 @@ _OVERSUBSCRIBED = {
 
 def _log_concurrency(concurrency: Concurrency) -> None:
     threads = concurrency.torch_threads
+    device = concurrency.device
+    gpu: dict[str, object] = {}
+    if device.on_gpu:
+        gpu = {"gpu_name": device.gpu_name, "gpu_memory_mib": device.gpu_memory_mib}
     _logger.info(
         "concurrency in use",
         extra={
@@ -478,9 +658,14 @@ def _log_concurrency(concurrency: Concurrency) -> None:
             "max_concurrent_jobs": concurrency.max_concurrent_jobs,
             "ner_pool_size": concurrency.ner_pool_size,
             "embedding_pool_size": concurrency.embedding_pool_size,
+            "injection_pool_size": concurrency.injection_pool_size,
             "ocr_workers": concurrency.ocr_workers,
+            "device": device.name,
+            **gpu,
         },
     )
+    if device.on_gpu:  # the pools' forward passes do not compete for the CPUs
+        return
     pools = {
         "NER_POOL_SIZE": concurrency.ner_pool_size,
         "EMBEDDING_POOL_SIZE": concurrency.embedding_pool_size,
@@ -539,7 +724,13 @@ def _llm_config(settings: Settings) -> LLMClientConfig | None:
     )
 
 
-def _ask(settings: Settings, embedder: Embedder, store: VectorStore, llm: LLMClient) -> AskQuestion:
+def _ask(
+    settings: Settings,
+    embedder: Embedder,
+    store: VectorStore,
+    llm: LLMClient,
+    detector: InjectionDetector,
+) -> AskQuestion:
     return AskQuestion(
         embedder,
         store,
@@ -548,6 +739,10 @@ def _ask(settings: Settings, embedder: Embedder, store: VectorStore, llm: LLMCli
         top_k=settings.rag_top_k,
         max_chunks=settings.rag_max_chunks,
         max_context_chars=settings.rag_max_context_chars,
+        detector=detector,
+        injection_threshold=settings.injection_threshold,
+        support_min_share=settings.rag_support_min_share,
+        max_chunks_per_document=settings.rag_max_chunks_per_document,
     )
 
 

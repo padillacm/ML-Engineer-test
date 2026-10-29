@@ -196,7 +196,14 @@ def test_saturated_heavy_requests_are_busy_after_the_wait_and_health_answers_at_
 ) -> None:
     ocr = BlockingOcr()
     fakes.ocr = ocr
-    client = make_client(max_concurrent_jobs=1, busy_wait_s=BUSY_WAIT_S)
+    # One address floods on purpose: the per-client cap and rate are off (test_rate_limit.py
+    # covers them), so every request reaches the job limiter.
+    client = make_client(
+        max_concurrent_jobs=1,
+        busy_wait_s=BUSY_WAIT_S,
+        max_jobs_per_client=0,
+        rate_limit_uploads_per_minute=0,
+    )
     limiter = _limiter(client)
     holder, others = _Calls(), _Calls()
     try:

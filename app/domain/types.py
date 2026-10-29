@@ -106,13 +106,18 @@ class TextSpan:
 
 @dataclass(frozen=True, slots=True)
 class Chunk:
-    """A piece of one page's cleaned text; ``start``/``end`` are offsets into that page text."""
+    """A piece of one page's cleaned text; ``start``/``end`` are offsets into that page text.
+
+    ``flagged`` marks a chunk the injection detector scored at or above the threshold: it is
+    stored with the document but never returned by a search.
+    """
 
     text: str
     page: int
     sequence: int
     start: int
     end: int
+    flagged: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,11 +237,14 @@ class IngestResult:
     ``chunks_stored`` is the number of chunks held for ``document_id`` after the call. When
     ``already_indexed`` is true the file's content was found in the store and nothing was
     recognised, embedded or written, so at least one chunk is stored for it.
+    ``chunks_flagged`` is how many of the chunks written by this call the injection detector
+    flagged (0 when the document was already indexed: nothing was screened).
     """
 
     document_id: str
     chunks_stored: int
     already_indexed: bool
+    chunks_flagged: int = 0
 
     def __post_init__(self) -> None:
         if not self.document_id.strip():
@@ -245,6 +253,10 @@ class IngestResult:
             raise ValueError(f"chunks_stored must be >= 0, got {self.chunks_stored}")
         if self.already_indexed and self.chunks_stored == 0:
             raise ValueError("an already indexed document must have stored chunks")
+        if not 0 <= self.chunks_flagged <= self.chunks_stored:
+            raise ValueError(
+                f"chunks_flagged must be within 0..chunks_stored, got {self.chunks_flagged}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

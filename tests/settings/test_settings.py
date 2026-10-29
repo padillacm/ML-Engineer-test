@@ -7,11 +7,14 @@ import pytest
 from pydantic import ValidationError
 
 from app.adapters.embeddings.config import E5EmbedderConfig
+from app.adapters.injection.config import InjectionDetectorConfig
 from app.adapters.llm.config import LLMClientConfig
 from app.adapters.ner.config import TransformersNerConfig
 from app.adapters.ocr.engine import TesseractOcrConfig
 from app.adapters.vector_store.config import QdrantStoreConfig
 from app.application import ask_question
+from app.bootstrap import CPU_INJECTION_POOL
+from app.domain import guardrails
 from app.domain.chunking import ChunkingConfig
 from app.domain.errors import ConfigurationError
 from app.domain.matching import DEFAULT_THRESHOLD
@@ -51,6 +54,12 @@ CODE_DEFAULTS: list[tuple[str, object]] = [
     ("rag_top_k", ask_question.DEFAULT_TOP_K),
     ("rag_max_chunks", ask_question.DEFAULT_MAX_CHUNKS),
     ("rag_max_context_chars", ask_question.DEFAULT_MAX_CONTEXT_CHARS),
+    ("rag_support_min_share", guardrails.DEFAULT_SUPPORT_MIN_SHARE),
+    ("rag_max_chunks_per_document", guardrails.DEFAULT_MAX_CHUNKS_PER_DOCUMENT),
+    ("injection_threshold", guardrails.DEFAULT_INJECTION_THRESHOLD),
+    ("ocr_render_timeout_s", _default(TesseractOcrConfig, "render_timeout_s")),
+    ("ocr_max_image_pixels", _default(TesseractOcrConfig, "max_image_pixels")),
+    ("max_page_chars", _default(TesseractOcrConfig, "max_page_chars")),
     ("qdrant_collection_prefix", _default(QdrantStoreConfig, "collection_prefix")),
     ("qdrant_timeout_s", _default(QdrantStoreConfig, "timeout_s")),
     ("qdrant_attempts", _default(QdrantStoreConfig, "attempts")),
@@ -75,6 +84,8 @@ AGREED_DEFAULTS: dict[str, object] = {
     "max_concurrent_jobs": None,
     "ner_pool_size": None,
     "embedding_pool_size": None,
+    "injection_pool_size": None,
+    "device": "auto",
     "max_concurrent_questions": 16,
     "busy_wait_s": 10.0,
     "log_exception_messages": False,
@@ -89,6 +100,14 @@ AGREED_DEFAULTS: dict[str, object] = {
     "llm_api_key_file": None,
     "audit_viewer_enabled": True,
     "pdfjs_dir": None,
+    "expose_docs": False,
+    "injection_model_path": None,
+    "injection_patterns": True,
+    "rate_limit_uploads_per_minute": 60,
+    "rate_limit_uploads_burst": 20,
+    "rate_limit_questions_per_minute": 240,
+    "rate_limit_questions_burst": 60,
+    "max_jobs_per_client": 4,
 }
 
 
@@ -812,3 +831,22 @@ def test_an_invalid_audit_viewer_flag_names_the_variable(monkeypatch: pytest.Mon
     monkeypatch.setenv("AUDIT_VIEWER_ENABLED", "perhaps")
 
     assert "AUDIT_VIEWER_ENABLED" in _error()
+
+
+def test_the_cpu_detector_pool_is_the_detector_adapter_default() -> None:
+    """Unset ``INJECTION_POOL_SIZE`` on the CPU takes the detector adapter's default."""
+    assert CPU_INJECTION_POOL == _default(InjectionDetectorConfig, "pool_size") == 2
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize(
+    ("value", "expected"), [("CUDA", "cuda"), (" Auto ", "auto"), ("cpu", "cpu")]
+)
+def test_device_is_read_case_insensitively(value: str, expected: str) -> None:
+    assert load_settings(device=value).device == expected
+
+
+@pytest.mark.usefixtures("required_env")
+def test_an_unknown_device_names_the_variable() -> None:
+    with pytest.raises(ConfigurationError, match="DEVICE"):
+        load_settings(device="tpu")

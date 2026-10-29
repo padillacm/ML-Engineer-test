@@ -1,6 +1,7 @@
 """PDFs built in memory for the OCR adapter tests."""
 
 import re
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -87,6 +88,37 @@ def declare_page_count(pdf: bytes, count: int) -> bytes:
         + b"".join(rows)
         + trailer
         + b"startxref\n%d\n%%%%EOF\n" % len(body)
+    )
+
+
+def cropped_pdf(rotation: int = 0) -> bytes:
+    """Return an A4 page of ``build_pdf`` cropped to 300 x 400 pt at (10, 20), then rotated."""
+    with pymupdf.open(stream=build_pdf([PageSpec(size=A4)]), filetype="pdf") as document:
+        document[0].set_cropbox(pymupdf.Rect(10, 20, 310, 420))
+        document[0].set_rotation(rotation)
+        data: bytes = document.tobytes()
+        return data
+
+
+def inherited_boxes_pdf(rotation: int = 0) -> bytes:
+    """Return one blank page inheriting its MediaBox, CropBox and /Rotate from the page tree."""
+    return page_tree_pdf(
+        [b"<< /Type /Page /Parent 2 0 R >>"],
+        tree_entries=b"/MediaBox [0 0 595 842] /CropBox [50 40 350 540] /Rotate %d" % rotation,
+    )
+
+
+def many_strokes_pdf(strokes: int) -> bytes:
+    """Return one 200 x 200 pt page whose content draws ``strokes`` diagonal lines.
+
+    Every line is its own page object, so PDFium polls its pause callback every hundred of
+    them while drawing; 100,000 strokes draw for seconds at 200 DPI from a 10 KB file.
+    """
+    content = zlib.compress(b"0 0 m 200 200 l S\n" * strokes, 1)
+    stream = b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(content)
+    return page_tree_pdf(
+        [PAGE_DICT.replace(b" >>", b" /Contents 4 0 R >>")],
+        extra=[stream + content + b"\nendstream"],
     )
 
 

@@ -3,12 +3,18 @@
 # Stages:
 #   model - downloads the NER model (Davlan/xlm-roberta-base-ner-hrl) and the embedding model
 #           (intfloat/multilingual-e5-base), each at a pinned revision with sha256-checked files
+#   prompt-guard - downloads the injection detector (meta-llama/Llama-Prompt-Guard-2-86M, gated:
+#           needs the `hf_token` build secret), pinned and checked the same way; built only when
+#           INJECTION_MODEL=1 (the default)
 #   uv    - the uv binaries only (pinned by digest); copied into `test`, mounted while `runtime`
 #           installs, so the runtime image has no uv
 #   pdfjs - downloads the audit viewer's pdf.js (npm pdfjs-dist, pinned with its sha256 in
 #           deploy/pdfjs.lock) and keeps only the files the lock lists
 #   base  - Python 3.12 on Debian 13 (trixie) + Tesseract 5 with eng/spa/por/fra/deu
-#           + both models at /models (read-only; Hugging Face offline mode)
+#           + the models at /models (read-only; Hugging Face offline mode). Chosen by the
+#           INJECTION_MODEL build argument: `base-1` adds the detector and sets
+#           INJECTION_MODEL_PATH, `base-0` has neither (the service then runs with injection
+#           detection off); `base` is the one selected
 #   test    - project + dev dependencies + uv; runs the full pytest suite (incl. `tesseract` tests)
 #   chromium - downloads the Chrome Headless Shell that Playwright pins, checked against its sha256
 #   e2e     - `test` + the `e2e` dependency group (Playwright) + that headless Chromium, for
@@ -20,8 +26,12 @@
 # Build and run the tests:
 #   docker build --target test -t docintel-test .
 #   docker run --rm docintel-test
-# Build the service image (docker compose build does the same):
-#   docker build --target runtime -t docintel .
+# Build the service image (docker compose build does the same, reading HF_TOKEN from .env):
+#   docker build --target runtime --secret id=hf_token,env=HF_TOKEN -t docintel .
+# Without the detector model (no token needed; the service starts with detection off):
+#   docker build --target runtime --build-arg INJECTION_MODEL=0 -t docintel .
+# With the CUDA build of torch (run it with `--gpus all`; compose's `gpu` profile builds this one):
+#   docker build --target runtime --build-arg TORCH_VARIANT=cuda --secret id=hf_token,env=HF_TOKEN -t docintel:cuda .
 
 # python:3.12-slim-trixie, pinned by digest (resolved 2026-10-27). Debian 13 ships Tesseract 5.5,
 # the version the OCR defaults were benchmarked with; bump tag and digest together.
@@ -29,6 +39,19 @@ ARG PYTHON_IMAGE=python:3.12-slim-trixie@sha256:12316debbfb86890f6b2d82582061274
 # Embedding model commit (intfloat/multilingual-e5-base main, resolved 2026-10-27). Global so the
 # `model` stage downloads it and `base` exposes it as EMBEDDING_MODEL_REVISION (model identity).
 ARG E5_MODEL_REVISION=d128750597153bb5987e10b1c3493a34e5a4502a
+# 1: download the Prompt Guard 2 model (needs the `hf_token` build secret) and set
+# INJECTION_MODEL_PATH in the images; 0: skip the `prompt-guard` stage and leave the variable
+# unset, so the service runs with injection detection off. Any other value fails the build.
+ARG INJECTION_MODEL=1
+# huggingface_hub of the download stages, pinned by version only: --require-hashes would need
+# every transitive dependency hashed too, and the downloaded model files are hash-checked anyway.
+ARG HF_HUB_VERSION=2.3.0
+# The torch build of the `test`, `e2e` and `runtime` stages: the pyproject.toml extra of the same
+# name. cpu (default): the PyTorch CPU wheel, no NVIDIA library in the image (checked below).
+# cuda: the CUDA 12.6 wheel, whose nvidia-* dependencies bring the CUDA runtime, so the base image
+# stays python:3.12-slim (no nvidia/cuda image); it needs a GPU at run time (`--gpus all`, or the
+# reservation of compose's `gpu` profile). Any other value fails the build.
+ARG TORCH_VARIANT=cpu
 
 
 # NER model, downloaded at build time so run time never touches the network. Only this stage has
@@ -40,12 +63,13 @@ ARG E5_MODEL_REVISION=d128750597153bb5987e10b1c3493a34e5a4502a
 # The small files are plain git blobs (their "oid" there is a git sha1), so take their sha256 from
 #   https://huggingface.co/Davlan/xlm-roberta-base-ner-hrl/resolve/<sha>/<file>  (| sha256sum)
 # Update the revision and every *_SHA256 ARG below, rebuild and rerun the suite (the `ner_model`
-# tests use the model).
-# huggingface_hub is pinned by version only: --require-hashes would need every transitive
-# dependency hashed too, and the downloaded model files are hash-checked here anyway.
+# tests use the model). scripts/resolve_model_hashes.py prints the ARG lines for a revision:
+#   uv run python scripts/resolve_model_hashes.py Davlan/xlm-roberta-base-ner-hrl <sha> \
+#       --prefix NER_MODEL README.md config.json model.safetensors sentencepiece.bpe.model \
+#       special_tokens_map.json tokenizer_config.json
 FROM ${PYTHON_IMAGE} AS model
 
-ARG HF_HUB_VERSION=2.3.0
+ARG HF_HUB_VERSION
 ARG NER_MODEL_REPO=Davlan/xlm-roberta-base-ner-hrl
 # Commit of the Hub repository's main branch, resolved 2026-10-27.
 ARG NER_MODEL_REVISION=253f557bd8249b8515114cfd7f71974fe5fa4d2f
@@ -195,6 +219,115 @@ PY
 # Read-only for everyone; COPY keeps these modes (owner root), so the app user cannot change it.
 RUN chmod -R a=rX /models
 
+# Prompt injection detector (meta-llama/Llama-Prompt-Guard-2-86M), downloaded like the models
+# above. The repository is gated: the build needs a Hugging Face read token of an account that
+# accepted the Llama 4 Community License, passed as the BuildKit secret `hf_token` (an
+# environment variable of this RUN step only, in no layer, never in the image):
+#   docker build --secret id=hf_token,env=HF_TOKEN ...   (compose: `build.secrets`, from .env)
+# The Hub masks the sha256 of the LFS files of a gated repository in its public tree listing, so
+# to bump the revision run, with HF_TOKEN in the environment:
+#   uv run python scripts/resolve_model_hashes.py meta-llama/Llama-Prompt-Guard-2-86M <sha> \
+#       --prefix PROMPT_GUARD README.md LICENSE USE_POLICY.md config.json model.safetensors \
+#       special_tokens_map.json tokenizer.json tokenizer_config.json
+# and copy its ARG lines here. Only what AutoModelForSequenceClassification + AutoTokenizer load
+# (config, safetensors weights, the fast tokenizer and its two small configs) plus the model
+# card, the licence and the use policy; nothing else of the repository is downloaded.
+# Stage referenced by `base-1` only: with INJECTION_MODEL=0 it is never built.
+FROM ${PYTHON_IMAGE} AS prompt-guard
+
+ARG HF_HUB_VERSION
+ARG PROMPT_GUARD_REPO=meta-llama/Llama-Prompt-Guard-2-86M
+# Commit of the Hub repository's main branch, resolved 2026-10-29.
+ARG PROMPT_GUARD_REVISION=a8ded8e697ce7c355e395a0df51f94adb4a2fd27
+ARG PROMPT_GUARD_CARD_SHA256=5d2a3e0c46397609a784a5034dc823da408aa8b5a414828609f32dc18ee16933
+ARG PROMPT_GUARD_LICENSE_SHA256=73755cee886613ae3135140882289e0a4955d5f0e90f8b1c1ffc962aa9082917
+ARG PROMPT_GUARD_USE_POLICY_SHA256=5ae40fe842b87b5773c47cfd25992a496cc09b17cbb246968762f06352d89270
+ARG PROMPT_GUARD_CONFIG_SHA256=cd54ac39a1f2c3c5146bd5295b34038f8b4d9069e2f844450da014a523bb7653
+ARG PROMPT_GUARD_SAFETENSORS_SHA256=e72017dbbe89c1232dcbc4a74ce0c389db5b468c42afd05850347b2a8c5f6b09
+ARG PROMPT_GUARD_SPECIAL_TOKENS_SHA256=9463f61e1b109a8eb4688b829260d7c6b1e6dff04c98ff7269bb89e2b92369b9
+ARG PROMPT_GUARD_TOKENIZER_SHA256=3e7e96867c2acdd575f0862c74822e05d1d15b93d9d9a4a2144b1ce83ae3339f
+ARG PROMPT_GUARD_TOKENIZER_CONFIG_SHA256=fa09cf22b9d723377f95706967f789ca1a8267e1412385705e1ed51ce0559189
+
+ENV HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN pip install --no-cache-dir "huggingface_hub==${HF_HUB_VERSION}"
+
+# The token is read from the environment of this step only (never printed, never saved: the
+# download passes it explicitly, no `login`), so `docker history` and the image never hold it.
+RUN --mount=type=secret,id=hf_token,env=HF_TOKEN python - <<'PY'
+import hashlib
+import os
+import pathlib
+import shutil
+
+from huggingface_hub import snapshot_download
+
+repo, revision = os.environ["PROMPT_GUARD_REPO"], os.environ["PROMPT_GUARD_REVISION"]
+token = os.environ.get("HF_TOKEN", "").strip()
+if not token:
+    raise SystemExit(
+        f"{repo} is gated: build with --secret id=hf_token,env=HF_TOKEN (docker compose build "
+        "reads HF_TOKEN from .env), or without the detector: --build-arg INJECTION_MODEL=0"
+    )
+expected = {
+    "LICENSE": "PROMPT_GUARD_LICENSE_SHA256",
+    "README.md": "PROMPT_GUARD_CARD_SHA256",
+    "USE_POLICY.md": "PROMPT_GUARD_USE_POLICY_SHA256",
+    "config.json": "PROMPT_GUARD_CONFIG_SHA256",
+    "model.safetensors": "PROMPT_GUARD_SAFETENSORS_SHA256",
+    "special_tokens_map.json": "PROMPT_GUARD_SPECIAL_TOKENS_SHA256",
+    "tokenizer.json": "PROMPT_GUARD_TOKENIZER_SHA256",
+    "tokenizer_config.json": "PROMPT_GUARD_TOKENIZER_CONFIG_SHA256",
+}
+files = sorted(expected)
+target = pathlib.Path("/models/prompt-guard")
+snapshot_download(repo, revision=revision, allow_patterns=files, local_dir=target, token=token)
+del token
+shutil.rmtree(target / ".cache", ignore_errors=True)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+present = sorted(p.name for p in target.iterdir())
+assert present == files, f"unexpected model files: {present}"
+mismatches = []
+for name, env in expected.items():
+    actual, pinned = sha256(target / name), os.environ[env]
+    if actual != pinned:
+        mismatches.append(f"{name}: sha256 {actual} != pinned {env}={pinned}")
+if mismatches:
+    raise SystemExit(
+        "prompt-guard: the downloaded files do not match the pinned hashes (resolve them with "
+        "scripts/resolve_model_hashes.py):\n" + "\n".join(mismatches)
+    )
+(target / "NOTICE").write_text(
+    f"Model: {repo}\n"
+    f"Source: https://huggingface.co/{repo} (revision {revision})\n"
+    "Author: Meta Platforms, Inc. (Llama Prompt Guard 2, 86M parameters; the model card names\n"
+    "mDeBERTa-base (mdeberta-v3, Microsoft, MIT License) as its base model).\n"
+    "Licence: Llama 4 Community License, as declared in the model card README.md; its text is\n"
+    "LICENSE and its acceptable use policy USE_POLICY.md in this directory.\n"
+    "Built with Llama\n"
+    "Llama 4 is licensed under the Llama 4 Community License, Copyright \u00a9 Meta Platforms,\n"
+    "Inc. All Rights Reserved.\n"
+    "The model files in this directory are redistributed unmodified.\n",
+    encoding="utf-8",
+)
+for name in sorted(p.name for p in target.iterdir()):
+    print(name, (target / name).stat().st_size)
+PY
+
+# Read-only for everyone, as for the other models.
+RUN chmod -R a=rX /models
+
 
 # uv 0.12.19 (same version as the host), pinned by digest.
 FROM ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 AS uv
@@ -213,7 +346,7 @@ RUN python -I /build/fetch_pdfjs.py --lock /build/pdfjs.lock --dest /pdfjs \
     && chmod -R a=rX /pdfjs
 
 
-FROM ${PYTHON_IMAGE} AS base
+FROM ${PYTHON_IMAGE} AS base-common
 
 ARG E5_MODEL_REVISION
 
@@ -269,7 +402,34 @@ RUN useradd --create-home --uid 10001 app
 COPY --from=model /models /models
 
 
+# `base` with the injection detector: its files next to the other models (read-only, owner root,
+# as copied) and INJECTION_MODEL_PATH pointing at them, so the service loads it at start-up.
+FROM base-common AS base-1
+
+COPY --from=prompt-guard /models/prompt-guard /models/prompt-guard
+ENV INJECTION_MODEL_PATH=/models/prompt-guard
+
+
+# `base` without it: no detector files and no INJECTION_MODEL_PATH (the setting stays unset, the
+# service logs "injection detection off"). Nothing to add.
+FROM base-common AS base-0
+
+
+# The variant the INJECTION_MODEL build argument names (1 or 0; another value names no stage and
+# the build fails). BuildKit builds only the stages the target depends on, so with 0 the
+# `prompt-guard` stage never runs and no token is needed.
+FROM base-${INJECTION_MODEL} AS base
+
+
 FROM base AS test
+
+ARG TORCH_VARIANT
+# Validated before the first sync, so a wrong value fails fast with its own message.
+RUN case "${TORCH_VARIANT}" in cpu|cuda) ;; \
+      *) echo "TORCH_VARIANT must be cpu or cuda, not '${TORCH_VARIANT}'" >&2; exit 1 ;; esac
+# Kept in the image, so its checks know the variant (tests/deploy/test_torch_variant.py, the
+# smoke `hygiene` service); the service does not read it.
+ENV TORCH_VARIANT=${TORCH_VARIANT}
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -280,12 +440,31 @@ WORKDIR /app
 # (UV_LINK_MODE=copy is required because the mount is a separate filesystem).
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --extra dev --no-install-project
+    uv sync --frozen --extra dev --extra "${TORCH_VARIANT}" --no-install-project
 
 COPY --chown=app:app . .
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --extra dev \
+    uv sync --frozen --extra dev --extra "${TORCH_VARIANT}" \
     && chown app:app /app
+
+# The torch variant, checked after the sync: the CPU image holds no NVIDIA library (no nvidia-*,
+# cuda-* or triton distribution) and a torch without CUDA; the CUDA image a torch built with CUDA
+# (tests/deploy/test_torch_variant.py and the smoke `hygiene` service check it again).
+RUN python -I - <<'PY'
+import importlib.metadata as md
+import os
+
+import torch
+
+variant = os.environ["TORCH_VARIANT"]
+names = sorted({(d.metadata["Name"] or "").lower() for d in md.distributions()})
+gpu = [n for n in names if n.startswith(("nvidia-", "cuda-")) or n == "triton"]
+if variant == "cpu" and (gpu or torch.version.cuda is not None):
+    raise SystemExit(f"CPU image with CUDA: torch {torch.__version__}, packages {gpu}")
+if variant == "cuda" and torch.version.cuda is None:
+    raise SystemExit(f"CUDA image with a CPU torch: {torch.__version__}")
+print(f"torch {torch.__version__} (CUDA {torch.version.cuda}); NVIDIA packages: {len(gpu)}")
+PY
 
 # pdf.js, read-only and owned by root as in `runtime` (COPY keeps the stage's modes). Late in the
 # stage, so a new pin rebuilds only this layer. PDFJS_DIR names it (the service's default for
@@ -380,6 +559,7 @@ PY
 # output directory, writable by it. Neither `test` nor `runtime` contains Playwright or a browser.
 FROM test AS e2e
 
+ARG TORCH_VARIANT
 USER root
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
@@ -388,7 +568,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
 COPY --from=chromium /ms-playwright /ms-playwright
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --extra dev --group e2e \
+    uv sync --frozen --extra dev --extra "${TORCH_VARIANT}" --group e2e \
     && playwright install-deps chromium-headless-shell \
     && rm -rf /var/lib/apt/lists/* \
     && python -I -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); p.chromium.launch(headless=True).close(); p.stop()" \
@@ -404,26 +584,63 @@ CMD ["pytest", "-q", "-rs", "-p", "no:cacheprovider", "-m", "e2e", "tests/e2e"]
 
 FROM base AS runtime
 
+ARG TORCH_VARIANT
+# Validated before the first sync, so a wrong value fails fast with its own message.
+RUN case "${TORCH_VARIANT}" in cpu|cuda) ;; \
+      *) echo "TORCH_VARIANT must be cpu or cuda, not '${TORCH_VARIANT}'" >&2; exit 1 ;; esac
+# Kept in the image, so its checks know the variant (tests/deploy/test_torch_variant.py, the
+# smoke `hygiene` service); the service does not read it.
+ENV TORCH_VARIANT=${TORCH_VARIANT}
+
 WORKDIR /app
 
-# Runtime dependencies only: no `dev` extra (pytest, ruff, mypy, pre-commit, PyMuPDF), no
-# project yet, so this layer is reused while only the source changes. Same cache mount as `test`.
+# Runtime dependencies only: no `dev` extra (pytest, ruff, mypy, pre-commit, PyMuPDF), torch of
+# the TORCH_VARIANT extra, no project yet, so this layer is reused while only the source
+# changes. Same cache mount as `test`.
 # --compile-bytecode: the app user cannot write .pyc files into the root-owned venv (and
 # PYTHONDONTWRITEBYTECODE is set), so without precompiled bytecode every start would recompile
 # torch and transformers in memory. uv is mounted for these two steps only, never copied.
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv     --mount=from=uv,source=/uv,target=/usr/local/bin/uv     uv sync --frozen --no-dev --no-install-project --compile-bytecode
+RUN --mount=type=cache,target=/root/.cache/uv     --mount=from=uv,source=/uv,target=/usr/local/bin/uv     uv sync --frozen --no-dev --extra "${TORCH_VARIANT}" --no-install-project --compile-bytecode
 
 # Only the service code. The build backend (hatchling, `packages = ["app"]`) needs nothing else:
 # pyproject.toml declares no readme or licence file. Code and venv stay owned by root, so the
 # service cannot modify them.
 COPY app/ ./app/
-RUN --mount=type=cache,target=/root/.cache/uv     --mount=from=uv,source=/uv,target=/usr/local/bin/uv     uv sync --frozen --no-dev --compile-bytecode
+RUN --mount=type=cache,target=/root/.cache/uv     --mount=from=uv,source=/uv,target=/usr/local/bin/uv     uv sync --frozen --no-dev --extra "${TORCH_VARIANT}" --compile-bytecode
+
+# The torch variant, checked after the sync: the CPU image holds no NVIDIA library (no nvidia-*,
+# cuda-* or triton distribution) and a torch without CUDA; the CUDA image a torch built with CUDA
+# (tests/deploy/test_torch_variant.py and the smoke `hygiene` service check it again).
+RUN python -I - <<'PY'
+import importlib.metadata as md
+import os
+
+import torch
+
+variant = os.environ["TORCH_VARIANT"]
+names = sorted({(d.metadata["Name"] or "").lower() for d in md.distributions()})
+gpu = [n for n in names if n.startswith(("nvidia-", "cuda-")) or n == "triton"]
+if variant == "cpu" and (gpu or torch.version.cuda is not None):
+    raise SystemExit(f"CPU image with CUDA: torch {torch.__version__}, packages {gpu}")
+if variant == "cuda" and torch.version.cuda is None:
+    raise SystemExit(f"CUDA image with a CPU torch: {torch.__version__}")
+print(f"torch {torch.__version__} (CUDA {torch.version.cuda}); NVIDIA packages: {len(gpu)}")
+PY
 
 # The audit viewer's pdf.js (stage `pdfjs`): read-only, owned by root. Late, so a new pin
 # rebuilds only this layer.
 COPY --from=pdfjs /pdfjs /app/vendor/pdfjs
 ENV PDFJS_DIR=/app/vendor/pdfjs
+
+# The service runs on a read-only root filesystem with /tmp on tmpfs (docker-compose.yml): every
+# path a library may write to points there. TMPDIR for Python's tempfile; HF_HOME for
+# transformers (it writes a cache version marker under the hub cache at import; nothing is
+# downloaded, HF_HUB_OFFLINE is set) and TORCH_HOME for torch's hub cache, instead of the app
+# user's home, which is read-only too.
+ENV TMPDIR=/tmp \
+    HF_HOME=/tmp/huggingface \
+    TORCH_HOME=/tmp/torch
 
 USER app
 
@@ -442,5 +659,11 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 # One worker per container (every worker loads every model, about 2.3 GB RSS; scale by replicas).
 # --http h11: httptools hides a client's disconnect while a pipelined request waits (block 5 P5).
 # --timeout-graceful-shutdown 30: running requests get 30 s after SIGTERM (compose waits longer).
+# --limit-concurrency 64: connections open at once (above MAX_CONCURRENT_JOBS +
+# MAX_CONCURRENT_QUESTIONS + the waiting room); Uvicorn answers 503 beyond it.
+# --timeout-keep-alive 5: an idle keep-alive connection is closed after 5 s, so a client holding
+# connections open cannot keep the limit filled. docker-compose.yml repeats this command.
 # Uvicorn's access log is replaced by the service's own request log (app/observability.py).
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--http", "h11",      "--timeout-graceful-shutdown", "30", "--no-server-header"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--http", "h11", \
+     "--timeout-graceful-shutdown", "30", "--no-server-header", \
+     "--limit-concurrency", "64", "--timeout-keep-alive", "5"]

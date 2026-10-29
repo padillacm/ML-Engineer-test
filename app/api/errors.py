@@ -55,6 +55,7 @@ CATEGORY_BY_CODE: Mapping[str, Category] = MappingProxyType(
         "ocr_failed": Category.PROCESSING_FAILED,
         "ner_failed": Category.PROCESSING_FAILED,
         "embedding_failed": Category.PROCESSING_FAILED,
+        "detector_failed": Category.PROCESSING_FAILED,
         "geometry_error": Category.PROCESSING_FAILED,
         "request_cancelled": Category.PROCESSING_FAILED,
         "llm_unavailable": Category.DEPENDENCY_UNAVAILABLE,
@@ -99,7 +100,7 @@ _INTERNAL_CATEGORY = "internal"
 _RETRY_STATUSES = frozenset({503, 504})
 _FIRST_SERVER_ERROR = 500
 _HTTP_CODES: Mapping[int, str] = MappingProxyType(
-    {404: "not_found", 405: "method_not_allowed", 413: "too_large"}
+    {404: "not_found", 405: "method_not_allowed", 413: "too_large", 429: "rate_limited"}
 )
 
 _logger = logging.getLogger(__name__)

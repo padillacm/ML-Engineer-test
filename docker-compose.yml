@@ -21,6 +21,13 @@
 #     both, so `ollama-pull` also refuses to start when LLM_BASE_URL points elsewhere.
 # Only the app publishes a port, on 127.0.0.1 by default: the service has no authentication, so
 # exposing it beyond this host belongs behind a reverse proxy with TLS and auth.
+# The build downloads the gated Prompt Guard 2 model with HF_TOKEN (.env or the shell) as a
+# build secret, in no layer; INJECTION_MODEL=0 builds without it (detection off).
+# torch: the CPU build by default; with COMPOSE_PROFILES=gpu (or TORCH_VARIANT=cuda) the app is
+# built with the CUDA build and reserves the GPU next to Ollama (docker-compose.torch.yml).
+# The app and Qdrant run with least privilege: read-only root filesystem (scratch on tmpfs and
+# the data volume only), every capability dropped, no privilege escalation, a process-count
+# limit and a memory limit (tests/deploy/test_hardening_smoke.py checks the running containers).
 
 name: docintel
 
@@ -41,15 +48,30 @@ x-app-llm-model: &app-llm-model ${LLM_MODEL:-${COMPOSE_PROFILES:+gemma4:e4b-it-q
 
 services:
   app:
+    # The torch variant: its build argument TORCH_VARIANT and, for cuda, the GPU reservation.
+    # TORCH_VARIANT from .env or the shell, else cuda when COMPOSE_PROFILES is set (the stack's
+    # only profile is `gpu`, as for the model server above), else the default CPU build.
+    extends:
+      file: docker-compose.torch.yml
+      service: torch-${TORCH_VARIANT:-${COMPOSE_PROFILES:+cuda}}
     build:
       context: .
       target: runtime
+      args:
+        INJECTION_MODEL: ${INJECTION_MODEL:-1}
+      # The Hugging Face token of the `prompt-guard` stage, from HF_TOKEN; the empty placeholder
+      # without one, so a build with INJECTION_MODEL=0 needs no token (with 1 it fails, naming
+      # the secret). Same scheme as the keys below.
+      secrets:
+        - source: hf_token${HF_TOKEN:+_from_env}
+          target: hf_token
     image: ${APP_IMAGE:-docintel}
     # Every setting the service reads (tests/deploy/test_compose_wiring.py keeps this list equal
     # to app/settings.py), so nothing else from .env (another token, say) reaches the container.
-    # The model paths and revision and PDFJS_DIR come from the image; QDRANT_URL and the key
-    # files are fixed.
+    # The model paths (INJECTION_MODEL_PATH only in an image built with the detector) and
+    # revision and PDFJS_DIR come from the image; QDRANT_URL and the key files are fixed.
     environment:
+      DEVICE: ${DEVICE:-}
       TORCH_THREADS: ${TORCH_THREADS:-}
       NER_POOL_SIZE: ${NER_POOL_SIZE:-}
       EMBEDDING_POOL_SIZE: ${EMBEDDING_POOL_SIZE:-}
@@ -59,6 +81,9 @@ services:
       OCR_TIMEOUT_S: ${OCR_TIMEOUT_S:-}
       OCR_FLATTEN: ${OCR_FLATTEN:-}
       MAX_PAGES: ${MAX_PAGES:-}
+      OCR_RENDER_TIMEOUT_S: ${OCR_RENDER_TIMEOUT_S:-}
+      OCR_MAX_IMAGE_PIXELS: ${OCR_MAX_IMAGE_PIXELS:-}
+      MAX_PAGE_CHARS: ${MAX_PAGE_CHARS:-}
       MATCH_THRESHOLD: ${MATCH_THRESHOLD:-}
       CHUNK_SIZE: ${CHUNK_SIZE:-}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-}
@@ -66,6 +91,11 @@ services:
       RAG_TOP_K: ${RAG_TOP_K:-}
       RAG_MAX_CHUNKS: ${RAG_MAX_CHUNKS:-}
       RAG_MAX_CONTEXT_CHARS: ${RAG_MAX_CONTEXT_CHARS:-}
+      RAG_SUPPORT_MIN_SHARE: ${RAG_SUPPORT_MIN_SHARE:-}
+      RAG_MAX_CHUNKS_PER_DOCUMENT: ${RAG_MAX_CHUNKS_PER_DOCUMENT:-}
+      INJECTION_THRESHOLD: ${INJECTION_THRESHOLD:-}
+      INJECTION_POOL_SIZE: ${INJECTION_POOL_SIZE:-}
+      INJECTION_PATTERNS: ${INJECTION_PATTERNS:-}
       QDRANT_URL: http://qdrant:6333
       QDRANT_API_KEY_FILE: /run/secrets/qdrant_api_key
       QDRANT_COLLECTION_PREFIX: ${QDRANT_COLLECTION_PREFIX:-}
@@ -85,6 +115,11 @@ services:
       LLM_SEND_TEMPERATURE: ${LLM_SEND_TEMPERATURE:-}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-}
       MAX_NAMES: ${MAX_NAMES:-}
+      RATE_LIMIT_UPLOADS_PER_MINUTE: ${RATE_LIMIT_UPLOADS_PER_MINUTE:-}
+      RATE_LIMIT_UPLOADS_BURST: ${RATE_LIMIT_UPLOADS_BURST:-}
+      RATE_LIMIT_QUESTIONS_PER_MINUTE: ${RATE_LIMIT_QUESTIONS_PER_MINUTE:-}
+      RATE_LIMIT_QUESTIONS_BURST: ${RATE_LIMIT_QUESTIONS_BURST:-}
+      MAX_JOBS_PER_CLIENT: ${MAX_JOBS_PER_CLIENT:-}
       MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-}
       MAX_CONCURRENT_QUESTIONS: ${MAX_CONCURRENT_QUESTIONS:-}
       BUSY_WAIT_S: ${BUSY_WAIT_S:-}
@@ -93,6 +128,7 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-}
       LOG_EXCEPTION_MESSAGES: ${LOG_EXCEPTION_MESSAGES:-}
       AUDIT_VIEWER_ENABLED: ${AUDIT_VIEWER_ENABLED:-}
+      EXPOSE_DOCS: ${EXPOSE_DOCS:-}
       # Not a setting: read by the start command below.
       OLLAMA_URL: *ollama-url
     # The keys (from .env or the shell) as files under /run/secrets. Compose refuses to create a
@@ -116,9 +152,31 @@ services:
             export LLM_REASONING_EFFORT="$${LLM_REASONING_EFFORT:-none}" ;;
         esac
         exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --http h11 \
-          --timeout-graceful-shutdown 30 --no-server-header
+          --timeout-graceful-shutdown 30 --no-server-header \
+          --limit-concurrency 64 --timeout-keep-alive 5
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8000}:8000"
+    # Least privilege. The code, venv and models are root-owned already; with a read-only root
+    # the service can write only to /tmp (tmpfs, 1 GiB: Tesseract and the page images are in
+    # memory, TMPDIR and the library caches point there, see the Dockerfile). No capability is
+    # needed (port 8000, uid 10001) and no binary may gain any. pids: jobs x OCR workers x
+    # Tesseract processes plus the thread pools, with margin. Memory: about 2.3 GB RSS loaded
+    # plus the pages in flight (docs/BENCHMARKS.md sizing table); the kernel kills the container
+    # instead of the host swapping.
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # (Compose keeps `pids_limit` and `deploy.resources.limits.pids` in step and refuses the
+    # short key next to other limits, so both limits sit here; honoured without swarm.) The CUDA
+    # variant adds `reservations.devices` (the GPU) from docker-compose.torch.yml.
+    deploy:
+      resources:
+        limits:
+          pids: 512
+          memory: 8g
     networks:
       - backend
       - egress
@@ -161,6 +219,7 @@ services:
     image: qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
     environment:
       QDRANT__TELEMETRY_DISABLED: "true"
+      QDRANT_INIT_FILE_PATH: /tmp/.qdrant-initialized
     # With QDRANT_API_KEY set, Qdrant requires it (the app sends it): the image's start command
     # runs with the key from the secret file in its environment, which `docker inspect` does not
     # show. Health endpoints (the healthcheck below) need no key.
@@ -177,6 +236,23 @@ services:
         exec ./entrypoint.sh
     volumes:
       - qdrant_data:/qdrant/storage
+    # Least privilege, as for the app. Qdrant writes to its storage (the volume), creates a
+    # scratch directory under its snapshots path at start (tmpfs; snapshots are not used, and
+    # tmpfs pages count against the memory limit) and touches an init marker, pointed at /tmp so
+    # it survives the restart its entrypoint does after an OOM kill within the container, as it
+    # did on the container's own filesystem.
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /qdrant/snapshots:size=256m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          pids: 512
+          memory: 2g
     networks:
       - backend
     healthcheck:
@@ -314,4 +390,10 @@ secrets:
   qdrant_api_key_from_env:
     environment: QDRANT_API_KEY
   qdrant_api_key:
+    file: ./deploy/empty-secret
+  # The Hugging Face token of the app's build (the `prompt-guard` stage), HF_TOKEN; the same
+  # empty file without one.
+  hf_token_from_env:
+    environment: HF_TOKEN
+  hf_token:
     file: ./deploy/empty-secret

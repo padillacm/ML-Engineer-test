@@ -80,7 +80,8 @@ def test_uploads_are_released_after_many_requests(
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     monkeypatch.setattr(formparsers, "SpooledTemporaryFile", TrackedSpool)
     TrackedSpool.created = []
-    client = make_client(max_upload_mb=2)
+    # Hundreds of uploads from one address: the upload rate limit is off for this test.
+    client = make_client(max_upload_mb=2, rate_limit_uploads_per_minute=0)
     _send(client, 2)  # warm up: lazy imports and pools open their descriptors once
     gc.collect()
     fds_before = _open_fds()

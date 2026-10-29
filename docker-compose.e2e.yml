@@ -40,6 +40,12 @@ services:
     build:
       context: .
       target: e2e
+      # The detector model, as for the test image (docker-compose.test.yml explains).
+      args:
+        INJECTION_MODEL: ${INJECTION_MODEL:-1}
+      secrets:
+        - source: hf_token${HF_TOKEN:+_from_env}
+          target: hf_token
     image: ${TEST_IMAGE:-docintel-test}-e2e
     environment:
       VIEWER_URL: http://docintel-app:8000/audit
@@ -67,3 +73,11 @@ services:
 
 volumes:
   e2e_artifacts:
+
+secrets:
+  # The Hugging Face token of the e2e image's build, HF_TOKEN from .env or the shell, or the
+  # empty placeholder without one (docker-compose.yml explains the scheme).
+  hf_token_from_env:
+    environment: HF_TOKEN
+  hf_token:
+    file: ./deploy/empty-secret

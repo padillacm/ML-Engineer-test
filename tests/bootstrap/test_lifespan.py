@@ -189,6 +189,8 @@ def test_start_up_logs_one_line_without_secrets(
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line]
     assert [line["message"] for line in lines] == [
         "concurrency in use",
+        "injection detection off (INJECTION_MODEL_PATH is unset)",
+        "injection patterns on",
         "service started (language model configured)",
         "service stopped",
     ]

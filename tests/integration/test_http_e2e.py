@@ -57,7 +57,7 @@ PRESENT = {
 ABSENT = ("Zebulon", "Quackenbush")
 MIN_MATCH_SCORE = 0.9
 
-SCRIPTED_REPLY = "Robert Chen (scripted reply)."
+SCRIPTED_REPLY = "Robert Chen."  # only context tokens: the support check keeps it
 ANSWER_THRESHOLD = 0.70  # as in test_rag_e2e: no razor-thin margin for the answerable question
 MEMO_QUESTION = "Who was promoted to Vice President of Engineering?"
 OFF_TOPIC_QUESTION = "What is the boiling point of mercury on Venus?"

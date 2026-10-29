@@ -7,7 +7,9 @@ from tests.api.support import PDF, Fakes, names_json
 from tests.fakes.llm import FakeLLMClient
 
 QUESTION = "Who signed the contract before the notary in Madrid?"
-ANSWER = "Signed by the notary Ximena Quintanilla."
+# Every content token of the answer is in the ingested text: the support check (D9) would refuse
+# a name the context does not hold, which is the point of that check, not of this test.
+ANSWER = "Signed before the notary in Madrid by Quintanilla."
 FORBIDDEN = (
     "María",
     "Maria",

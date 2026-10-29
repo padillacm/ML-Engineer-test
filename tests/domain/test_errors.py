@@ -101,6 +101,7 @@ def test_registry_is_closed_and_snake_case() -> None:
         "ocr_failed",
         "ner_failed",
         "embedding_failed",
+        "detector_failed",
         "llm_unavailable",
         "llm_timeout",
         "vector_store_unavailable",

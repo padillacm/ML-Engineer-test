@@ -29,3 +29,6 @@ benchmarks/
 .DS_Store
 .idea/
 .vscode/
+
+# The host CUDA environment for the `cuda`-marked tests (UV_PROJECT_ENVIRONMENT=.venv-cuda)
+.venv-cuda/

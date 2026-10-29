@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.adapters.device import is_device_name
 from app.domain.errors import ConfigurationError
 
 _CONFIG_FILE = "config.json"
@@ -33,7 +34,10 @@ class E5EmbedderConfig:
     batch uses ``threads`` intra-op threads, so up to ``pool_size`` x ``threads`` CPUs are busy.
     The default 4 is the smallest pool within 5 % of the best ingestion throughput on 16 CPUs
     with 2 threads (BENCHMARKS 18); the service derives the size from the CPUs when
-    ``EMBEDDING_POOL_SIZE`` is unset. Invalid values raise ``ConfigurationError``.
+    ``EMBEDDING_POOL_SIZE`` is unset. ``device`` is where the model runs, ``"cpu"`` or
+    ``"cuda[:<index>]"`` (in half precision there, with pooling and normalisation in full
+    precision; ``app.adapters.device``); the service resolves the ``DEVICE`` setting into it.
+    Invalid values raise ``ConfigurationError``.
     """
 
     model_path: str | Path
@@ -43,6 +47,7 @@ class E5EmbedderConfig:
     threads: int = 2
     max_chars: int = 50_000
     pool_size: int = 4
+    device: str = "cpu"
 
     def __post_init__(self) -> None:
         _require(
@@ -56,6 +61,7 @@ class E5EmbedderConfig:
         _require(_is_positive_int(self.threads), "threads must be a positive integer")
         _require(_is_positive_int(self.max_chars), "max_chars must be a positive integer")
         _require(_is_positive_int(self.pool_size), "pool_size must be a positive integer")
+        _require(is_device_name(self.device), "device must be 'cpu', 'cuda' or 'cuda:<index>'")
         _validate_model_directory(self.path)
 
     @property

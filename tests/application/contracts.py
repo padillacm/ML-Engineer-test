@@ -475,6 +475,80 @@ class VectorStoreContract:
         assert [hit.document_id for hit in ready.search(one_hot(384, 0), top_k=10)] == ["doc-b"]
         assert ready.count() == 1
 
+    # --- flagged chunks (D6): stored and counted like any other, never returned by a search ---
+
+    def test_a_flagged_best_match_is_never_returned(self, ready: VectorStore) -> None:
+        close = [0.0] * 384
+        close[0], close[1] = 1.0, 1.0
+        chunks = [
+            Chunk("injected", 0, 0, 0, 8, flagged=True),
+            Chunk("close", 0, 1, 9, 14),
+            Chunk("far", 0, 2, 15, 18),
+        ]
+        upsert(ready, "doc", chunks, [one_hot(384, 0), close, one_hot(384, 7)])
+
+        best = ready.search(one_hot(384, 0), top_k=1)
+        every = ready.search(one_hot(384, 0), top_k=10)
+
+        assert [hit.text for hit in best] == ["close"]
+        assert [hit.text for hit in every] == ["close", "far"]
+        assert every[0].score == pytest.approx(math.sqrt(0.5))
+
+    def test_a_document_of_flagged_chunks_only_is_searched_as_empty(
+        self, ready: VectorStore
+    ) -> None:
+        chunks = [Chunk("one", 0, 0, 0, 3, flagged=True), Chunk("two", 0, 1, 4, 7, flagged=True)]
+        upsert(ready, "doc", chunks, [one_hot(384, 0), one_hot(384, 1)])
+
+        assert ready.search(one_hot(384, 0), top_k=10) == []
+        assert ready.count() == 2
+        assert ready.document_chunk_count("doc") == 2
+
+    @pytest.fixture
+    def flagged_document(self, ready: VectorStore) -> list[Chunk]:
+        """``doc``: 10 chunks, the ones with sequence 3 and 7 flagged."""
+        chunks = [Chunk(f"chunk {i}", 0, i, 0, 7, flagged=i in {3, 7}) for i in range(10)]
+        upsert(ready, "doc", chunks, [one_hot(384, i) for i in range(10)])
+        return chunks
+
+    def test_chunk_count_includes_flagged_chunks(
+        self, ready: VectorStore, flagged_document: list[Chunk]
+    ) -> None:
+        assert ready.document_chunk_count("doc") == 10
+        assert ready.count() == 10
+        texts = {hit.text for hit in ready.search(one_hot(384, 3), top_k=20)}
+        assert texts == {f"chunk {i}" for i in range(10) if i not in {3, 7}}
+
+    def test_deleting_a_document_removes_its_flagged_chunks(
+        self, ready: VectorStore, flagged_document: list[Chunk]
+    ) -> None:
+        ready.delete_document("doc")
+
+        assert ready.count() == 0
+        assert ready.document_chunk_count("doc") == 0
+
+    def test_a_document_missing_a_flagged_chunk_is_incomplete_and_repairable(
+        self, ready: VectorStore, flagged_document: list[Chunk]
+    ) -> None:
+        self.drop_chunk(ready, "doc", 3)
+        assert ready.document_chunk_count("doc") == 0
+
+        upsert(ready, "doc", flagged_document, [one_hot(384, i) for i in range(10)])
+
+        assert ready.document_chunk_count("doc") == 10
+        assert ready.count() == 10
+        assert [hit.text for hit in ready.search(one_hot(384, 3), top_k=1)] != ["chunk 3"]
+
+    def test_rewriting_a_document_unflagged_makes_its_chunks_searchable_again(
+        self, ready: VectorStore, flagged_document: list[Chunk]
+    ) -> None:
+        cleared = [dataclasses.replace(chunk, flagged=False) for chunk in flagged_document]
+
+        upsert(ready, "doc", cleared, [one_hot(384, i) for i in range(10)])
+
+        assert [hit.text for hit in ready.search(one_hot(384, 3), top_k=1)] == ["chunk 3"]
+        assert ready.count() == 10
+
     def test_hits_carry_the_page_text_of_their_chunk(self, ready: VectorStore) -> None:
         chunks = [Chunk("first half", 0, 0, 0, 10), Chunk("other page", 1, 1, 0, 10)]
         page_texts = {0: "first half and second half", 1: "other page text", 2: "unused page"}

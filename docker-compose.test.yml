@@ -8,6 +8,9 @@
 # no route out, so the tests cannot reach the internet either.
 # TEST_IMAGE names the built image (default docintel-test); give each parallel compose project
 # its own, e.g. TEST_IMAGE=docintel-test-ci docker compose -p ci -f docker-compose.test.yml ...
+# TORCH_VARIANT=cuda builds the test image with the CUDA build of torch and reserves the GPU
+# for the run (docker-compose.torch.yml), for the `cuda`-marked tests; give it its own image:
+#   TORCH_VARIANT=cuda TEST_IMAGE=docintel-test-cuda docker compose -f docker-compose.test.yml #     run --rm tests pytest -q -m cuda
 
 services:
   qdrant:
@@ -40,9 +43,20 @@ services:
       start_period: 5s
 
   tests:
+    # The torch variant (default cpu): build argument and, for cuda, the GPU reservation.
+    extends:
+      file: docker-compose.torch.yml
+      service: torch-${TORCH_VARIANT:-cpu}
     build:
       context: .
       target: test
+      # The detector model, as for the app's build in docker-compose.yml (the test image carries
+      # it too; the `injection_model` tests need it). INJECTION_MODEL=0 builds without it.
+      args:
+        INJECTION_MODEL: ${INJECTION_MODEL:-1}
+      secrets:
+        - source: hf_token${HF_TOKEN:+_from_env}
+          target: hf_token
     image: ${TEST_IMAGE:-docintel-test}
     environment:
       QDRANT_URL: http://qdrant:6333
@@ -56,3 +70,11 @@ services:
 networks:
   internal:
     internal: true
+
+secrets:
+  # The Hugging Face token of the test image's build, HF_TOKEN from .env or the shell, or the
+  # empty placeholder without one (docker-compose.yml explains the scheme).
+  hf_token_from_env:
+    environment: HF_TOKEN
+  hf_token:
+    file: ./deploy/empty-secret
