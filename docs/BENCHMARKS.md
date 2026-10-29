@@ -23,6 +23,10 @@ Environment recorded in the sources (details per section): Windows 11 (10.0.2263
 13. HTTP edge (`add-http-api`): parity, overhead, concurrency, resources, start-up
 14. NER pipeline pool (task 10.1)
 15. Concurrency with the NER pool (tasks 10.1 and 10.7): job limit, pool size, 50-page documents, resources
+16. Language model choice (`add-deployment` tasks 5.1 and 5.2): candidates, context length, answer quality, thinking mode, audit, concurrency, hosted reference
+17. Deployed stack (`add-deployment` task 6.1): image sizes, extract and ingest throughput with CPU limits, sizing, questions, cold start, parity, smoke suite
+18. Embedder pool and concurrency derived from the CPUs (`add-deployment` task 6.2): identical vectors, pool size, questions during ingestion, ingestion through HTTP under CPU quotas, the rule, FIFO hand-off of the NER and embedder slots
+19. Deployed stack after task 6.2 and the FIFO hand-off (`add-deployment` task 6.3): derived defaults at 16, 8 and 4 CPUs, questions during ingestion, cold start with `start_interval`, parity, smoke suite
 
 ---
 
@@ -756,12 +760,19 @@ Sensitivity (scenario A)
 | Embedder | `intfloat/multilingual-e5-base` (`query: ` / `passage: ` prefixes, mean pooling, fp32 on CPU) | 6.1 (public nDCG@10 mean 79.3, CPU 106.2 / 356.2 ms), 6.2 (corpus) | ans R@5 64.4 (62.7-66.2) at `s800_o12`; +5.1 [+3.9, +6.2] over e5-small; arctic-m-v2 is -3.9 [-5.1, -2.8] below it on same-language questions and +4.7 [+1.8, +7.5] above it on cross-lingual ones; e5-base needs no remote code |
 | Chunking | 800 characters, 12 % overlap (96 characters), word-safe, never crossing a page; retrieve chunks, pass the parent page to the LLM | 7 (sweep, paired, parent-page table) | k = 3 chunks + parent pages: 81.4 (79.9-82.9) at 4,798 characters vs 72.2 for whole-page chunks at 5,211 |
 | Refusal threshold | top-1 cosine < 0.808 -> refuse | 8 (e5-base `global`, `s800_o12`) | keeps 95.0 % of answerable, refuses 48.3 % of unanswerable (66.0 % without cross-document items) |
-| `MAX_CONCURRENT_JOBS` | **12** (applied), one process, 16 logical CPUs | 15.2 (D7 rule: smallest limit within 5 % of the best throughput); before the NER pool: 8 (13.2) | with the NER pool, 75-request runs (two passes or more each): 87.9 docs/min at 12 / pool 4 and 91.2 at 12 / pool 8, against 78.9 at 8 (-13.5 % of the best, 91.2); 16 and 24 are no faster (88.6-89.3; 87.1 on the short set); host-specific, re-measure on the target hardware |
-| `NER_POOL_SIZE` (`TORCH_THREADS` 2) | **8** (applied) | 14 (NER alone: identical spans, +70 MB), 15.2, 15.3 and 15.6 (D7 rule over both workloads) | short documents: pools 4 and 8 within 4 % of each other (87.9 and 91.2 docs/min at 12 jobs, run-to-run spread 1-3 %); 50-page documents at 12 jobs: 24 documents in 342-345 s with 8 against 367-370 s with 4 (pool 4 is 7 % slower, outside the 5 % band); under mixed load short-document p95 15 s against 27-33 s; server peak +40-90 MB |
+| `MAX_CONCURRENT_JOBS` | **12** on 16 logical CPUs, one process (derived from the CPUs when unset since task 6.2, 18.5) | 15.2 (D7 rule: smallest limit within 5 % of the best throughput); before the NER pool: 8 (13.2) | with the NER pool, 75-request runs (two passes or more each): 87.9 docs/min at 12 / pool 4 and 91.2 at 12 / pool 8, against 78.9 at 8 (-13.5 % of the best, 91.2); 16 and 24 are no faster (88.6-89.3; 87.1 on the short set); host-specific, re-measure on the target hardware |
+| `NER_POOL_SIZE` (`TORCH_THREADS` 2) | **8** on 16 CPUs (derived when unset, 18.5); free pipelines go to waiting calls in arrival order (18.6) | 14 (NER alone: identical spans, +70 MB), 15.2, 15.3 and 15.6 (D7 rule over both workloads) | short documents: pools 4 and 8 within 4 % of each other (87.9 and 91.2 docs/min at 12 jobs, run-to-run spread 1-3 %); 50-page documents at 12 jobs: 24 documents in 342-345 s with 8 against 367-370 s with 4 (pool 4 is 7 % slower, outside the 5 % band); under mixed load short-document p95 15 s against 27-33 s; server peak +40-90 MB |
+| `MAX_CONCURRENT_JOBS` / `NER_POOL_SIZE` on fewer CPUs | derived when unset since task 6.2 (18.5), following the sizing table (16 CPUs 12 / 8, 8 CPUs 6 / 4, 4 CPUs 3 / 2) | 17.3, 17.4 (deployed runtime image, `cpus:` quota), 19.2 (derived, deployed) | defaults confirmed on 16 CPUs (85.3 docs/min, test-image control 85.4); with `cpus: 8` the former fixed defaults logged the oversubscription warning and gave 54.0 docs/min against 61.4 for 6 / 4; with `cpus: 4` 27.9 against 37.5 for 3 / 2; derived and unset (19.2): 84.0 / 62.0 / 37.3 docs/min extraction at 16 / 8 / 4 CPUs, no warning |
+| `EMBEDDING_POOL_SIZE` (`TORCH_THREADS` 2) | derived when unset: CPUs / (2 x `TORCH_THREADS`), at most 4 (**4** on 16 CPUs); one copy of the model, one more slot reserved for queries, which also go before waiting passages; queries and passages each served in arrival order (18.6) | 18.1-18.5 (D7 rule on `/api/ingest` docs/min) | vectors bit-identical to a pool of 1 (780 / 780 calls); 16 CPUs: 86.3 docs/min at pool 4 against 45.8 for the former single embedder, 70.4 for pool 2 and 84.2-85.3 for 6 and 8; deployed with the derived pools (19.2): 90.7 / 65.9 / 38.1 docs/min ingestion at 16 / 8 / 4 CPUs against 50.9 / 49.8 / 39.2 before the pool (17.3); 8 CPUs: pool 2 63.8 (pool 1 47.7, pool 4 62.4); 4 CPUs: pool 1 37.1 (pool 2 37.3); a question during ingestion embeds in 53-81 ms with the reserved slot against 0.3-1.2 s (p50) with priority alone, and is starved without priority; +110 MB after warm-up at pool 4 |
+| Derived concurrency (`MAX_CONCURRENT_JOBS`, `NER_POOL_SIZE`, `EMBEDDING_POOL_SIZE`, `OCR_WORKERS` unset) | `concurrency_for(cpus, T)` in `app/bootstrap.py`: jobs = 3/4 of the CPUs rounded up, at most 12; NER pool = CPUs / T, at most 8; embedder pool = CPUs / (2 T), at most 4; OCR workers = CPUs, at most 4; each at least 1; CPUs = affinity lowered to the cgroup v2 quota; a set value wins; logged once at start-up (`concurrency in use`) | 17.3, 17.4, 18.5, 19.1-19.2 | 16 CPUs 12 / 8 / 4 / 4, 8 CPUs 6 / 4 / 2 / 4, 4 CPUs 3 / 2 / 1 / 4 (the measured points; other counts follow the rule, 18.5 table), read from the deployed stack's `concurrency in use` line at all three (19.1); no derived pool logs the oversubscription warning |
+| `OCR_WORKERS` | derived when unset: min(4, CPUs available), the quota included (formerly the adapter's min(4, `os.cpu_count()`), which ignores a quota) | 15.2, 17.3, 18.5 | 3, 4 and 5 workers within the run-to-run spread on 16 CPUs (15.2); 4 was used at the 8- and 4-CPU quotas of 17.3 and 18.4 (the container sees 16 CPUs), which the rule keeps; fewer than 4 CPUs not measured |
 | `BUSY_WAIT_S` | 10 s (unchanged; re-derived with the pool) | 13.2, 15.2 (derived from measured latency, not an optimum) | before the pool: one loaded job at limit 8 (p50 10.1 s, 13.2); with the pool at the recommended 12 jobs: a job holds its slot 7.4-7.7 s on average and p50 latency at 16 clients is 9.6-10.8 s, so 10 s is still about one loaded job; a 50-page job holds a slot 47-347 s, so a burst of long documents is shed after 10 s (intended; clients retry after `Retry-After`) |
 | `TORCH_THREADS` | 2 (one process-wide value for the recogniser and the embedder) | 3 and 6 (CPU latency; both models were benchmarked at 2 threads), 14.2 (NER alone: threads 1 vs 2) | NER alone 65.7 docs/min at 2 threads vs 34.7 at 1 (pool 1); the former `NER_THREADS` / `EMBEDDING_THREADS` were merged because torch threads are process-wide (15.2 note); above 2 not measured end to end |
 | `MALLOC_ARENA_MAX` | 2 (Dockerfile) | 13.3, 15.5 (resources, 200 mixed requests per round) | RSS flat after round 1 (2,454-2,462 MB) instead of growing 16-520 MB per round, about 840 MB lower, at the same throughput (91.1-92.1 docs/min) |
-| `MAX_CONCURRENT_QUESTIONS` | 16 | not measured (judgement) | a question costs about 20 ms of embedding plus the language model's wait (I/O); 16 bounds threads and model calls while a slow model answers; to be measured with the real model in block 6 |
+| `MAX_CONCURRENT_QUESTIONS` | 16 (unchanged) | 16.7 (proxy, test image), 17.5 (deployed stack, `gpu` profile, e4b), 19.3 | 16 clients: 123-125 questions/min (16.7) and 128-136 on the deployed stack, p95 9.6-9.7 s, maximum 12.2 s, every request 200; a question costs about 50 ms of embedding plus the model's wait (I/O); during a 16-client ingestion load 0.2-0.5 s of embedding at 16 CPUs (client p95 2.3 s) and 78-174 ms at 8 (19.3) |
+| `LLM_READ_TIMEOUT_S` / `LLM_TOTAL_TIMEOUT_S` | 60 s / 90 s (unchanged) | 16.7, 17.5, 17.6, 19.4 | loaded maximum of a question 12.2 s at 16 clients (a fifth of 60 s); first question after a start 0.9-1.4 s (0.93-1.20 s in 19.4), including a first-ever start, thanks to the `ollama-pull` warm-up and `OLLAMA_KEEP_ALIVE=-1` (65 s without them, 16.7) |
+| Ollama serving (`gpu` profile) | `OLLAMA_NUM_PARALLEL` 2, `OLLAMA_KEEP_ALIVE` -1, `OLLAMA_CONTEXT_LENGTH` 8192, `OLLAMA_MAX_LOADED_MODELS` 1, warm-up prompt in `ollama-pull`, CUDA kernel cache in the volume | 16.3, 16.7 (choice), 17.5, 17.6 (confirmed deployed), 19.4 | read from the running stack; 128-136 questions/min at 16 clients, VRAM 5.9-6.5 GB device total; start with fresh containers 15.8-19.4 s with `start_interval` (19.7-23.4 s before), first-ever start 85 s |
+| Compose healthchecks (Qdrant, Ollama) | `interval: 5s`, `start_interval: 1s` during a 30 s `start_period` | 17.6, 19.4 | the app starts 1.7 s after Qdrant instead of 5.7 s; a start without a model 13.4-13.6 s instead of 17.4-20.1 s; Ollama healthy 2.8-3.5 s after its start instead of 5.9-6.1 s |
 | `READINESS_TIMEOUT_S` | 2 s (at most 30) | not measured (judgement) | a healthy store answers its ping in milliseconds; 2 s is below the 3 s compose healthcheck timeout; the review measured a hung store's ping cut from 10.0 s to 2.0 s |
 | Drain after an early 413 | up to 1 MiB over the route limit, at most 5 s | `add-http-api` 10.4 (`tests/api/test_uvicorn_edge.py`) | 900 KiB over: the client reads the 413 (reset without the drain); 5 s is nginx's `lingering_timeout`; far-over bodies are closed after about 1 MiB |
 | Body limits | uploads `MAX_UPLOAD_MB` + 1 MiB + 64 KiB; other routes 64 KiB | `add-http-api` 10.6 and review finding 2 | 1 MiB is the multipart parser's per-field limit (no accepted `names` field is cut); a 2,000-character question fully escaped is about 24 KB |
@@ -1082,3 +1093,660 @@ D7's rule, the smallest setting within 5 % of the best throughput, applied to bo
 **Applied: `MAX_CONCURRENT_JOBS` = 12, `NER_POOL_SIZE` = 8, `TORCH_THREADS` = 2 (the former `NER_THREADS` = `EMBEDDING_THREADS` = 2), `OCR_WORKERS` unset (min(4, CPUs) = 4, unchanged), `BUSY_WAIT_S` = 10 s (unchanged).** If the traffic is short documents only, pool 4 is equivalent (within 1-4 %) and saves the extra pipelines' memory (+100-250 MB for NER alone in section 14; not visible in the server peaks here). `BUSY_WAIT_S`, by the reasoning of 13.2 (about one loaded job's duration): at J 12 a job holds its slot 7.4-7.7 s on average and a request at 16 clients waits and runs 9.6-10.8 s (p50), so 10 s is still about one loaded job; with jobs finishing at staggered times a slot frees about every 7.5 s / 12 = 0.6 s, so about 16 queued requests are admitted before the service sheds load; a served short request completes within about 18 s (p95 at 24 clients), under common 30 s proxy timeouts. 50-page jobs hold a slot 47-347 s, so a burst of long documents is shed after 10 s, the intended behaviour (clients retry after `Retry-After`). **Expected envelope** at these settings on this host: 88-92 short docs/min per process; in the throughput runs the server peaks at 2.2-2.3 GB and server + Tesseract at 3.5 GB with short documents, and at 2.6-2.9 GB and 3.9 GB with 50-page documents; without `MALLOC_ARENA_MAX=2` the server's RSS keeps growing by allocator retention (3.3-3.5 GB after four resource rounds, 15.5), with it it stayed at 2.5 GB.
 
 **Caveats.** One host, synthetic scans, no language hint (detection reads the first pages twice); the client ran in the server's container and shares its CPUs. Configurations measured in different sessions differ by up to 3 % for the same setting; the 50-page comparison rests on two passes per pool (part a) and two passes of part c, part b on one pass (pool 4). Pool 8 at J 8 and J 12 with 50-page documents at other limits were not measured. The tree peaks marked † are upper bounds. The PDFium lock as a limit on concurrent Tesseract processes and the reading of the idle CPU share as second hardware threads are inferences, not measurements. `KNOWN_LIMITATIONS.md` P4 (one process tops out at 45-48 docs/min behind the NER lock) describes the state before the pool.
+
+**Note (18.6).** Since `add-deployment` the pipelines are handed to waiting calls in arrival order (formerly in no particular order). Re-measured with the request set of 15.2 at J 12 and 16 clients: 84.7 docs/min against 84.0 with pool 8 and 84.8 against 85.8 with pool 4 (within the run-to-run spread); with pool 4 the per-job NER time per page is more even (p95 2.5-2.8 s against 3.0-3.3 s, maximum 3.2-3.4 s against 3.7-4.7 s). The figures of this section are otherwise unaffected.
+
+---
+
+## 16. Language model choice (`add-deployment` tasks 5.1 and 5.2, design D5 and D6)
+
+Scripts: `benchmarks/llm_eval/` (local, like every benchmark script; driver `scripts/run.sh`, see `benchmarks/README.md` step 9). Raw outputs (per-question answers, recorded model calls, server and Ollama logs, VRAM samples) are in `benchmarks/llm_eval/out/` (local, not committed).
+
+### 16.1 Method
+
+**Stack.** The `docintel-test` image (built 2026-10-28 13:41 UTC, image id `sha256:3ea3c136...`; its `app/` is byte-identical to the working tree apart from line endings) runs the real service with Uvicorn and its **default settings**, plus `LLM_BASE_URL` and `LLM_MODEL`. Qdrant v1.20.0 (the digest of the tests) keeps its data in an external volume, so the 600 documents were ingested once and every candidate used the same index. Ollama `ollama/ollama:0.40.12@sha256:20d1bbfb...` ran with one GPU (RTX 4070 Ti 12 GB, Docker Desktop WSL2), `OLLAMA_CONTEXT_LENGTH=8192`, `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_MAX_LOADED_MODELS=1`, so one model at a time. Compose projects `llmeval*` (override `benchmarks/llm_eval/compose.llmeval.yml` of `docker-compose.test.yml`), torn down with `down -v --remove-orphans` after every run. The service calls a **pass-through recording proxy** in the harness container (`common.Proxy`). It forwards the exact request body to the model server and returns the reply unchanged, and it records the messages, the reply, `usage` and the upstream time, which the service does not expose. The proxy stores no headers. Refusal reasons, top-1 score and `llm_ms` come from the service's own `question completed` log line, matched by `X-Request-ID`.
+
+**Index.** All 600 PDFs through `POST /api/ingest` with 12 client threads (default `MAX_CONCURRENT_JOBS` 12): 600 x 200, **3,299 chunks** (the same count as the chain re-measurement of section 8.1), 1,045 pages in 1,010 s = **35.6 docs/min, 62 pages/min**. The model download (about 21 GB) ran on the host at the same time, so this is not a clean throughput figure (task 6.1 measures throughput). 11 of the first 12 simultaneous requests on the empty store returned 503 `vector_store_unavailable` and succeeded when resent: concurrent first `QdrantVectorStore.ensure_collection` calls hit a short window in which the new collection exists but is not yet readable (finding 1 in 16.10, fixed).
+
+**Sample** (`scripts/sample.py`, seed 20261028, `out/sample.json`). 600 of the 2,871 answerable same-language questions, stratified by language x document type (35 strata, proportional allocation by largest remainder, 14-19 per stratum). n = 600 bounds the 95 % half-width at 1.96 x sqrt(0.25/600) = 4.0 points (3.6 with the finite-population correction). Also 150 of the 300 unanswerable questions, 10 per language x category (absent entity, cross-document, off-topic). Every candidate and the hosted reference got the same 750 questions, in one fixed shuffled order (seed 20261029), sequentially (one client), after 3 warm-up questions that were not counted.
+
+**Scores** (`scripts/metrics.py`, `score.py`), as in D6:
+- **Accuracy.** The normalised gold answer is contained in the reply on token boundaries. Normalisation is NFKD, casefold, combining marks dropped, every Unicode punctuation character replaced by a space, whitespace collapsed. A refusal counts as wrong. Token-F1 (SQuAD-style, same normalisation) is the secondary score.
+- **Accuracy when gold in context.** The same accuracy, restricted to the questions whose normalised gold answer is contained in the context the model received. This separates the model's reading from retrieval. It undercounts slightly, because OCR errors on the gold page make the gold string absent.
+- **Refusals.** Wrong refusals on answerable questions and correct refusals on unanswerable ones, each split into threshold refusals (top-1 cosine below 0.808, model not called) and model refusals (`NOT_IN_DOCUMENTS` or a blank reply).
+- **Answer language.** The service's stop-word detector (`detect_language`, `min_words=3`, since replies are short) compared with the question's language. Undetermined replies (too few stop words) are counted separately.
+- **Latency.** The client's time for `POST /api/ask` (all requests, and the requests that called the model), plus the service's `llm_ms`.
+- **Intervals.** Percentile bootstrap over questions, 2,000 resamples, seed 0, paired over the same questions for differences.
+- **Tokens per second, and token counts checked against the API.** A side probe (`scripts/probe.py`) replays 100 recorded calls per candidate (40 for the 12B thinking runs) to Ollama's native `/api/chat` with the same messages, temperature 0 and `num_predict` 512, and reads `eval_count / eval_duration` (generation) and `prompt_eval_count / prompt_eval_duration` (prefill). `prompt_eval_count` equalled the OpenAI-compatible `usage.prompt_tokens` in 100 / 100 replays for every candidate. KV-prefix caching does not shrink the count.
+- **VRAM.** `nvidia-smi` on the host sampled every second. The figures are the device total, including about 0.9 GB used by the desktop at idle.
+
+**Thinking.** All three Gemma 4 models declare the `thinking` capability with default `true` (`ollama show`). Through Ollama's OpenAI-compatible endpoint, which the service's client uses, they therefore reason before answering. The reasoning comes back in a separate `reasoning` field, and its tokens count against `max_tokens` (512, `LLM_MAX_TOKENS`). Of the request fields tried (`scripts/think_check.py`), only `reasoning_effort: "none"` turns thinking off on this endpoint: the same German question took 22 completion tokens and 0.2-0.5 s, against 336-413 tokens and 3-12 s. `think: false` is ignored by the OpenAI-compatible endpoint (it works only on the native `/api/chat`), and `reasoning_effort: "low"` still thinks. The service's client sends neither field. Each candidate was therefore measured twice:
+- **thinking off (`_nt`).** The proxy adds `reasoning_effort: "none"` (`--rewrite reasoning_none`). This is what the client would send with a new setting (16.10). Full sample for all three models.
+- **as configured (`_t`).** The unchanged request, so thinking is on. The full sample for e4b. For the 12B models, a random subsample: the first 300 (12b-qat) and 150 (12b-q4_K_M) questions of the fixed shuffled order, because a 12B call takes about 8.5 s in this mode.
+
+**Hosted reference** (approved by the user): `gpt-6-luna` through `https://api.openai.com/v1`, model id confirmed from every response's `model` field (660 / 660). The key was passed only through compose interpolation from the repository `.env` (`compose.hosted.yml`), never written or printed; the outputs were checked afterwards for key-like strings (none). Two parameters of the service's unchanged client are rejected by this model, so the run used side-harness rewrites (`--rewrite max_completion_tokens,drop_temperature`; finding 3 in 16.10):
+- **`max_tokens`:** HTTP 400 `unsupported_parameter`, "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead." The proxy renamed it to `max_completion_tokens`.
+- **`temperature` 0:** HTTP 400 `unsupported_value`, "Unsupported value: 'temperature' does not support 0.0 with this model. Only the default (1) value is supported." The proxy dropped the field, so the reference ran at the model's default temperature 1 and is not deterministic.
+
+Both errors reached the API client as 503 `llm_unavailable`. An earlier attempt with the first key failed with 401 `expired_secret_key` (no tokens billed).
+
+### 16.2 Candidates (task 5.1)
+
+Pulled 2026-10-28 with `ollama pull` (`out/models.txt`: `ollama list`, `ollama show`, manifest files):
+
+| tag | ollama list ID / manifest digest | size | parameters | quantisation | weights blob | other | trained context | thinking |
+|---|---|---|---|---|---|---|---|---|
+| `gemma4:e4b-it-qat` | `ee6656371218` / `sha256:ee665637121887cf3befff38abbb1be4ee117c7db867d97a67e29049ecd7e15f` | 6.1 GB | 7.5B | Q4_0 (QAT) | `sha256:e8b6a059ba86...` (5.15 GB) | vision/audio projector 0.99 GB | 131,072 | default on |
+| `gemma4:12b-it-qat` | `38044be4f923` / `sha256:38044be4f923e5a55264ed7df4eaac2676651a905f735197c504045140c02bd3` | 7.2 GB | 11.9B | Q4_0 (QAT) | `sha256:faff1a63667f...` (6.98 GB) | projector 0.18 GB | 262,144 | default on |
+| `gemma4:12b-it-q4_K_M` | `6114515d63c1` / `sha256:6114515d63c17436a7c0417d82820ac65ad643e2806c5a3c89cb62846436ed0b` | 8.0 GB | 11.9B | Q4_K_M (imatrix) | `sha256:bb722270d543...` (7.38 GB) | projector 0.18 GB, **draft model** 0.47 GB (`draft_num_predict 3`, speculative decoding) | 262,144 | default on |
+
+All three ship sampling defaults of temperature 1, top_k 64, top_p 0.95; the service sends `temperature` 0. Loading a model into VRAM took 33-42 s (`llama-server started in` in the Ollama log) on the first request after the container started (the weights are read from the Docker volume). That first request took 65 s, longer than `LLM_READ_TIMEOUT_S` (60 s); the client timed out and its retry succeeded (warm-up lines in `console.log`, one `BrokenPipeError` in the proxy per run). Later requests in the same server found the model loaded (`OLLAMA_KEEP_ALIVE` 60 min here).
+
+### 16.3 Context length (task 5.1)
+
+**Observed** over 659 model calls per candidate (the full sample) plus the warm-up:
+- **Largest prompt:** 2,661 tokens (e4b) and 2,665 tokens (both 12B models, which share a tokenizer), at 6,122 characters of messages.
+- **Mean prompt:** 1,493 / 1,497 tokens.
+- **Densest prompt:** 0.457 tokens per character, from invoice pages full of amounts and identifiers. German and Portuguese invoices are the densest.
+
+**Constructed:** the probe packs the densest recorded pages with the service's own `select_context` (3 pages, budget 6,000) and the longest sample question (147 characters). This gave 1,973 tokens (e4b, 5,821 context characters) and 2,549 tokens (12B, 4,808 characters; the three densest pages were short).
+
+**Upper bound:** 0.46 tokens per character x about 6,700 characters (6,000 of context, the 535-character system prompt, the framing and a 150-character question) = **about 3,100 prompt tokens**. Generation adds up to `max_tokens` 512, so a request needs **at most about 3,600 tokens of context**; 25 % margin makes about 4,500.
+
+| setting | context | margin over 3,600 | verdict |
+|---|---|---|---|
+| Ollama's own default on this GPU (log: `vram-based default context ... default_num_ctx=4096`) | 4,096 | 14 % | too small for the 25 % rule |
+| **`OLLAMA_CONTEXT_LENGTH=8192`** (measured) | 8,192 | 128 % | **recommended** |
+
+VRAM at 8,192 (device maximum during each run, desktop included): e4b 5.7 GB, 12b-qat 9.2 GB, 12b-q4_K_M 10.2 GB.
+
+**No truncation at 8,192.**
+- No `truncating input prompt` warning in any Ollama log of the quality runs.
+- `prompt_eval_count` equalled `usage.prompt_tokens` in every replay.
+- `n_tokens` of the llama-server slot lines stayed under 3,100.
+- The detector works: a deliberate request with `options.num_ctx` 1024 (12B) logged `level=WARN msg="truncating input prompt" limit=1027 prompt=2549 keep=5 new=1027` and reported `prompt_eval_count` 1,027. The llama-server line said `truncated = 0` for the same request, so truncation must be checked on Ollama's own WARN line, not on llama-server's counter.
+- For e4b the per-request `num_ctx` 1024 did not reload the model and the full 1,973 tokens were evaluated. The service never sends `num_ctx`, so the server setting is what counts.
+
+### 16.4 Answer quality (task 5.2)
+
+Full sample (600 answerable, 150 unanswerable; `out/score/tables.md`). Thinking off for the local models; the hosted model with its own default reasoning (`completion_tokens_details.reasoning_tokens` 16,895 in total, 0 for most replies):
+
+| model (thinking) | accuracy (containment) | token-F1 | accuracy, gold in context (n = 448) | wrong refusals: all / threshold / model | correct refusals: all / threshold / model | language mismatch (undetermined of answered) |
+|---|---|---|---|---|---|---|
+| e4b (off) | 72.3 (68.7-76.0) | 27.5 (25.4-29.7) | 95.5 (93.5-97.3) | 10.5 (8.2-13.0) / 3.5 / 7.0 (5.2-9.0) | 72.0 (64.7-78.7) / 46.7 / 25.3 (18.7-32.7) | 0.3 (0.0-1.0) (226 of 537) |
+| 12b-qat (off) | **72.8 (69.2-76.5)** | 20.6 (19.3-21.9) | 95.5 (93.5-97.3) | 12.5 (10.0-15.0) / 3.5 / 9.0 (6.8-11.2) | 72.7 (66.0-79.3) / 46.7 / 26.0 (19.3-33.3) | 0.6 (0.0-1.6) (216 of 525) |
+| 12b-q4_K_M (off) | 72.3 (68.7-76.0) | 21.1 (19.9-22.5) | 95.1 (92.9-96.9) | 12.3 (9.8-15.0) / 3.5 / 8.8 (6.7-11.0) | 72.7 (66.0-79.3) / 46.7 / 26.0 (19.3-33.3) | 0.0 (0.0-0.0) (219 of 526) |
+| e4b (on, as configured) | 61.5 (57.7-65.5) | 32.3 (29.7-35.0) | 81.0 (77.5-84.6) | 24.7 (21.3-28.0) / 3.5 / 21.2 (18.0-24.3) | 74.0 (66.7-80.7) / 46.7 / 27.3 (20.7-34.7) | 0.6 (0.0-1.9) (296 of 452) |
+| 12b-qat (on), subsample 241 / 59 | 61.8 (55.6-67.6) | 25.3 (22.4-28.3) | 78.3 (72.5-84.1) (n = 189) | 32.4 (26.6-38.2) / 3.7 / 28.6 (22.8-34.4) | 76.3 (64.4-86.4) / 47.5 / 28.8 | 0.0 (104 of 163) |
+| 12b-q4_K_M (on), subsample 125 / 25 | 64.0 (55.2-72.0) | 28.0 (23.5-32.3) | 80.6 (71.4-87.8) (n = 98) | 28.8 (20.8-36.8) / 4.8 / 24.0 (16.8-32.0) | 80.0 (64.0-92.0) / 44.0 / 36.0 | 0.0 (60 of 89) |
+| gpt-6-luna (hosted reference) | 69.5 (65.5-73.3) | **48.7 (45.7-51.7)** | 91.1 (88.4-93.8) | 12.0 (9.5-14.5) / 3.5 / 8.5 (6.3-10.7) | 71.3 (64.0-78.0) / 46.7 / 24.7 (18.0-32.0) | 0.0 (431 of 528) |
+
+Every request returned 200 (0 errors in 4,950 questions). The threshold columns carry no interval: retrieval is the same for every model, so threshold refusals are identical.
+
+**Accuracy by language**, thinking off (en / es / pt / fr / de; each about +-8 points). German is the lowest for every model.
+- e4b: 72 / 70 / 77 / 76 / 66.
+- 12b-qat: 73 / 71 / 79 / 76 / 66.
+- 12b-q4_K_M: 73 / 71 / 78 / 76 / 64.
+- gpt-6-luna: 70 / 68 / 74 / 75 / 60.
+
+**Refused by category**, all models with thinking off: absent entity 100 %, off-topic 100 %, cross-document 14-18 %.
+
+**Paired differences in accuracy** against the most accurate local model (12b-qat, thinking off), in points:
+- e4b: -0.5 [-1.7, +0.7].
+- 12b-q4_K_M: -0.5 [-1.2, +0.0].
+- e4b with thinking on: -11.3 [-14.2, -8.8].
+- gpt-6-luna: -3.3 [-5.0, -1.8].
+
+**Paired differences in wrong refusals**, same reference:
+- e4b: -2.0 [-3.3, -0.8].
+- 12b-q4_K_M: -0.2 [-0.8, +0.3].
+- e4b with thinking on: +12.2 [+9.5, +15.0].
+- gpt-6-luna: -0.5 [-1.7, +0.7].
+
+**Retrieval is the same for everyone.** The context is identical for all models (same index, same questions): the gold answer was in it for 448 of 600 questions (74.7 %). Threshold refusals are identical: 21 answerable (3.5 %) and 70 unanswerable (46.7 %) were refused before any model call. The 1-2 point spread between the models is far below the +-4-point interval of each.
+
+**When the gold answer is in the context, the local models with thinking off answer it in 95 %.** Their model refusals of answerable questions are mostly questions whose gold answer was not in the context: 36 of e4b's 42, 44 of 54 (12b-qat) and 43 of 53 (12b-q4_K_M). That is the intended behaviour; only 1.3-2.2 % of the gold-in-context questions were refused.
+
+**Where the accuracy is lost.** Most of the remaining loss is retrieval. The corpus has many near-identical documents (the same template, with the same project names), so when the gold document is not retrieved the models answer from a similar document's values, or list each retrieved document's value; both are scored wrong. Language mismatch is 0-0.6 % of the determinable replies for every model. Refusal of unanswerable questions is the same for all: 100 % of absent-entity and off-topic questions (two thirds of absent-entity refusals by the model, the rest by the threshold), 14-22 % of cross-document questions (most of them are answerable in a filter-free index, section 8).
+
+**Thinking on (the service's current client).**
+- **e4b, full sample.** Accuracy falls from 72.3 to 61.5, and wrong refusals rise from 10.5 to 24.7 % (model refusals 21.2 %). In **136 of 659 calls (21 %)** the reasoning used the whole 512-token budget and the call ended with `finish_reason: length` and an **empty reply**, which `is_refusal` turns into the fixed refusal. With the gold answer in the context, 14.3 % were refused (1.3 % with thinking off). Among the questions it did answer it is as accurate as without thinking (81.6 against 80.8 %).
+- **Cost of thinking.** Completion tokens are 257,175 against 26,408, and the median latency of a model call is 4.05 s against 0.56 s.
+- **12B subsamples:** on the same questions with thinking off:
+  - **Accuracy:** 12b-qat falls by 14.1 [-18.7, -9.5] points (61.8 against 75.9), 12b-q4_K_M by 10.4 [-16.0, -4.8] (64.0 against 74.4).
+  - **Wrong refusals:** rise by 19.1 [+14.1, +24.1] and 15.2 [+8.8, +21.6] points.
+  - **Token limit:** 62 of 263 and 27 of 133 calls ended at the 512-token limit.
+  - **Latency:** the median model call takes 7.94 s and 3.97 s, against 1.50 s and 1.42 s with thinking off on the same questions.
+  - **Unanswerable questions:** thinking refuses slightly more of them correctly (e4b 111 against 108 of 150), not enough to offset the loss.
+
+### 16.5 Latency, speed and memory
+
+Sequential, one question at a time, on the full sample. 659 of the 750 questions call the model; the others are threshold refusals answered in about 55 ms.
+
+| model (thinking) | requests p50 / p95 (s) | with a model call p50 / p95 / p99 / max (s) | generation tokens/s (p50) | prefill tokens/s (p50) | completion tokens (p50) | VRAM, device max (GB) | prompt / completion tokens, whole sample |
+|---|---|---|---|---|---|---|---|
+| e4b (off) | 0.52 / 1.74 | **0.56 / 1.79** / 2.26 / 6.57 | 113 | 7,183 | 27 | 5.7 | 983,283 / 26,408 |
+| 12b-qat (off) | 1.44 / 4.09 | 1.51 / 4.33 / 4.89 / 7.63 | 55 | 3,228 | 35 | 9.2 | 985,919 / 33,970 |
+| 12b-q4_K_M (off) | 1.37 / 2.20 | 1.42 / 2.24 / 2.82 / 6.43 | 126 | 2,196 | 29 | 10.2 | 985,919 / 28,996 |
+| e4b (on) | 3.87 / 5.37 | 4.05 / 5.41 / 5.74 / 8.99 | 106 | 6,775 | 371 | 6.0 | 984,601 / 257,175 |
+| 12b-qat (on), 300 | 7.61 / 11.12 | 7.94 / 11.12 / 11.55 / 14.83 | 53 | 3,135 | 308 | 9.7 | 387,349 / 99,099 |
+| 12b-q4_K_M (on), 150 | 3.80 / 5.52 | 3.97 / 5.53 / 6.11 / 9.37 | 129 | 2,104 | 340 | 10.7 | 199,848 / 49,152 |
+| gpt-6-luna | 1.19 / 2.62 | 1.25 / 2.72 / 3.66 / 4.40 | - | - | 18 (mean 44, reasoning included) | - | 862,017 / 29,076 (OpenAI tokenizer) |
+
+Tokens per second come from the side probe (100 replays per model; 40 for the 12B thinking runs). VRAM is the device total sampled on the host, with the idle desktop taking about 0.9 GB. The models themselves therefore take about 4.8 / 8.3 / 9.3 GB at `OLLAMA_CONTEXT_LENGTH` 8192; the q4_K_M figure includes its draft model.
+
+The 12b-q4_K_M generates faster than 12b-qat (126 against 55 tokens/s) because of its bundled draft model (speculative decoding); its prefill is slower (2,196 against 3,228 tokens/s). With thinking off, replies are short (median 27-35 completion tokens), so latency is mostly prefill plus about 30 generated tokens. Retrieval in the service adds a median 48-50 ms (`embed_ms`) plus 3 ms (`search_ms`). The hosted model's latency includes the internet round trip (1.0-1.7 s per call in the 5-question probe). Its run shared the host with the 12B thinking run on the GPU, so its VRAM column is not its own.
+
+### 16.6 Manual audit of the containment metric
+
+50 replies scored wrong by containment, answered (not refused), from the three local models with thinking off: 17 / 17 / 16, round-robin over the five languages, seeded (`scripts/audit.py`, labels in `out/score/audit_labels.json`). Each was checked against its question, the gold answer, the gold sentence and the context the model received, including where the gold page was in the context and how OCR rendered it:
+
+| label | count | what it was |
+|---|---|---|
+| truly wrong | 40 | 34 answered from another, similar document (the gold document was not in the context, or only another page of it was); 4 picked the rank-1 document's value while the gold page was at rank 2-3; 1 gave the KYC reference instead of the document number; 1 the gold page was too garbled by OCR to read |
+| correct, format (OCR copy) | 6 | the model copied the OCR text faithfully: `Salle CS` for C5 (twice), `ler fevrier` for 1er, `8hoo`, `10188862` for 1018886Z, `204380571` for 29438057H |
+| correct paraphrase | 3 | `la oficina de Bogota, Sala 8A` for `nuestra oficina...`; the sender's company name in place of "our office" (twice) |
+| partially correct | 1 | the right (OCR-garbled) author plus the author of a second memo |
+
+No number or date in another format (e.g. 1.000 vs 1,000, 2024-12-10 vs 10 December 2024) appeared among the 50, so no extra normalisation was added for the local models. **Correction.** 9 of 50 (18 %) are correct, 3 of 50 (6 %) if OCR copies count as wrong for the user. Applying these pooled rates to each model's answered-but-not-contained replies (88-103) gives:
+
+| model | accuracy (containment) | corrected, OCR copies count as correct | corrected, paraphrases only |
+|---|---|---|---|
+| e4b | 72.3 | 75.4 | 73.4 |
+| 12b-qat | 72.8 | 75.5 | 73.7 |
+| 12b-q4_K_M | 72.3 | 75.1 | 73.3 |
+
+The containment metric therefore underestimates the local models by about 1-3 points, about equally for all three; the ranking does not change.
+
+**Supplementary audit of the hosted model** (46 replies; `out/score/audit_labels_luna.json`). The hosted model answers tersely and rephrases more, which containment penalises: its token-F1 is the highest, 48.7, while its containment is the lowest. It was therefore audited separately. Of its 111 answered-but-not-contained replies, all 31 with the gold answer in the context were checked:
+- 11 correct paraphrases ("Na Sala A5, em Campinas", "Im Buero in Berlin, Raum 12").
+- 5 format variants: "19 %" for "19,0 %", "7%" for "7,0%", German case endings "30 Tagen" for "30 Tage", "24 Monaten", "12 Monaten".
+- 2 partial.
+- 13 truly wrong.
+
+Of the other 80, 15 sampled were 13 wrong, 1 partial and 1 OCR copy. Corrected accuracy: 72.2 (paraphrases and format variants) to 73.1 (OCR copies as well), against 69.5 strict. These number and inflection variants occur only in the hosted model's replies. A metric that folded them would raise its score by about 1 point; it was not changed, to keep D6's definition.
+
+### 16.7 Concurrency (D7 questions part, chosen candidate)
+
+Chosen candidate (16.8): e4b. Thinking off (side-harness `reasoning_effort: "none"`), and also as configured (thinking on), so the effect of the current client is visible. Method (`scripts/chain_conc.sh`, `conc_table.py`):
+- A fresh compose project per cell with `OLLAMA_NUM_PARALLEL` 1, 2 or 4, `MAX_CONCURRENT_QUESTIONS` 16 (default) and 16 client threads.
+- The first 320 answerable questions of the fixed order with thinking off (96 with thinking on), after 4 sequential warm-up questions.
+- `LLM_READ_TIMEOUT_S` 600 and `LLM_TOTAL_TIMEOUT_S` 900 for these runs only, so that the measured latency is not cut by the client.
+- Thinking off: two passes, the second in reverse order. Thinking on: one pass.
+- The machine was otherwise idle: no other compose project was running, and the other agent's `deploy` stack had stopped before 17:30 UTC.
+
+| thinking | `OLLAMA_NUM_PARALLEL` | questions/min (passes) | client p50 / p95 / p99 / max (s) | `llm_ms` p50 / p95 / p99 (s) | VRAM, device max (GB) |
+|---|---|---|---|---|---|
+| off | 1 | 93.9, 94.2 | 10.0 / 15.0 / 17.1 / 17.7 | 10.1 / 15.2 / 17.0 | 5.8-5.9 |
+| off | **2** | **124.6, 123.3** | 7.5 / 12.3-12.4 / 15.0 / 15.8 | 7.5 / 12.7 / 15.0 | 6.1 |
+| off | 4 | 127.5, 128.3 | 6.9-7.1 / 11.7-13.0 / 13.6-13.9 / 20.7 | 6.9-7.2 / 11.6-13.0 / 12.9-13.9 | 6.1 |
+| on | 1 | 16.3 | 60.7 / 65.3 / 66.3 / 66.3 | 61.2 / 65.3 / 66.2 | 6.1 |
+| on | 2 | 26.7 | 36.2 / 40.0 / 41.3 / 41.5 | 36.3 / 39.9 / 41.2 | 6.0 |
+| on | 4 | 36.3 | 24.9 / 32.0 / 34.7 / 35.1 | 24.9 / 32.0 / 33.9 | 6.2 |
+
+Every request returned 200. `llm_ms` includes the wait in Ollama's queue, so with 16 questions in flight it is about 16 / `NUM_PARALLEL` times one call. With thinking off, a second slot adds 32 % throughput and a fourth only 3 % more (one GPU; batching two sequences is nearly free, four are limited by compute). Parallel slots cost only about 0.2-0.3 GB of VRAM at this context (`ollama ps` reports the same 8,192 context per slot). The one 20.7 s maximum at `NUM_PARALLEL` 4 is a single outlier of the second pass.
+
+**Thinking on with the current defaults breaks under load.** With one slot and 16 questions in flight, the median model call takes 61 s and the p99 66 s. That is above the default `LLM_READ_TIMEOUT_S` of 60 s, so with the service's defaults about half of these questions would time out and be retried: the client makes 3 attempts within the 90 s `LLM_TOTAL_TIMEOUT_S` and adds load while it does.
+
+**Recommendations** (the D7 rule of section 15.6, the smallest setting within 5 % of the best throughput):
+- **`OLLAMA_NUM_PARALLEL=2`.** 123-125 questions/min against the best 128; NUM_PARALLEL 1 is 27 % below the best.
+- **`MAX_CONCURRENT_QUESTIONS` 16, unchanged.** At 16 questions in flight the p99 of a model call is 15 s with two slots, a quarter of the read timeout.
+- **`LLM_READ_TIMEOUT_S` 60, unchanged.** This is 4.0 times the loaded p99 (15.0 s at NUM_PARALLEL 2) and 3.4 times the loaded maximum at NUM_PARALLEL 1 (17.7 s). Two conditions apply.
+  - **The model must already be in VRAM.** The first question after Ollama starts took 65 s: 33-42 s of model load plus the call. It succeeded only through the client's retry. Preloading the model when the stack starts, for example a one-token request from the pull step with `keep_alive`, and a long `OLLAMA_KEEP_ALIVE` remove this. Without a preload, use `LLM_READ_TIMEOUT_S=90` with `LLM_TOTAL_TIMEOUT_S` 180.
+  - **Thinking must be off.** With thinking on and two slots, the p99 is 41 s (66 s with one slot). That would need `LLM_READ_TIMEOUT_S` of at least 90 s and fewer concurrent questions.
+
+### 16.8 Choice (D5 rule)
+
+D5: among the local models whose accuracy lies within the 95 % interval of the best local model, the one with the lowest p95 latency; a candidate clearly worse on wrong refusals or answer language is excluded.
+
+1. **Best local model.** 12b-qat with thinking off, 72.8 (69.2-76.5).
+2. **Inside its interval.** e4b at 72.3 and 12b-q4_K_M at 72.3, both with thinking off (paired differences -0.5 [-1.7, +0.7] and -0.5 [-1.2, +0.0]). Every thinking-on configuration lies outside it (61.5-64.0, paired -10 to -14 points).
+3. **Exclusions.** None. Wrong refusals are 10.5 % for e4b, which is lower than 12.3-12.5 % for the 12B models (paired -2.0 [-3.3, -0.8]). Answer-language mismatch is at most 0.6 % for all three.
+4. **Lowest p95 latency.** e4b: **1.79 s** for a request that calls the model. The 12B models take 2.24 s (q4_K_M) and 4.33 s (qat).
+5. **e4b also leads on other counts.** It uses the least VRAM (about 4.8 GB, so it may fit an 8 GB card; not tested), it was the only candidate measured under load (16.7), and its audit-corrected accuracy equals the others' (75.4 against 75.1-75.5).
+
+**Recommended: `LLM_MODEL=gemma4:e4b-it-qat`, with thinking off.** The service's client does not turn thinking off today. With the unchanged client, the rule still picks e4b, since all thinking-on runs are equally poor, but at 61.5 % accuracy, 24.7 % wrong refusals and 4 s per question. So the recommendation depends on the client change in 16.10 (finding 2).
+
+**Ollama options:**
+- **`OLLAMA_CONTEXT_LENGTH=8192`** (16.3).
+- **`OLLAMA_NUM_PARALLEL=2`** (16.7).
+- **`OLLAMA_MAX_LOADED_MODELS=1`.**
+- **`OLLAMA_KEEP_ALIVE` long** (for example `24h`, or `-1` to keep the model loaded), plus a preload at start (16.7).
+
+The hosted reference, gpt-6-luna, is not more accurate on this corpus: 69.5 strict and 72.2-73.1 after its audit, against 72.3-72.8 strict and 73.3-75.5 corrected for the local models. Its latency (p95 2.72 s) is higher than e4b's. The hosted option is therefore a deployment choice (no GPU), not a quality upgrade.
+
+### 16.9 Hosted reference: tokens and cost
+
+Usage fields of the 660 responses (659 questions plus 1 warm-up; the 5-question probe and the two failed probes are separate):
+
+| | prompt tokens | of which cached | completion tokens | of which reasoning | cost |
+|---|---|---|---|---|---|
+| full sample (750 questions, 659 model calls) | 862,017 | 57,188 | 29,076 | 16,895 | **$0.0956** |
+| 5-question probe | 7,084 | 0 | 104 | 36 | $0.0008 |
+
+Prices are $0.10 per 1M input tokens, $0.01 per 1M cached input tokens and $0.50 per 1M output tokens. The cost is computed as (prompt - cached) x 0.10 + cached x 0.01 + completion x 0.50, per 1M tokens. The responses also report `cache_write_tokens` (708,244 in total); no separate price was given for them, so they are counted as ordinary input. The failed probes (401 and 400) report no usage.
+
+**Cost per 1,000 questions:** $0.13 for this mix of questions (12 % are refused before any model call), or $0.145 per 1,000 model calls. The prompt is about 1,310 tokens per call with the OpenAI tokenizer, against about 1,495 with the Gemma tokenizer (0.87 times). The projection made from the probe was $0.10 for the sample, which matches.
+
+### 16.10 Findings for the main session (fixed in tasks 5.3 and 5.4 of `add-deployment`)
+
+1. **Concurrent first `QdrantVectorStore.ensure_collection` calls.** 12 simultaneous first ingestions into an empty store gave 11 x 503 `vector_store_unavailable`. Reproduced against Qdrant v1.20.0: the duplicate create's 409 was already handled, but for about 15-30 ms after a create is accepted `collection_exists` is true while `get_collection` answers HTTP 500 "0 of 0 read operations failed" (shards not yet readable), and the retrier does not retry a 500, so `_verify` failed. Fixed in this block (task 5.4): first binding serialised by a lock, and the `get_collection` calls retry only that 500 (up to 10 tries, 0.05-0.5 s backoff, within the call deadline). After the fix: 12 simultaneous first ingestions on the runtime image, 12 x 200, one collection.
+2. **Thinking models through the OpenAI-compatible endpoint (llm-client delta).** Gemma 4 on Ollama thinks by default. In this mode it is 10-14 points less accurate, and 21 % of calls (e4b) end at `max_tokens` with an empty reply that the service turns into a refusal. It is also slower (median model call 7.2 times longer with e4b, 2.8-5.3 times with the 12B models; 16.5), and under load it exceeds the default read timeout. Proposed client change:
+   - An optional setting, for example `LLM_REASONING_EFFORT` (unset, `none`, `low`, ...), sent as `reasoning_effort`. With Ollama, `none` turns thinking off; this was verified, while `think: false` is ignored on this endpoint.
+   - Log `finish_reason: length` with an empty content as its own outcome instead of a silent refusal.
+3. **Hosted models that reject the current request (llm-client delta).** `gpt-6-luna` answers 400 to `max_tokens` (`unsupported_parameter`, wants `max_completion_tokens`) and to `temperature` 0 (`unsupported_value`, only the default 1). Proposed change:
+   - A setting for the token-limit field name (`max_tokens` or `max_completion_tokens`), or always sending `max_completion_tokens` to OpenAI.
+   - A way to omit `temperature` (for example `LLM_TEMPERATURE` unset means not sent).
+   - Both errors currently surface as 503 `llm_unavailable` with no hint. Logging the upstream error `code` (not the message, which can quote input) would make them diagnosable.
+4. **Cold start exceeds `LLM_READ_TIMEOUT_S`.** The first question after Ollama starts took 65 s (33-42 s model load) and was saved only by the retry. Preload the model in the stack (D2's pull step) or document a longer first-call timeout.
+5. **Default Ollama context is too small for the margin.** On this 12 GB GPU, Ollama picks 4,096 when `OLLAMA_CONTEXT_LENGTH` is unset, which leaves 14 % over the worst request. The stack must set 8192.
+6. **Truncation is visible only in Ollama's own log.** The WARN line `truncating input prompt` is the signal; llama-server's `truncated = 0` and the API response give no sign of it. `prompt_eval_count` and `usage.prompt_tokens` show the truncated count.
+
+**Caveats.**
+- **Corpus.** One synthetic corpus whose near-duplicate templates make retrieval, not the model, the main source of error (section 1). Real documents may separate the models more.
+- **Determinism.** Temperature 0 on the local models is not fully deterministic: replaying the same messages to the native API gave the same reply in 72-81 % of cases.
+- **Hosted reference.** It ran at temperature 1 with renamed parameters, through the side harness only, so it does not measure the service's current client. It shared the host with a GPU run.
+- **12B thinking runs.** These are random subsamples of 300 and 150 questions, so their intervals are wider.
+- **VRAM.** VRAM is the device total, including the desktop.
+- **Audits.** The audits were done by one person (this evaluation) without a second rater.
+
+---
+
+## 17. Deployed stack (`add-deployment` task 6.1, design D7 and evidence plan items 3 and 4)
+
+Scripts: `benchmarks/deploy_perf/` (local, like every benchmark script; driver `scripts/run.sh`, see `benchmarks/README.md` step 10). Raw outputs (client results per request, cgroup counters, `docker stats` samples, app, Qdrant and Ollama logs, `nvidia-smi` samples) are in `benchmarks/deploy_perf/out/` (local, not committed).
+
+### 17.1 Method and environment
+
+**Stack.** The repository's `docker-compose.yml` and `docker-compose.smoke.yml`, unchanged except `build.context` (rewritten to the repository path; `out/stack/compose.diff` shows that one line), started from a copy in `out/stack/` with its own `.env`. Compose reads `.env` from the project directory, both for interpolation and as the app's `env_file`, so the repository-root `.env` (which can hold a key) took no part in any run; the settings of a run were written into that copy's `.env`, exactly as a user configures the stack, and every run's `.env` is kept next to its results. The app's server process had no `LLM_API_KEY` (checked in `/proc/<pid>/environ`, 17.5), and no hosted model was called. Images built from the tree of this change with `docker build --target runtime -t docintel .` (`sha256:ffda6d7a...`) and `docker build --target test -t docintel-test .` (`sha256:018edb07...`), both on 2026-10-28. Compose projects `perf_cold`, `perf_par`, `perf_tp` and `perf_gpu`, each torn down with `down -v`; the evaluation volumes of section 16 were only mounted read-only (to copy them) and are unchanged.
+
+**Host.** As in sections 13-16: Windows 11, Docker Desktop 29.9.2 (Compose 5.6.1, WSL2 VM with 16 CPUs and 15.2 GiB), AMD Ryzen 7 7700X (8 cores, 16 threads), RTX 4070 Ti 12 GB; nothing else ran during the timing runs.
+
+**Client.** A separate container (`compose.perf.yml`: the test image on the stack's internal `backend` network, `http://app:8000`), so the client never shares the app container's CPU quota (in sections 13-15 it ran inside the server's container). Same request sets and client as block 5 (`client.py`): threads with one `httpx.Client` each pulling from a shared queue; `/api/extract` with the 25-document set of 13.2 three times (75 requests, 135 pages) and its name lists, no language hint; `/api/ingest` with 75 distinct documents (the 60 of the seed-0 sample and, per language, the first three corpus documents outside it; 125 pages). Each run is a fresh stack (`down -v`, so every ingestion is `indexed`), warmed up as in 15.1 (2 sequential extractions, 8 concurrent ones, 2 ingestions of other documents), then the extract cell and the ingest cell at 16 clients. `BUSY_WAIT_S=300` (nothing rejected, as in block 5); every other setting at its default unless stated. Two rounds per configuration, the second in reverse order (`chain_tp.sh`); the 4-CPU configurations one round.
+
+**Counters.** docs/min = requests / wall time; latency is the client's. Mean CPUs used = the app container's cgroup `cpu.stat` `usage_usec` over the cell divided by its wall time (server and Tesseract processes); throttled = share of CFS periods throttled; server `VmHWM` reset before each cell; OCR, NER and embedding ms per page summed from the use cases' outcome lines of the cell's requests (request ids `<cell>-<i>`), including any wait for a pipeline or the embedder. CPU limit: `cpus: N` on the app service (`compose.cpus.yml`), a cgroup quota; the container still sees 16 CPUs, so `OCR_WORKERS` stays min(4, 16) = 4.
+
+### 17.2 Image sizes (`sizes.txt`)
+
+| image | size (`docker image inspect`) | venv | of which bytecode | models | `/app` | dev tools |
+|---|---|---|---|---|---|---|
+| `docintel` (runtime) | 5,840,400,350 B (5.84 GB) | 1,246 MB | 228 MB (10,085 `.pyc`) | 2,146 MB | 1 MB | none |
+| `docintel-test` (test) | 5,749,571,612 B (5.75 GB) | 1,171 MB | 0 | 2,146 MB | 3 MB | pytest, pymupdf, mypy, ruff |
+
+The runtime image is 91 MB **larger** than the test image: the development dependencies cost about 150 MB of the test venv (1,171 MB against 1,018 MB for the runtime venv without its bytecode), and the runtime venv is compiled to bytecode (228 MB), which D2 adopted because the non-root user cannot write `.pyc` files and imports then take 4.2-4.9 s instead of 8.6-9.5 s. Models (2.1 GB) and torch dominate both images.
+
+### 17.3 Extract and ingest throughput, with and without a CPU limit
+
+Means of the rounds (per-round values in `out/tables_tp.md`); J = `MAX_CONCURRENT_JOBS`, P = `NER_POOL_SIZE`, `TORCH_THREADS` 2; every request of every cell returned 200:
+
+| app CPUs | J / P | rounds | extract docs/min (rounds) | extract pages/min | extract p50 / p95 (s) | CPUs used | throttled | OCR / NER ms per page | ingest docs/min (rounds) | ingest pages/min | ingest p50 / p95 (s) | server peak (MB) | warning |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 16 (unlimited) | **12 / 8** (defaults) | 2 | 85.1, 85.6 = **85.3** | 153.6 | 10.5 / 13.4 | 12.5 | 0 % | 2,633-2,681 / 1,737-1,761 | 50.9, 50.8 = **50.9** | 84.8 | 18.0 / 20.4 | 2,466-2,735 | no |
+| 16, test image (control) | 12 / 8 | 2 | 84.6, 86.1 = 85.4 | 153.6 | 10.3 / 14.2 | 12.6 | 0 % | 2,651-2,691 / 1,727-1,790 | 51.0, 50.8 = 50.9 | 84.8 | 18.1 / 20.5 | 2,503-2,748 | no |
+| 8 | 12 / 8 (defaults) | 2 | 53.6, 54.4 = 54.0 | 97.2 | 16.6 / 22.3 | 7.8 | 92-94 % | 4,142-4,226 / 2,876-2,931 | 49.9, 49.7 = 49.8 | 83.0 | 18.2 / 20.6 | 2,484-2,758 | **yes** |
+| 8 | 8 / 4 | 2 | 59.1, 58.8 = 59.0 | 106.1 | 15.4 / 18.8 | 7.6 | 82-85 % | 2,817-2,821 / 1,504-1,520 | 49.9, 50.0 = 50.0 | 83.3 | 18.2 / 20.9 | 2,310-2,621 | no |
+| 8 | **6 / 4** | 2 | 61.2, 61.5 = **61.4** | 110.5 | 14.9 / 17.1 | 7.3 | 55-56 % | 2,112-2,113 / 1,027-1,036 | 50.0, 50.5 = **50.3** | 83.8 | 18.4 / 20.8 | 2,243-2,566 | no |
+| 8 | 4 / 4 | 2 | 51.3, 49.8 = 50.6 | 91.0 | 18.3 / 20.3 | 5.5 | 0-1 % | 1,769-1,820 / 771-793 | 47.8, 46.8 = 47.3 | 78.8 | 19.3 / 22.4 | 2,171-2,564 | no |
+| 4 | 12 / 8 (defaults) | 1 | 27.9 | 50.3 | 32.2 / 47.0 | 4.0 | 98 % | 8,258 / 5,617 | 39.2 | 65.3 | 22.9 / 28.4 | 2,561-2,825 | **yes** |
+| 4 | 4 / 2 | 1 | 36.2 | 65.1 | 25.7 / 28.5 | 3.9 | 92 % | 2,443 / 1,170 | 40.0 | 66.6 | 23.2 / 26.6 | 2,171-2,504 | no |
+| 4 | **3 / 2** | 1 | **37.5** | 67.5 | 24.8 / 27.1 | 3.8 | 61 % | 1,829 / 783 | 37.6 | 62.7 | 24.6 / 27.9 | 2,161-2,495 | no |
+| 4 | 2 / 2 | 1 | 29.3 | 52.7 | 32.4 / 34.8 | 2.9 | 4 % | 1,633 / 635 | 29.3 | 48.8 | 31.6 / 37.0 | 2,092-2,404 | no |
+
+"Server peak" is the server's `VmHWM` over the extract and ingest cells; the container's sampled memory (`docker stats`, page cache excluded) stayed between 1.3 and 2.5 GB.
+
+**Unlimited, against block 5.** The deployed runtime image reaches 85.3 docs/min (153.6 pages/min) for extraction at the defaults, against 91.2 docs/min (91.1-92.1 with `MALLOC_ARENA_MAX=2`) for the same configuration and request set in 15.2. The test image measured the same way, in the same session, gives 85.4: the 6-7 % gap is the method (client in its own container over the compose network instead of inside the server's container, another session), not the image. Latency (p50 10.5 s, p95 13.4 s against 9.8-10.0 / 12.4-13.0 s), CPUs used (12.5 of 16, 78 %, against 79 %), per-page stage times (OCR 2.6-2.7 s, NER 1.7-1.8 s against 2.5 / 1.6-1.7 s) and the server peak (2.5 GB against 2.2-2.3 GB) match 15.2.
+
+**Ingestion is limited by the embedder, not by the CPUs.** Ingestion runs at 50.9 docs/min (84.8 pages/min) using only 4.9 of 16 CPUs, and the same 47-50 docs/min with 8 CPUs. Its embedding time is 5.8-5.9 s per page at J 12 against 0.7 s per page when 2 jobs share 4 CPUs: the e5 embedder is one model under one lock with 2 torch threads (`app/adapters/embeddings/embedder.py`), so concurrent ingestions queue for it, as NER did before its pool (13.2). 125 pages at about 0.7 s each is about 87 s, the 88 s wall time of the cell. This was not measured in block 5 (sections 13-15 timed extraction only; 16.1 indexed 600 documents at 35.6 docs/min while a model download ran). It is not a setting: more ingestion throughput per process needs a pool of embedder instances (or more torch threads per call, untested), a code change outside this task (17.9).
+
+**With `cpus: 8`.** The oversubscription warning is logged once at start with the defaults (`NER_POOL_SIZE x TORCH_THREADS exceeds the CPUs available to the process`, `cpus_requested` 16, `cpus_available` 8; also at 4 CPUs with `cpus_available` 4), and not with pool 4 at 8 CPUs or pool 2 at 4 CPUs: the cgroup quota detection works in the deployed container. The defaults do hurt there: extraction falls to 54.0 docs/min with the quota throttled in 92-94 % of the periods and OCR and NER both about 1.6 times slower per page, while 6 / 4 gives 61.4 (+14 %) and 8 / 4 gives 59.0. At 4 CPUs the defaults give 27.9 against 37.5 for 3 / 2 (+34 %, one round). Too few jobs leave CPUs idle (4 / 4 at 8 CPUs uses 5.5 CPUs and reaches 50.6; 2 / 2 at 4 CPUs uses 2.9 and reaches 29.3). Ingestion barely moves with the settings (47-50 docs/min at 8 CPUs, 29-40 at 4), because the embedder queue sets it.
+
+### 17.4 Sizing (D7 rule: the smallest setting within 5 % of the best extraction throughput)
+
+| CPUs available to the app (quota or host) | `MAX_CONCURRENT_JOBS` | `NER_POOL_SIZE` (`TORCH_THREADS` 2) | extract docs/min (pages/min) | ingest docs/min | evidence |
+|---|---|---|---|---|---|
+| 16 | 12 | 8 | 85.3 (153.6) here; 88-92 in 15.6 | 50.9 | 15.6 (rule applied on this host), 17.3 (confirmed on the deployed image) |
+| 8 | 6 | 4 | 61.4 (110.5) | 50.3 | 17.3: best 61.4, band from 58.3; 8 / 4 (59.0) is also inside, 4 / 4 (50.6) and the defaults (54.0, -12 %) are outside |
+| 4 | 3 | 2 | 37.5 (67.5) | 37.6 | 17.3, one round: band from 35.6; 4 / 2 (36.2) is also inside, 2 / 2 (29.3) and the defaults (27.9, -26 %) are outside |
+| other | about 3/4 of the CPUs (at least 2) | CPUs / `TORCH_THREADS` | not measured | not measured | the three measured points follow this rule; it is a rule of thumb between and beyond them |
+
+The defaults (12 / 8) remain right for the 16-CPU host they were measured on and are not changed; on a smaller host or under a CPU limit they cost 12 % (8 CPUs) to 26 % (4 CPUs) of extraction throughput, and the start-up warning flags exactly that case. Pool = CPUs / `TORCH_THREADS` is the largest pool without the warning. Memory at the smaller settings is lower (server peak 2.2-2.6 GB against 2.5-2.8 GB).
+
+### 17.5 Questions on the deployed stack (`gpu` profile)
+
+**Stack.** `docker compose --profile gpu up -d --wait` of the copy (project `perf_gpu`), with the project's own volumes filled from read-only mounts of section 16's: the Qdrant index of the 600 documents (3,299 chunks, collection `chunks_eb486d86e2d5`) and, from the models volume, only `gemma4:e4b-it-qat`'s manifest, blobs and metadata (5.9 GB). Defaults throughout (`LLM_READ_TIMEOUT_S` 60, `LLM_TOTAL_TIMEOUT_S` 90, `MAX_CONCURRENT_QUESTIONS` 16), no harness rewrite and no proxy: the service's own client talks to Ollama. Checked in the running stack (`gpu_env.txt`): the app's server process has `LLM_BASE_URL=http://ollama:11434/v1`, `LLM_MODEL=gemma4:e4b-it-qat`, `LLM_REASONING_EFFORT=none` (set by the compose start command) and no `LLM_API_KEY`; Ollama 0.40.12 has `OLLAMA_NUM_PARALLEL=2`, `OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_CONTEXT_LENGTH=8192`, `OLLAMA_MAX_LOADED_MODELS=1`, `CUDA_CACHE_PATH=/root/.ollama/cuda-cache`; `ollama ps` shows the model 100 % on the GPU, context 8192, until "Forever". Questions: the first N answerable questions of section 16's fixed order (`benchmarks/llm_eval/out/sample.json`, seed 20261029), after 3 warm-up questions; two rounds.
+
+| clients | questions per round | questions/min (rounds) | client p50 / p95 / p99 / max (s) | `llm_ms` p50 / p95 / p99 (s) | statuses | refused: threshold / model | VRAM, device max (GB) |
+|---|---|---|---|---|---|---|---|
+| 1 | 150 | 81.1, 100.0 | 0.54-0.62 / 1.29-1.50 / 1.77-2.38 / 1.90-7.17 | 0.49-0.56 / 1.27-1.44 / 1.72-2.34 | 300 x 200 | 6 / 10 per round | 5.9-6.5 |
+| 16 | 320 | **127.8, 136.3** | 7.0-7.5 / **9.6-9.7** / 10.7-11.5 / 11.9-12.2 | 7.0-7.5 / 9.6 / 10.7-11.5 | 640 x 200 | 13 / 22-23 per round | 5.9-6.4 |
+
+This confirms 16.5 and 16.7 on the deployed stack: one client gets p50 0.54-0.62 s and p95 1.29-1.50 s (16.5: 0.56 / 1.79 s for questions that call the model); 16 clients get 128-136 questions/min with p95 9.6-9.7 s (16.7 at `OLLAMA_NUM_PARALLEL` 2: 123-125 questions/min, p95 12.3-12.4 s, through the proxy and with raised timeouts). The first one-client round had one 7.2 s outlier and a slower start (81 against 100 questions/min); the second round's maximum was 1.9 s. VRAM is the device total including about 1.2 GB used by the desktop at idle. The loaded maximum (12.2 s) is a fifth of `LLM_READ_TIMEOUT_S`, so **`MAX_CONCURRENT_QUESTIONS` 16 and `LLM_READ_TIMEOUT_S` 60 stay** (D9); `OLLAMA_NUM_PARALLEL` 1 and 4 were not re-measured on the deployed stack (16.7 has them).
+
+### 17.6 Cold start, end to end
+
+Time of `docker compose [--profile gpu] up -d --wait` until it returns (every service healthy, the one-shot pull completed), with the container timestamps from `docker inspect`:
+
+| case | runs | `up -d --wait` (s) | breakdown | first question (s) |
+|---|---|---|---|---|
+| (a) no profile, new containers and new Qdrant volume | 1 | 20.1 | Qdrant start to app start 5.7 s; app start to healthy 13.4 s | - |
+| (a) no profile, from a stopped stack (`stop`, then `up`) | 3 | 17.4-17.9 | Qdrant start to app start 5.7 s; app start to healthy 11.2 s | - |
+| (a) no profile, recreated containers (`down` without `-v`) | 2 | 17.6, 17.6 | as above | - |
+| (a) no profile, fresh stack in each throughput run (17.3, runtime image) | 14 | 17.6-18.3 (median 17.6) | lifespan (`service started` `duration_ms`) 4.1-4.2 s | - |
+| (b) `gpu`, fresh containers, model and compiled CUDA kernels in the volume (`down`, then `up`) | 3 | 19.7, 20.5, 23.4 | Ollama start to healthy 5.4-5.8 s; `ollama-pull` 3.5-6.6 s (pull check 0.74-0.77 s, warm-up prompt 2.6-5.6 s); app start to healthy 9.0-9.1 s | **0.92, 0.99, 1.07** (model call 0.75-0.94 s) |
+| (c) `gpu`, first-ever start of the project (model just copied into the new volume, no CUDA kernel cache) | 1 | **85.0** | `ollama-pull` 68.6 s: pull check 1.0 s, warm-up prompt 60 s (model load 36 s, then 31 s to the first token); app start to healthy 9.0 s | 1.42 (model call 1.22 s) |
+
+The first question after a start is answered in about 1 s in every case, far below `LLM_READ_TIMEOUT_S` (60 s) and `LLM_TOTAL_TIMEOUT_S` (90 s): the warm-up in `ollama-pull` and `OLLAMA_KEEP_ALIVE=-1` take the model load (and, on a first start, the CUDA kernel compilation) out of the request path, which in section 16.7 made a first question take 65 s. On a first-ever start the stack is healthy only after about 85 s (D2 measured 33-50 s load plus 33-46 s compilation on a 1B model; here 36 + 31 s), and a model download, when the volume is empty, comes on top (not measured here: about 6 GB). A cold page cache could not be forced: Docker Desktop's VM page cache cannot be evicted from the host without a privileged container writing `drop_caches`, which was not done; so "first-ever" here means new containers and volumes and no CUDA kernel cache, with the model blobs probably still in the page cache from the copy.
+
+**Where the 17.6 s without a model go.** Qdrant listens 0.16 s after its container starts (its own log), but its healthcheck (`interval: 5s`, no `start_interval`) first passes 5.0-5.2 s after start, so the app starts 5.7 s after Qdrant in every run. The app then needs about 10.3 s to `Application startup complete` (interpreter start and imports about 6 s, lifespan 4.1-4.2 s; 9.0-9.1 s in total in the `gpu` runs) and is marked healthy at the next 2 s probe (`start_interval` 2 s of the image's healthcheck). The Ollama healthcheck has the same 5 s interval (5.4-5.8 s from start to healthy). A `start_interval` of about 1 s on the Qdrant and Ollama healthchecks would most likely take about 4 s off each of these starts (not measured: the compose file was not changed, 17.9).
+
+### 17.7 Parity of the deployed runtime image with the test image (evidence plan item 4)
+
+The 60 documents of the seed-0 sample through the deployed stack twice, once with the runtime image and once with the test image as the app service (`APP_IMAGE=docintel-test`, the same compose copy and the same client, `parity.py`): `/api/extract` with the documents' name lists, then `/api/ingest` into the empty store, 4 clients:
+
+| check | identical / total | detail |
+|---|---|---|
+| extract: whole JSON body (names, boxes, matches, their order) | **60 / 60** | 805 names, each with its box, 86 matches; every status 200 |
+| ingest: HTTP status, result status, `chunks_stored` | **60 / 60** | 327 chunks; every result `indexed` |
+| against block 5's run (`p81.json` of 13.1, test image of `add-http-api`): names, matches and chunks per document | **60 / 60** each | same totals: 805 names, 86 matches, 327 chunks |
+
+No difference, so no document is reported. Block 5's raw outputs keep only per-document counts and equality flags, not the bodies, which is why the exact comparison was regenerated with the current test image. Wall times: extraction 66.1 s (runtime) and 65.8 s (test), ingestion 78.5 and 78.3 s.
+
+### 17.8 Smoke suite and hygiene against the `gpu` stack
+
+`docker compose -f docker-compose.yml -f docker-compose.smoke.yml --profile gpu run --rm smoke` from the copy (`gpu_smoke.txt`): **12 passed, 2 skipped** (the two "without a model" variants, skipped because readiness reports a configured model), exit 0. The answerable smoke questions were answered by e4b (two `question completed` lines with `refused: false`, model calls of 0.53 and 0.28 s); the off-topic question was refused below the threshold. `... run --rm hygiene`: all 13 checks `ok` (uid 10001, tini as PID 1, no pytest, pymupdf or development tools, no tests, sample PDFs or `.env` in the image, Hugging Face offline, `MALLOC_ARENA_MAX=2`, read-only code and models, the service imports), exit 0. The smoke suite ingested the sample PDFs into the project's copy of the index after the question runs.
+
+### 17.9 Findings and caveats
+
+**Defaults.** No default is changed. Confirmed on the deployed stack: `MAX_CONCURRENT_JOBS` 12 / `NER_POOL_SIZE` 8 / `TORCH_THREADS` 2 on 16 CPUs (17.3), `MAX_CONCURRENT_QUESTIONS` 16, `LLM_READ_TIMEOUT_S` 60, `LLM_TOTAL_TIMEOUT_S` 90, `OLLAMA_NUM_PARALLEL` 2, `OLLAMA_KEEP_ALIVE` -1, `OLLAMA_CONTEXT_LENGTH` 8192 and the `ollama-pull` warm-up (17.5, 17.6). For smaller hosts, the sizing table of 17.4 instead of a new default.
+
+**Findings for the main session** (not fixed here; this task changes no code or configuration):
+1. **Ingestion throughput is capped by the single e5 embedder** (one instance under a lock): about 50 docs/min (85 pages/min) per process on 16 CPUs with 4.9 CPUs busy, unchanged at 8 CPUs. A pool of embedders (as for NER, section 14) or measured `TORCH_THREADS` above 2 would be the levers; a candidate for `KNOWN_LIMITATIONS.md` if not addressed.
+2. **Healthcheck intervals cost about 5 s per dependency at start** (Qdrant and Ollama: `interval: 5s` without `start_interval`): about a third of the 17.6 s start without a model. A `start_interval` (Docker Engine 25 or later) is the likely fix; not measured.
+3. **The job defaults lose 12-26 % of extraction throughput under a CPU limit of 8 or 4** (17.3); the start-up warning appears in exactly those cases. Documenting the sizing table (task 7.1) is the measured remedy; deriving the defaults from the available CPUs would be a code change and was not measured beyond the three points.
+4. **The runtime image is not smaller than the test image** (5.84 against 5.75 GB, 17.2), because of its bytecode; worth stating in the README rather than claiming a slimmer image.
+
+**Caveats.** One host, one session per measurement; the client in its own container makes the absolute figures 6-7 % lower than block 5's (shown by the test-image control), so compare within this section. The 4-CPU configurations ran once. A `cpus:` quota is not a smaller machine: the container still sees 16 CPUs, so `OCR_WORKERS` stayed 4 and torch and Tesseract threads were scheduled on all 16 under the quota. Short documents only (the 50-page workload of 15.3 was not repeated under a limit). The question runs use only answerable questions of section 16's order with the default `OLLAMA_NUM_PARALLEL` 2, and the 1-client figures are sensitive to a single slow call (7.2 s in one round). The first-ever start ran with the model blobs probably in the page cache, and with no download (17.6).
+
+---
+
+## 18. Embedder pool and concurrency derived from the CPUs (`add-deployment` task 6.2, design D10)
+
+Scripts: `benchmarks/embed_pool/scripts/` (local, like every benchmark script; driver `run.sh`, timing runs in `chain.sh`, see `benchmarks/README.md` step 11).
+
+**Root cause (17.3, 17.9 finding 1).** `E5Embedder` ran every call (passage batches and question queries alike) under one `threading.Lock` around both the tokenizer and the forward pass, so one process embedded one batch at a time with `TORCH_THREADS` (2) CPUs: 5.3 chunks/s however many jobs waited (18.2), and an ingestion job held its job slot mostly waiting for that lock (5.8-7.1 s of `embed_ms` per page at 12 jobs against 0.7 s alone). The lock was wider than needed: the model only runs forward in `eval` mode under `torch.inference_mode`, which torch allows from several threads, and the only shared mutable state is the fast tokenizer's truncation, padding and special-token settings, which `transformers` (5.21) sets in place on a call only when they differ from the requested ones (`set_truncation_and_padding`), and which are the same on every call of the embedder. **Design (as built):** `EMBEDDING_POOL_SIZE` passage batches run at once with the one model and the one tokenizer; tokenising runs under one lock (0.26 % of a call, 18.1), the forward pass and pooling outside it; one warm-up call at load settles the tokenizer settings, which are then only read; one extra slot is reserved for queries, and a waiting query takes the next free slot before any waiting passage (18.3); `close()` releases the model and fails waiting and later calls with `embedding_failed`. Errors are mapped as before (fixed messages, cause kept).
+
+**Environment.** As in sections 13-17 (16 CPUs, AMD Ryzen 7 7700X, Docker Desktop WSL2, nothing else running during the timing runs). Image `docintel-test` built with `docker build --target test -t docintel-test .` from the tree of this task (torch 2.14.1+cpu, transformers 5.21.0, tokenizers 0.23.3); the confirmation runs of 18.4 with the image rebuilt after the reserved slot was added (`sha256:bd880278...`). Every script ran through `docker-compose.test.yml` (project `embpoolev`, with its Qdrant, `down -v` after each script); CPU limits by a `cpus:` quota on the measuring container (`compose.cpus.yml`; `cpu.max` read `800000 100000` and `400000 100000`, and the server's `concurrency in use` line reported `cpus_available` 8 and 4). Inputs: the 60 documents of the seed-0 sample (section 2.8) read once with the production OCR engine and chunked exactly as `IngestDocument` does (`chunks.py`): **327 chunks** (102 pages, mean 617 characters, at most 9 chunks per document), one `embed_passages` call per document as the use case makes them (batches of at most 16); questions from the corpus QA set.
+
+### 18.1 Identical vectors (`correct.py`)
+
+**Method.** Expected vectors: a pool of 1 called sequentially on the 60 passage calls and 200 questions (260 calls). Then a pool of 4 called from 16 threads on the same calls, three rounds in different shuffles; every vector compared component by component.
+
+| check | result |
+|---|---|
+| vectors, pool 4 under 16 threads vs pool 1 sequential | **780 / 780 calls bit-identical** (3 rounds of 260), maximum absolute difference **0.0**; 0 exceptions |
+| structure | one encoder, one model (eval mode), one fast tokenizer; after the warm-up the tokenizer's truncation is `{max_length 512, longest_first, right}` and padding is set |
+| share of a call spent tokenising (under the lock) | **0.26 %** (40 passage batches: tokenising against forward pass) |
+| wall time | pool 1 sequential 70.7 s; pool 4 at 16 threads 25.5-27.2 s (2.6-2.8 x) |
+| after `close()` | `ProcessingFailed('embedding_failed', 'embedding model is closed')` |
+| negative control: 16 threads on one fresh tokenizer, no lock, no warm-up | 320 / 320 calls without error with constant settings, and also with `max_length` alternating 512 / 256 between calls |
+
+The tolerance stated by the spec and the tests (1e-6 per component) is therefore not even used on this host: concurrency does not change a single bit, because each call computes the same shapes with the same kernels. As in 14.1, the tokenizer failure the lock guards against (a concurrent in-place change of its settings, `RuntimeError: Already borrowed` in the Rust binding) was not reproduced; the lock rests on the code path, costs 0.26 % of a call and was kept for consistency with the NER pool.
+
+### 18.2 Embedding alone: pool size x concurrency (`bench_one.py`, `bench_all.py`)
+
+**Method.** A fresh process per configuration (pool P, `TORCH_THREADS` 2, P concurrent warm-up calls), then the 60 passage calls pulled from a shared queue by 1 and by 16 threads; two passes (pass 2 in reverse order of pools and concurrencies). "docs/min" is the embedding rate alone (the 60 documents' chunks per minute), not comparable with the end-to-end figures of 18.4. Call latency includes the wait for a slot.
+
+| pool | concurrent calls | chunks/s (passes) | mean | docs/min | call p50 / p95 (s) | process CPUs | errors |
+|---|---|---|---|---|---|---|---|
+| 1 | 1 | 5.1, 5.3 | 5.2 | 57.4 | 1.03 / 1.83 | 2.00 | 0 |
+| 1 | 16 | 5.3, 5.3 | 5.3 | 58.8 | 1.26 / 58.20 | 2.00 | 0 |
+| 2 | 16 | 9.5, 9.3 | 9.4 | 103.6 | 1.39 / 32.96 | 3.88 | 0 |
+| 4 | 16 | 14.8, 14.8 | 14.8 | 163.1 | 1.67 / 21.19 | 7.49 | 0 |
+| 6 | 16 | 17.9, 17.7 | 17.8 | 196.1 | 1.99 / 17.56 | 11.34 | 0 |
+| 8 | 16 | 18.9, 18.3 | 18.6 | 205.0 | 2.55 / 16.70 | 14.83 | 0 |
+
+At one call at a time every pool gives 5.2-5.5 chunks/s (call p50 0.97-1.03 s for a document's batch). With 16 callers the rate scales with the CPUs the pool can use (P x 2) up to pool 6 (11.3 CPUs, 3.4 x the former embedder) and adds 4 % more at pool 8 with all 16 CPUs busy; each batch gets slower as more run (p50 1.26 s at pool 1, 2.55 s at pool 8). With pool 1, the p95 of 58 s is a call waiting behind the other 15 (and some calls waited far longer than others: the slot was not handed out in arrival order, see 18.3; fixed by the FIFO hand-off of 18.6).
+
+| pool | RSS after import (MB) | after load | after warm-up | peak (`VmHWM`) over the cells, pass 1 / pass 2 |
+|---|---|---|---|---|
+| 1 | 229 | 1,004-1,005 | 1,032-1,054 | 1,468 / 1,485 |
+| 2 | 229 | 1,005 | 1,049-1,064 | 1,550 / 1,610 |
+| 4 | 229 | 1,005 | 1,146-1,174 | 1,777 / 1,664 |
+| 6 | 229 | 1,005-1,006 | 1,193-1,234 | 1,827 / 1,818 |
+| 8 | 229 | 1,004-1,006 | 1,240-1,275 | 1,990 / 2,006 |
+
+The weights are loaded once whatever the pool (1,005 MB after load, the warm-up call included); a pool of 4 costs about +110 MB after warm-up and +180-310 MB at peak against pool 1 (the working memory of four forward passes of up to 16 x 512 tokens), pool 8 about +500 MB at peak. A copy of the model per slot would cost about 1 GB each.
+
+### 18.3 Questions during ingestion: slot policy (`query_latency.py`)
+
+**Method.** In one process, 12 threads (the 12 ingestion jobs of the 16-CPU default) loop over the 60 passage calls while one thread asks 60 corpus questions one after the other, 0.1 s apart (`embed_query` latency, slot wait included); "idle" is the same 60 questions without load. Policies: **none** (a query competes with the passages for the next free slot), **priority** (a waiting query takes the next free slot before any waiting passage batch), **reserved** (priority plus one slot only queries may use: `pool_size` passage batches and `pool_size` + 1 calls at most). The `none` cells stop the loaders after 120 s.
+
+| pool | policy | idle p50 / p95 (ms) | loaded: questions answered | loaded p50 / p95 / p99 / max (ms) | passage batches/s |
+|---|---|---|---|---|---|
+| 2 | none | 47.9 / 58.5 | **1, starved**: still waiting at 125 s | 129,835 (the one question; it ran when the loaders stopped) | 1.90 |
+| 4 | none | 47.1 / 56.9 | **1, starved**: still waiting at 125 s | 126,756 (as above) | 2.59 |
+| 1 | priority | 50.0 / 61.2 | 60 | 1,188 / 2,025 / 2,104 / 2,150 | 0.81 |
+| 2 | priority | 48.8 / 57.8 | 60 | 573 / 1,278 / 1,548 / 1,811 | 1.59 |
+| 4 | priority | 49.3 / 61.3 | 60 | 344 / 886 / 1,039 / 1,151 | 2.51 |
+| 1 | **reserved** | 47.0 / 61.7 | 60 | **53 / 67 / 70 / 71** | 1.08 |
+| 2 | **reserved** | 48.2 / 57.9 | 60 | **62 / 82 / 88 / 89** | 1.73 |
+| 4 | **reserved** | 49.3 / 58.2 | 60 | **81 / 102 / 106 / 106** | 2.38 |
+
+Without priority a question is **starved**: a thread that has just finished a batch takes the freed slot again before a woken waiter can (the condition is not fair, nor was the former lock), so the question waited for minutes and ran only when the passage threads stopped. Priority bounds the wait by the remaining time of a running batch (p50 0.3-1.2 s, p95 0.9-2.0 s, growing as the pool shrinks). The reserved slot removes the wait: loaded questions take 53-81 ms (p95 67-102 ms) against 47-49 ms idle, and the passages' rate does not drop (1.08 / 1.73 / 2.38 batches/s against 0.81 / 1.59 / 2.51 with priority alone; these 7-10 s windows are short and noisy, and a query uses 2 threads for about 50 ms). **Decision: priority plus one reserved slot for queries** (as built). The passage batches themselves still took the slot in no particular order, as the NER pipelines did (a 50-page ingestion makes 4-5 calls of 16 chunks and a short one usually one); both are handed out in arrival order since 18.6.
+
+### 18.4 End to end `/api/ingest` through HTTP (`http_ingest.py`)
+
+**Method.** Block 5's method (15.1): one Uvicorn process per configuration in the test container, `BUSY_WAIT_S=300` (nothing rejected), a fresh collection prefix per server (every ingestion `indexed`), warm-up 2 sequential and 8 concurrent ingestions of other documents; then the 75-document ingest set of 17.1 (the 60 sample documents and per language the first three corpus documents outside the sample; 125 pages) from 16 client threads, while one more client asks a corpus question every 0.5 s (`RAG_THRESHOLD=1.0`, so every question is embedded and searched, then refused below the threshold; no language model is needed). Two passes per configuration, the second in reverse order. The client ran in the server's container (as in 13-15, unlike 17), so absolute figures are not those of 17.3. "CPUs used" is from `/proc/stat` over the cell (host-wide, client included). The grid ran with **priority only** (before the reserved slot was added); the rows marked "reserved" are the confirmation runs with the code as built, in a later session.
+
+| CPUs | J / NER / emb pool | docs/min (passes) | mean | pages/min | client p50 / p95 (s) | CPUs used | OCR / embed ms per page | question p50 / p95 / max (s) | question `embed_ms` p50 / p95 | server peak (MB) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 16 | 12 / 8 / 1 (former) | 43.8, 47.8 | 45.8 | 76.4 | 17.1 / 36.1 | 5.0 | 2,144 / 6,739 | 0.76 / 1.64 / 2.30 | 753 / 1,631 | 2,472-2,516 |
+| 16 | 12 / 8 / 2 | 69.4, 71.4 | 70.4 | 117.3 | 11.5 / 20.1 | 8.6 | 2,390 / 3,389 | 0.58 / 1.25 / 1.71 | 523 / 1,215 | 2,498-2,566 |
+| 16 | **12 / 8 / 4** | 86.8, 85.8 | **86.3** | 143.9 | 10.3 / 13.7 | 12.7 | 2,868 / 1,804 | 0.48 / 1.35 / 2.12 | 434 / 1,324 | 2,630-2,635 |
+| 16 | 12 / 8 / 6 | 84.7, 83.8 | 84.2 | 140.4 | 10.4 / 14.3 | 13.0 | 3,022 / 1,739 | 0.41 / 1.09 / 1.47 | 388 / 1,065 | 2,781-2,801 |
+| 16 | 12 / 8 / 8 | 85.2, 85.4 | 85.3 | 142.2 | 10.1 / 14.4 | 13.1 | 2,993 / 1,739 | 0.34 / 0.83 / 1.19 | 297 / 767 | 2,784-2,824 |
+| 16 | 12 / 8 / 4, reserved | 81.5, 83.7 | 82.6 | 137.6 | 10.5 / 14.5 | 12.8 | 2,946 / 1,946 | 0.30 / 0.65 / 1.08 | 277 / 627 | 2,690-2,757 |
+| 8 | 6 / 4 / 1 | 47.7, 47.6 | 47.7 | 79.4 | 18.7 / 25.1 | 4.9 | 1,903 / 2,474 | 0.65 / 1.46 / 1.90 | 643 / 1,454 | 2,323-2,354 |
+| 8 | **6 / 4 / 2** | 62.8, 64.8 | **63.8** | 106.3 | 14.2 / 17.4 | 7.3 | 2,193 / 1,056 | 0.26 / 1.23 / 1.88 | 258 / 1,229 | 2,453-2,495 |
+| 8 | 6 / 4 / 4 | 62.3, 62.6 | 62.4 | 104.0 | 14.5 / 17.7 | 7.5 | 2,299 / 1,015 | 0.10 / 0.27 / 0.92 | 86 / 259 | 2,464-2,515 |
+| 8 | 6 / 4 / 2, reserved | 62.0, 61.5 | 61.8 | 103.0 | 14.8 / 17.8 | 7.3 | 2,257 / 1,092 | 0.09 / 0.20 / 0.30 | 80 / 166 | 2,424-2,441 |
+| 4 | **3 / 2 / 1** | 37.2, 37.1 | **37.1** | 61.9 | 24.9 / 28.8 | 3.8 | 1,918 / 925 | 0.36 / 1.54 / 2.11 | 359 / 1,536 | 2,274-2,361 |
+| 4 | 3 / 2 / 2 | 36.9, 37.7 | 37.3 | 62.2 | 25.1 / 28.6 | 4.0 | 2,016 / 827 | 0.09 / 0.65 / 1.70 | 74 / 642 | 2,349-2,373 |
+| 4 | 3 / 2 / 1, reserved | 35.9, 36.2 | 36.1 | 60.2 | 25.6 / 29.8 | 3.8 | 1,980 / 948 | 0.08 / 0.16 / 0.24 | 66 / 139 | 2,359-2,376 |
+
+Every request of every cell returned 200 (75 ingestions and 49-214 questions per cell); no warning or error was logged; servers were ready in 10.7-12.1 s.
+
+**Findings.** On 16 CPUs the former single embedder gives 45.8 docs/min with 5.0 CPUs busy and 6.7 s of embedding per page (the 17.3 picture: 50.9 docs/min, 4.9 CPUs, 5.8 s); **pool 4 gives 86.3 docs/min (1.9 x)** with 12.7 CPUs busy and 1.8 s of embedding per page, and the client p95 falls from 36 to 14 s. Beyond 4 nothing is gained (84.2 and 85.3 at 6 and 8): OCR becomes the limit again (2.9-3.0 s per page) as in 15.4. With a quota of 8 CPUs pool 2 gives 63.8 docs/min against 47.7 for pool 1 (+34 %) and 62.4 for pool 4; with 4 CPUs pools 1 and 2 are equal (37.1 and 37.3). Ingestion now reaches the extraction rate of the same CPUs (17.3: 85.3, 61.4 and 37.5 docs/min at 16, 8 and 4 CPUs with the sizing table). The reserved slot shortens the question's wait for a slot without a measurable cost: question `embed_ms` p95 0.63 s against 1.32 s on 16 CPUs (the rest is CPU contention: 13 of 16 CPUs busy), 0.17 s against 1.23 s on 8 and 0.14 s against 1.54 s on 4, at 82.6, 61.8 and 36.1 docs/min, 2.7-4.3 % below the grid's 86.3, 63.8 and 37.1 (a later session; the faster answers also let the question client ask 29-86 % more questions in a cell). Memory: the server peak rises by about 120-160 MB from pool 1 to pool 4 (2.47-2.52 against 2.63 GB) and by 300 MB to pool 8.
+
+### 18.5 Choice and the derived defaults
+
+D7's rule (the smallest setting within 5 % of the best throughput), on ingestion docs/min:
+
+- **16 CPUs:** best 86.3 (pool 4), band from 82.0; pool 2 (70.4, -18 %) is outside, **pool 4 is the smallest inside** (6 and 8 are inside too).
+- **8 CPUs (J 6):** best 63.8 (pool 2), band from 60.6; pool 1 (47.7) is outside, **pool 2** is the smallest inside (4: 62.4).
+- **4 CPUs (J 3):** best 37.3 (pool 2), band from 35.4; **pool 1** (37.1) is inside.
+
+So the embedder pool is CPUs / (2 x `TORCH_THREADS`), at most 4: half the CPUs a pool of `CPUs / TORCH_THREADS` would use, because OCR (one thread per Tesseract process) needs the rest. **Applied:** `EMBEDDING_POOL_SIZE` unset = derived, `E5EmbedderConfig.pool_size` = 4 (the 16-CPU value, for standalone use), one reserved query slot. The other three values follow the measured sizing table of 17.4 and keep the existing OCR default; `concurrency_for(cpus, torch_threads)` in `app/bootstrap.py` is the one rule:
+
+- `MAX_CONCURRENT_JOBS` = three quarters of the CPUs rounded up, at most 12 (rounding up because one job too few cost more than one too many where measured: at 4 CPUs 2 jobs -22 %, 4 jobs -3 %; at 8 CPUs 4 jobs -18 %, 8 jobs -4 %, 17.3);
+- `NER_POOL_SIZE` = CPUs / `TORCH_THREADS` rounded down, at most 8 (the largest pool without the oversubscription warning, 17.4);
+- `EMBEDDING_POOL_SIZE` = CPUs / (2 x `TORCH_THREADS`) rounded down, at most 4 (above);
+- `OCR_WORKERS` = the CPUs, at most 4 (the former `min(4, cpu_count)`, now with the quota: 15.2 found 3, 4 and 5 equivalent on 16 CPUs; not re-measured under a quota);
+- each at least 1; a set value always wins; the values in use are logged once at start-up (`concurrency in use`, with `cpus_available`) and a warning is logged per pool whose size x `TORCH_THREADS` exceeds the CPUs (the derived pools never do).
+
+| CPUs available | 1 | 2 | 4 | 6 | 8 | 12 | 16 | 32 |
+|---|---|---|---|---|---|---|---|---|
+| `MAX_CONCURRENT_JOBS` | 1 | 2 | **3** | 5 | **6** | 9 | **12** | 12 |
+| `NER_POOL_SIZE` (T 2) | 1 | 1 | **2** | 3 | **4** | 6 | **8** | 8 |
+| `EMBEDDING_POOL_SIZE` (T 2) | 1 | 1 | **1** | 1 | **2** | 3 | **4** | 4 |
+| `OCR_WORKERS` | 1 | 2 | **4** | 4 | **4** | 4 | **4** | 4 |
+
+Bold columns are measured (17.3 / 17.4 for jobs and NER pool, 18.4 for the embedder pool, 15.2 and 17.3 for OCR workers at 4); the others follow the rule and were not measured. Above 16 CPUs the caps keep the 16-CPU values, so a larger host is not used fully by one process (replicas, `KNOWN_LIMITATIONS.md` P4).
+
+**Caveats.** One host, synthetic scans, short documents; the 50-page workload and mixed extract + ingest load were not repeated with the embedder pool (they share the CPUs, and the job limit bounds both pools together). The client ran in the server's container. The grid and the confirmation runs are different sessions (2.7-4.3 % apart for the same pool), so the reserved slot's throughput cost is bounded, not measured exactly; its question latency gain is large and consistent (18.3, 18.4). The 8- and 4-CPU points are CPU quotas on a 16-CPU host (threads still spread over 16 CPUs), not smaller machines. A deployed-stack re-measurement with the derived defaults is task 6.3 (section 19).
+
+### 18.6 FIFO hand-off of the NER pipelines and the embedder slots (`chain_fifo.sh`, `fifo_tables.py`)
+
+**Problem.** Both pools admitted callers through a plain `threading.Condition`: a freed slot went to whichever thread took the lock next, which is usually the thread that has just released it and calls again before a woken waiter runs (18.2: with pool 1 some calls waited 58 s while others took 1 s; 18.3: a query without priority was starved for minutes). This was `KNOWN_LIMITATIONS.md` P11. **Change (as built).** `app/adapters/slots.py` (`FifoSlots`, shared by both adapters) hands a freed slot directly to the first waiter of its queue (one condition per waiter on one lock), so a caller that arrives, or comes back, while others wait queues behind them. Lanes keep the embedder's policy: queries (lane 0) may use every slot including the reserved one and are served first, passage batches (lane 1) hold at most `EMBEDDING_POOL_SIZE` slots; each lane is FIFO. The NER pool is one lane of `NER_POOL_SIZE` slots. `close()`, the error codes and messages, and the vectors and spans are unchanged (the models' calls are the same; only the order of admission changes). Unit tests: `tests/adapters/test_slots.py` (arrival order, a releasing thread does not overtake a waiter, lane priority and limits, close, interrupted waits) and ordering tests in the recogniser and embedder tests (a job calling page after page, or a call with several batches, does not overtake a waiting call; waiting queries before waiting passages, each in arrival order).
+
+**Method.** The scripts of 18.2 (`bench_one.py`, now also recording every call's latency and the calls served per worker thread), 18.4 (`http_ingest.py`, now also recording each job's `embed_ms` and `duration_ms`) and 15.2 (`p15.py`, each job's `ner_ms` and `duration_ms` from the outcome lines), run with the test image before the change (`docintel-test:prefifo`, the tree of task 6.2) and after it (`docintel-test:fifo`), one pass per run in the order before, after, after, before (the extract cells also once more before, and pool 4 four more passes, after, before, after, before); compose project `fifoev`, `down -v` after every script; otherwise as in 18.2 and 18.4 (client in the server's container, 16 CPUs or a `cpus: 8` quota). "CV" is the standard deviation over the mean. Per-job stage times are per page of the job, waiting for a slot included.
+
+**Embedding alone** (16 threads pulling the 60 passage calls from a queue):
+
+| pool | image | chunks/s (passes) | call p05 / p50 / p95 / max (s) | CV | calls served per thread |
+|---|---|---|---|---|---|
+| 1 | before | 5.49, 5.39 | 0.51-0.52 / 1.23-1.25 / 57.0-58.1 / 59.6-60.7 | 1.61 | 1-45 |
+| 1 | **after** | 5.40, 5.45 | 3.46-3.56 / 15.4-15.6 / 18.1-18.2 / 18.7-18.8 | 0.33-0.34 | **3-4** |
+| 4 | before | 15.14, 15.20 | 0.73-0.77 / 1.63 / 20.3-20.5 / 21.5-21.6 | 1.44 | 1-14 |
+| 4 | **after** | 15.54, 15.57 | 1.35-1.38 / 5.08 / 6.38-6.48 / 7.18-7.38 | 0.32-0.33 | **3-5** |
+
+Before, a few threads kept the slot for most of the run (one served 45 of the 60 calls with pool 1) and the others waited up to a minute; after, every thread gets 3-5 calls and the slowest call waits 18.8 s instead of 60.7 s (pool 1) or 7.4 s instead of 21.6 s (pool 4). The median rises because it now includes the fair share of waiting (15 calls ahead with pool 1). Throughput is unchanged (pool 1: 5.40-5.45 against 5.39-5.49 chunks/s; pool 4: 15.5-15.6 against 15.1-15.2).
+
+**End to end** (75 requests from 16 clients, one pass per run; per-job values over the 75 jobs of a run):
+
+| workload, CPUs, J / NER / emb | image | docs/min (passes) | mean | client p50 / p95 / max (s) | stage ms per page per job: p50 / p95 / max (s) | CV | job s per page p95 / max |
+|---|---|---|---|---|---|---|---|
+| ingest, 16, 12 / 8 / 4 | before | 87.4, 89.7 | 88.6 | 9.9-10.0 / 12.6-13.7 / 14.3-16.9 | embed 1.72-1.74 / 2.75-3.26 / 3.39-7.72 | 0.30-0.49 | 7.13-7.57 / 7.98-11.28 |
+| ingest, 16, 12 / 8 / 4 | after | 89.2, 89.3 | **89.3** | 9.9-10.0 / 13.3-13.5 / 14.4-16.0 | embed 1.75-1.81 / 2.73-2.80 / 2.97-3.33 | 0.27-0.29 | 6.81-7.15 / 8.25-8.37 |
+| ingest, `cpus: 8`, 6 / 4 / 2 | before | 62.2, 64.6 | 63.4 | 13.9-14.7 / 17.2-17.8 / 17.8-19.0 | embed 1.01-1.02 / 1.83-1.94 / 2.41-2.45 | 0.37-0.40 | 5.05-5.26 / 5.59-6.60 |
+| ingest, `cpus: 8`, 6 / 4 / 2 | after | 64.8, 64.6 | **64.7** | 13.9-14.1 / 16.9-17.1 / 17.7-17.8 | embed 0.97-1.00 / 1.80-2.09 / 2.20-2.25 | 0.36-0.38 | 5.17-5.26 / 5.81-6.07 |
+| extract, 16, 12 / 8 | before | 83.6, 84.4 | 84.0 | 10.5-10.6 / 13.3-13.5 / 15.0-16.9 | NER 1.83-1.93 / 2.69-2.73 / 3.22-3.32 | 0.31 | 5.90 / 7.65-8.10 |
+| extract, 16, 12 / 8 | after | 84.7, 84.7 | **84.7** | 10.6-10.9 / 13.8-13.9 / 16.3-17.1 | NER 1.86-1.89 / 2.59-2.71 / 3.03-3.31 | 0.30-0.31 | 5.95-5.97 / 7.91-7.93 |
+| extract, 16, 12 / 4 | before | 85.1, 86.2, 85.6, 86.1 | 85.8 | 10.4-10.6 / 13.0-13.9 / 14.7-17.2 | NER 1.77-1.87 / 2.96-3.28 / 3.72-4.72 | 0.33-0.39 | 6.42-7.40 / 8.23-9.46 |
+| extract, 16, 12 / 4 | after | 83.7, 84.3, 85.9, 85.2 | **84.8** | 10.6-10.8 / 13.2-13.7 / 14.8-16.7 | NER 1.88-1.99 / 2.50-2.83 / 3.22-3.38 | 0.27-0.30 | 5.77-6.24 / 7.52-7.93 |
+
+Every request of every cell returned 200. **Throughput is unchanged within the run-to-run spread**: ingestion +0.8 % (16 CPUs) and +2.1 % (8 CPUs), extraction +0.8 % at the default pool 8 and -1.1 % at pool 4 (two passes each, four at pool 4; the passes of one image differ by up to 3.9 %). **The spread between jobs narrows where jobs compete for a pool**: with 12 extraction jobs on 4 NER pipelines the slowest job's NER time per page falls from 3.7-4.7 s to 3.2-3.4 s, the 95th percentile from 3.0-3.3 to 2.5-2.8 s and the coefficient of variation from 0.33-0.39 to 0.27-0.30 (job time per page p95 6.4-7.4 s against 5.8-6.2 s); on the 16-CPU ingestion runs the worst job's embedding time per page was 7.7 s in one before-run (3.4 s in the other) against at most 3.3 s after. With the default 8 pipelines for 12 jobs, and with 2 passage slots for 6 jobs at 8 CPUs, the per-job spread is the same before and after (CV 0.30-0.31 and 0.36-0.40); client latency (dominated by the job limit and the queue of 16 clients for 12 jobs) is the same. Questions keep the reserved slot and their priority: question `embed_ms` p50 / p95 during ingestion 226-272 / 592-608 ms after against 217-230 / 606-634 ms before on 16 CPUs, and 69-72 / 131-170 against 72-75 / 167-215 ms on 8 (18.4: p95 627 and 166 ms).
+
+**Caveats.** Short documents only: the case P11 named (a 50-page ingestion's 4-5 batches overtaking shorter jobs) is covered by the unit tests and by the embedding-alone runs, not by a 50-page HTTP run. One host, client in the server's container, one pass per run (four for extraction at pool 4).
+
+---
+
+## 19. Deployed stack after the embedder pool, the derived defaults and the FIFO hand-off (`add-deployment` task 6.3)
+
+Scripts: `benchmarks/deploy_perf/scripts/` as in section 17, driven by `chain19.sh` (new commands `gpu-askload` and `smoke` in `run.sh`, `askload` in `client.py`; tables by `tables.py`, `askload_table.py`, `cold_table.py` and `parity.py`). Raw outputs in `benchmarks/deploy_perf/out19/` (local, not committed).
+
+### 19.1 Method and environment
+
+As 17.1, with the tree after task 6.2 and the FIFO hand-off of 18.6: images `docker build --target runtime -t docintel .` (`sha256:f76a09ff...`, 5.84 GB) and the test image from `docker compose -f docker-compose.test.yml build tests` (`sha256:fe0db350...`, 5.75 GB), both on 2026-10-28; same host, Docker Desktop 29.9.2, Compose 5.6.1, nothing else running. The stack is the repository's `docker-compose.yml` and `docker-compose.smoke.yml`, started from a copy with its own `.env` (`out19/stack/`, `compose.diff` shows only `build.context` changed), so the repository-root `.env` took no part; no hosted model was called. **No concurrency setting was set**: the copy's `.env` held only `BUSY_WAIT_S=300` for the timed cells (as in 17, so nothing is shed) and nothing for the cold-start, parity and no-model smoke runs, so `MAX_CONCURRENT_JOBS`, `NER_POOL_SIZE`, `EMBEDDING_POOL_SIZE` and `OCR_WORKERS` were derived at start-up from the CPUs (18.5). CPU limits by `cpus:` on the app service. Compose projects `perf_tp`, `perf_cold`, `perf_par`, `perf_smoke` and `perf_gpu`, each torn down with `down -v`; the evaluation volumes of section 16 were only mounted read-only (copied by `gpu-setup`).
+
+**Derived values in use**, from every run's `concurrency in use` line (`cpus_available`, jobs / NER pool / embedder pool / OCR workers): 16 -> 12 / 8 / 4 / 4, `cpus: 8` -> 8 -> 6 / 4 / 2 / 4, `cpus: 4` -> 4 -> 3 / 2 / 1 / 4, the values of the 18.5 table, in every run (throughput, cold start, parity, smoke, both question runs); no oversubscription warning in any run.
+
+### 19.2 Extract and ingest throughput with the derived defaults
+
+Same cells as 17.3 (75 extractions and 75 ingestions from 16 clients in their own container, fresh stack per run, two rounds, the second in reverse order of CPUs); every request returned 200:
+
+| app CPUs | 17.3, defaults then (J / P) | 17.3 extract docs/min | 17.3 ingest docs/min | derived now (J / NER / emb / OCR) | extract docs/min (rounds) | extract p50 / p95 (s) | ingest docs/min (rounds) | ingest p50 / p95 (s) | CPUs used: extract / ingest | throttled: extract / ingest | server peak (MB): extract / ingest |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 16 | 12 / 8 | 85.3 | 50.9 | 12 / 8 / 4 / 4 | 83.5, 84.5 = **84.0** | 10.6-10.7 / 13.3-14.0 | 90.3, 91.0 = **90.7** | 9.4-9.6 / 12.9-13.2 | 12.9-13.0 / 12.5 | 0 / 0 % | 2,552-2,595 / 2,919-2,973 |
+| 8 | 12 / 8 (warning) | 54.0 (6 / 4: 61.4) | 49.8 (6 / 4: 50.3) | 6 / 4 / 2 / 4 | 61.9, 62.2 = **62.0** | 14.5-14.9 / 16.9 | 65.5, 66.3 = **65.9** | 13.7-13.8 / 16.4-16.7 | 7.3 / 6.9-7.0 | 56-58 / 30-33 % | 2,295-2,305 / 2,671-2,732 |
+| 4 | 12 / 8 (warning) | 27.9 (3 / 2: 37.5) | 39.2 (3 / 2: 37.6) | 3 / 2 / 1 / 4 | 37.3, 37.3 = **37.3** | 24.9-25.1 / 26.9-27.0 | 38.1, 38.1 = **38.1** | 24.1-24.3 / 27.9 | 3.8 / 3.5 | 58 / 34-38 % | 2,152-2,176 / 2,523-2,540 |
+
+Per-page stage times (outcome lines): extraction OCR / NER 2.69-2.71 / 1.76-1.80 s at 16 CPUs, 2.09 / 1.01-1.02 s at 8, 1.83-1.84 / 0.78-0.79 s at 4; ingestion OCR / embedding 2.77 / 1.63-1.67 s, 2.11 / 1.00-1.03 s and 1.86-1.88 / 0.89-0.90 s.
+
+**Against 17.3.** Without any setting the stack now gets what 17.3 needed hand-picked settings for: at `cpus: 8` extraction runs at 62.0 docs/min against 54.0 with the old fixed defaults (+15 %; 61.4 with the best 6 / 4), at `cpus: 4` 37.3 against 27.9 (+34 %; 37.5 with 3 / 2), each within 1 % of the best setting of 17.4, without the oversubscription warning. At 16 CPUs extraction is 84.0 against 85.3 (-1.5 %, within the spread between sessions; the configuration is the same apart from the FIFO hand-off, which 18.6 measured as neutral at pool 8). **Ingestion is no longer capped by the embedder**: 90.7 docs/min (151 pages/min) at 16 CPUs against 50.9, with 12.5 CPUs busy instead of 4.9 and 1.6-1.7 s of embedding per page instead of 5.8-5.9 s; 65.9 against 49.8-50.3 at 8 CPUs; at 4 CPUs 38.1 against 37.6-39.2 (one embedder slot was enough there already). Ingestion now matches or exceeds extraction on the same CPUs (17.3's finding 1 resolved), and the client p95 of an ingestion at 16 CPUs is 12.9-13.2 s against 20.4 s. The server peak during ingestion is 2.9-3.0 GB at 16 CPUs against 2.5-2.7 GB (the working memory of four concurrent forward passes, 18.2); the container's sampled memory stayed at 1.4-2.7 GB.
+
+### 19.3 Questions during ingestion (`gpu` profile)
+
+**Method.** `gpu` stack as in 17.5 (own volumes with a copy of the 600-document index and `gemma4:e4b-it-qat`, defaults, thinking off by the compose start command; checked in `gpu_env.txt`: `LLM_BASE_URL=http://ollama:11434/v1`, `LLM_REASONING_EFFORT=none`, no `LLM_API_KEY`, `OLLAMA_NUM_PARALLEL=2`). After a restart of the stack (17.6 (b)), 3 warm-up questions, then 60 questions from one client with no load ("idle"), then the 75-document ingest set from 16 clients while one more client asks the next answerable question of section 16's order every 0.5 s until the ingestion ends (`client.py askload`). Each ingested file had a comment line appended after `%%EOF`, which changes its sha256 and therefore its document id but not its content, so every ingestion OCRed, embedded and stored (75 / 75 `indexed`) although the index already held the originals. Repeated at `cpus: 8` (stack recreated with the quota). Service times from the questions' `question completed` lines.
+
+| CPUs | load | questions (all 200) | client p50 / p95 / max (s) | `embed_ms` p50 / p95 / max | `search_ms` p50 / p95 | `llm_ms` p50 / p95 / max (s) | ingestion during the run |
+|---|---|---|---|---|---|---|---|
+| 16 | none | 60 | 0.60 / 1.84 / 2.14 | 53 / 69 / 82 | 4 / 5 | 0.53 / 1.78 / 2.09 | - |
+| 16 | ingestion, 16 clients | 37 | **0.84 / 2.31 / 2.48** | **228 / 538 / 688** | 11 / 118 | 0.55 / 1.91 / 2.13 | 80.9 docs/min, 75 x 200 |
+| 8 | none | 60 | 0.56 / 1.86 / 2.14 | 52 / 65 / 72 | 3 / 12 | 0.50 / 1.80 / 2.10 | - |
+| 8 | ingestion, 16 clients | 55 | **0.55 / 1.99 / 8.79** | **78 / 174 / 391** | 4 / 14 | 0.45 / 1.86 / 8.71 | 60.1 docs/min, 75 x 200 |
+
+A question during a full ingestion load costs 0.2-0.5 s more at 16 CPUs (embedding p50 228 ms against 53 ms idle: the query has its reserved slot and priority, 18.3, but its forward pass shares the CPUs with 12 jobs, the app container using 11.6 CPUs; 18.4 measured p50 277, p95 627 ms the same way) and little at 8 CPUs (embedding 78 / 174 ms against 52 / 65 ms idle, client latency unchanged; the quota most likely leaves the other containers' share of the host free, not measured). The language model dominates in both cases (`llm_ms` p50 0.45-0.55 s, unchanged by the load; GPU-bound). The one slow question at 8 CPUs (8.8 s) was slow in the model call (`llm_ms` 8.7 s), not in the service; single occurrence, like the 7.2 s outlier of 17.5. **Before the embedder pool** (17.3 ingestion: one embedder under one lock, 5.8 s of embedding per page) a question's query waited behind the ingestion's passage batches (18.3: 0.3-1.2 s p50 with priority alone, starved without). The ingestion rates (80.9 and 60.1 docs/min) are below 19.2's (90.7 and 65.9) because this run is a different method: no ingestion warm-up after the restart, and Ollama, its CPU-side work and the question client share the host (OCR per page 2.98 against 2.77 s, embedding 2.02 against 1.63-1.67 s, the app container used 11.6 CPUs against 12.5; not separated further).
+
+### 19.4 Cold start with `start_interval`
+
+Same commands as 17.6 (`run.sh cold`, `gpu-first`, `gpu-restart`); breakdown from `docker inspect` (`cold_table.py`; the Ollama figure is its start to the start of `ollama-pull`, which waits for Ollama's healthcheck, because the inspect keeps only the last five checks):
+
+| case | runs | `up -d --wait` (s), 17.6 | `up -d --wait` (s), now | Qdrant start to app start (s), 17.6 -> now | Ollama start to healthy (s), 17.6 -> now | app start to healthy (s), 17.6 -> now | first question (s), 17.6 -> now |
+|---|---|---|---|---|---|---|---|
+| (a) no profile, new containers and new Qdrant volume | 1 | 20.1 | **13.64** | 5.7 -> 1.66 | - | 13.4 -> 11.14 | - |
+| (a) no profile, from a stopped stack | 3 | 17.4-17.9 | **13.38-13.42** | 5.7 -> 1.65-1.68 | - | 11.2 -> 11.12-11.15 | - |
+| (a) no profile, recreated containers (`down` without `-v`) | 2 | 17.6, 17.6 | **13.62, 13.63** | 5.7 -> 1.68 | - | 11.2 -> 11.13-11.14 | - |
+| (a) no profile, fresh stack of each throughput run | 6 | 17.6-18.3 | 13.63-16.16 (median 13.65) | - | - | - | - |
+| (b) `gpu`, fresh containers, model and CUDA kernels in the volume | 3 | 19.7, 20.5, 23.4 | **19.41, 15.81, 17.18** | 9.3-12.7 -> 6.75-8.66 | 5.9-6.1 -> 2.8-3.5 | 9.0-9.1 -> 6.8-9.0 | 0.92-1.07 -> 0.95-0.98 |
+| (b) the same at `cpus: 8` | 1 | - | 21.00 | 10.87 | 3.94 | 8.96 | 0.93 |
+| (c) `gpu`, first-ever start (no CUDA kernel cache) | 1 | 85.0 | 85.49 | 74.3 -> 73.9 | 6.1 -> 7.1 | 9.0 -> 9.05 | 1.42 -> 1.20 |
+
+The `start_interval: 1s` of 6.2 removed what 17.6 predicted: the app now starts 1.7 s after Qdrant instead of 5.7 s, and a start without a model takes 13.4-13.6 s instead of 17.4-20.1 s (4.0-4.5 s less, and 6.5 s less with a new Qdrant volume). With the `gpu` profile Ollama is healthy 2.8-3.5 s after its start instead of 5.9-6.1 s and the stack is up in 15.8-19.4 s instead of 19.7-23.4 s; the first question is answered in under 1 s as before. The first-ever start is unchanged (85.5 s), because it is the warm-up prompt (model load and CUDA kernel compilation, `ollama-pull` 67.6 s) that takes the time. What remains of a start without a model is the app itself: 10.2 s from container start to `Application startup complete` (imports and a 4.2 s lifespan), and up to one interval of the image's own healthcheck (`start_interval` 2 s): the app was marked healthy 0.9 s after its startup completed in the run checked. A 1 s interval there would save about half a second on average; every measurement in this table used the 2 s probe, and the 1 s interval was adopted afterwards (next paragraph, task 7.1).
+
+**The image's healthcheck at `start_interval` 1 s (task 7.1).** Adopted after this measurement, on the isolated stack of 19.7 without the profile (`benchmarks/t71/cold.py`, local): fresh containers and Qdrant volume each run (`down -v`, then `up -d --wait`), one discarded warm-up, then 1 s (the new image) and 2 s (the same image, a compose override changing only `start_interval`) alternated three times; container times from `docker inspect`, `service started` from the app's log line:
+
+| image `start_interval` | runs | `up -d --wait` (s) | Qdrant start to app start (s) | app start to `service started` (s) | lifespan (ms) | `service started` to healthy (s) | app start to healthy (s) |
+|---|---|---|---|---|---|---|---|
+| 1 s | 3 | 13.48-13.52 | 1.65-1.68 | 10.10-10.21 | 4,143-4,196 | **0.70-0.78** | **10.88-10.91** |
+| 2 s | 3 | 13.51-13.53 | 1.66-1.68 | 10.14-10.18 | 4,169-4,192 | 0.95-1.02 | 11.13-11.15 |
+
+The app is marked healthy 0.22-0.27 s earlier in every pair; `up -d --wait` itself returned after the same 13.5 s in both cases (compose polls the containers' state for `--wait`; its granularity was not measured), so the gain shows for whatever waits on the health status (`depends_on: service_healthy`, an orchestrator), not in this command. Load: one probe costs 157 ms of CPU (user 143, system 14 ms; 160 ms wall at p50, 176 ms at most; 20 probes in a running container, `getrusage` of the child processes), and Docker counts the interval from the end of the previous probe, so while starting the probes use about 0.13 CPU at 1 s against 0.07 at 2 s, of 16; the start itself did not change (app start to `service started` and the lifespan within 0.1 s and 50 ms of each other). No measurable load, so the image now probes every second while starting (`Dockerfile`, design D12).
+
+### 19.5 Parity and smoke suite
+
+**Parity** (`parity.py`, as 17.7: the 60 sample documents through the stack, runtime image against the test image as the app service, 4 clients): extraction JSON bodies **60 / 60 identical** (805 names, each with its box, 86 matches), ingestion status, result and `chunks_stored` **60 / 60 identical** (327 chunks, all `indexed`); the runtime run is also identical, body for body, to 17.7's runtime run. Wall times 66.2 s extraction for both images; ingestion 68.9 s for both (78.5 s in 17.7, the embedder pool).
+
+**Smoke suite** (`docker compose -f docker-compose.yml -f docker-compose.smoke.yml [--profile gpu] run --rm smoke`, from the copy): without the profile **12 passed, 2 skipped** (the answerable-question variants: no model configured), exit 0; with the `gpu` profile **12 passed, 2 skipped** (the "without a model" variants), exit 0. `run --rm hygiene`: all 13 checks `ok` both times, exit 0.
+
+### 19.6 Findings
+
+- **Ingestion is no longer capped by the embedder** on the deployed stack: 90.7 docs/min at 16 CPUs (50.9 in 17.3), 65.9 at 8, 38.1 at 4 (17.9 finding 1, fixed by task 6.2).
+- **The derived defaults reproduce the best measured settings** at 16, 8 and 4 CPUs without configuration and without the oversubscription warning: extraction 84.0 / 62.0 / 37.3 docs/min against 85.3 / 61.4 / 37.5 for the best settings of 17.4 (17.9 finding 3).
+- **Start-up is about 4 s shorter** with `start_interval` on the Qdrant and Ollama healthchecks (17.9 finding 2).
+- **Questions during ingestion** stay under 2.5 s at p95 on 16 CPUs (embedding 0.2-0.5 s under CPU contention) and are unaffected at 8 CPUs; the reserved slot and the FIFO hand-off keep the query's wait for a slot out of it.
+- Nothing measured here called for a code or configuration change; no new limitation.
+
+**Caveats.** One host, one session, two rounds for throughput, one run per question configuration. The question runs use the first answerable questions of section 16's order, a single client for the questions, and an ingestion load without warm-up (19.3). The first-ever start ran with the model blobs probably in the page cache (as in 17.6). CPU quotas on a 16-CPU host, not smaller machines (17.9).
+
+### 19.7 Task 7.1: the language model key as a compose secret, probe access lines, smoke suite
+
+**Isolated stack.** A copy of the tree of this task in `benchmarks/t71/stack/` (local; made with `tar` excluding `.env`, `.venv`, `.git` and `benchmarks/`, so the repository-root `.env` took no part), images `docker build --target runtime -t docintel:t71` (`sha256:de93b466...`, 5.84 GB) and `--target test -t docintel-test:t71` (`sha256:c8fbb8dc...`, 5.75 GB), Docker 29.9.2 and Compose 5.6.1, compose projects `t71key`, `t71nokey`, `t71guard` and `t71cold`, each torn down with `down -v`. The copy's own `.env` held a fake key (`sk-test-...-0000`, 27 characters, written out in full in that `.env`), `LLM_BASE_URL=http://fakellm:8080/v1` and `LLM_MODEL=fake-model`; `fakellm` is a 40-line Python server on the internal network (compose override of the copy) that logs, per request, whether the `Authorization` header equals `Bearer <fake key>` by comparing sha256 digests. No hosted model was called.
+
+**Compose behaviour checked first** (throw-away probe projects): a secret with `environment: LLM_API_KEY` is resolved from `.env` (and the shell) and mounted read-only (`-r--r--r--`, root) at `/run/secrets/<name>`, readable by uid 10001; with the variable unset compose refuses to create the container (`environment variable "LLM_API_KEY" required by secret ... is not set`); with it set to the empty string no file is mounted; `file` and `environment` are mutually exclusive even when one is empty; secrets have no `content` source (`configs` have, and `config` prints it). Hence the design of D11: source `llm_api_key${LLM_API_KEY:+_from_env}`, an empty committed file in the no-key case.
+
+| check (key in `.env`, project `t71key`) | result |
+|---|---|
+| occurrences of the key in `docker inspect t71key-app-1` | **0** |
+| the app container's environment (`Config.Env`, `LLM_*`) | `LLM_BASE_URL=http://fakellm:8080/v1`, `LLM_MODEL=fake-model`, `LLM_API_KEY=`, `LLM_API_KEY_FILE=/run/secrets/llm_api_key` |
+| environment of tini and the Uvicorn process (`/proc/<pid>/environ`) | `LLM_API_KEY=` and `LLM_API_KEY_FILE=/run/secrets/llm_api_key` only |
+| occurrences of the key in `docker compose config` | **0**; the app's environment shows `LLM_API_KEY: ""` and `LLM_API_KEY_FILE: /run/secrets/llm_api_key`, its `secrets` `source: llm_api_key_from_env`, `target: llm_api_key`, and the top-level secret `name: t71key_llm_api_key_from_env`, `environment: LLM_API_KEY` |
+| `/run/secrets/llm_api_key` | 27 bytes (the key's length), `-r--r--r--` root, read by uid 10001 |
+| readiness | `{"status":"ready","checks":{"vector_store":"ok","llm":"configured"}}` |
+| `/api/ingest` of `company_memo.pdf`, then "Who was promoted to Vice President of Engineering?" | `indexed`, 2 chunks; 200 with the fake model's answer and the memo's chunks as sources |
+| fake server's record of that call | `{"path": "/v1/chat/completions", "auth_present": true, "auth_matches": true, "model": "fake-model"}` |
+| occurrences of the key in the logs of every service | **0** |
+
+**Without `.env`** (project `t71nokey`, `APP_IMAGE` and `APP_PORT` from the shell): `docker compose config` resolves the app's secret to `source: llm_api_key`, `file: <project>/deploy/no-llm-api-key`; the stack starts (`up -d --wait`), `/run/secrets/llm_api_key` is 0 bytes and readiness reports `"llm": "not_configured"`. With `LLM_API_KEY` set to the empty string the source is also `llm_api_key`.
+
+**`ollama-pull` guard** (`docker compose --profile gpu run --rm --no-deps ollama-pull`, no Ollama running): with `LLM_BASE_URL=https://api.example.invalid/v1` it exits 1 with `LLM_BASE_URL points at another server; start the stack without the gpu profile`; with `http://ollama:11434/v1` or unset it passes the check and goes on to `ollama pull` (which then fails only because no Ollama server runs here).
+
+**Probe access lines.** In `t71key`, after start (five healthcheck runs recorded by `docker inspect`, the first one before the server listened), my `/health/ready` request, one ingestion and one question, the app's log held exactly two access lines (`/api/ingest`, `/api/ask`): successful probes are logged at DEBUG (design D12; unit tests in `tests/api/test_middleware.py` cover the DEBUG level, a failing probe at INFO and a client request in between).
+
+**Smoke and hygiene** against `t71nokey` (no profile, no model; `docker compose -f docker-compose.yml -f docker-compose.smoke.yml run --rm smoke` and `... hygiene` from the copy): **12 passed, 2 skipped** (the answerable-question variants with a model), exit 0; hygiene **13 / 13 ok**, exit 0. The `gpu` profile was not run in this task (task 8.2).
+
+
+### 19.8 Task 8.1: review fixes
+
+**Isolated stack.** A copy of the tree in `benchmarks/fx8/stack/` (local; `tar` excluding `.env`, `.venv`, `.git` and `benchmarks/`), images `docintel:fx8` (runtime, 5.76 GB: 5.84 GB before, uv no longer copied in) and `docintel-test:fx8`, compose projects `fx8` (fake Ollama), `fx8d` (small Qdrant volume), `fx8n` (subnet clash) and `fx8g` (real Ollama), each torn down with `down -v`. The copy's `.env` held only fake values (an unrelated `OTHER_TOKEN`, fake keys); no hosted model was called. The fake Ollama is a 90-line Python server in the app image at Ollama's address (`/api/version`, `/api/show`, `/api/generate`, `/v1/chat/completions`; it logs the request path, the model, `reasoning_effort` and a sha256 prefix of the `Authorization` header), with a fake `ollama` command for `ollama-pull` (`show` and `pull` with a chosen exit code). The real run used `gemma4:e4b-it-qat` copied from the evaluation volume into a new volume (6.1 GB, no download) on the RTX 4070 Ti.
+
+| finding | check | result |
+|---|---|---|
+| 1 failed download | `PULL_EXIT=1` (fake), model absent from the server (fake), `LLM_MODEL=gemma4:no-such-tag` (real Ollama, registry reachable) | `up -d --wait` exit 1 after 3-5 s in each case; `service "ollama-pull"` or `"llm-warmup" didn't complete successfully: exit 1`; the app container `created`, never started; `llm-warmup` names the model and `ollama-pull`'s log; the real one logs `Error: pull model manifest: file does not exist` |
+| 2a switch on | plain `up` (readiness `not_configured`), then `COMPOSE_PROFILES=gpu up` | app and `llm-warmup` recreated, readiness `configured`, a question answered by the fake |
+| 2b Ollama down | `docker stop` Ollama, `docker restart` the app (no compose) | app healthy after 7 s, still pointed at Ollama; a question 503 `llm_unavailable` (10 s, 3 attempts); after `docker start` Ollama the next question 200 |
+| 2c outside answer | a decoy server on the egress network with the alias `ollama`, Ollama stopped | `getent hosts ollama` in the app resolves to the decoy; the decoy received **0** requests; the app's `LLM_BASE_URL` is `http://10.213.47.250:11434/v1` |
+| 2 `--profile gpu` alone | no `COMPOSE_PROFILES` | `ollama-pull` exits 1 with `the app is not pointed at Ollama: start with COMPOSE_PROFILES=gpu ...`; `up` exit 1; app not started |
+| 3 environment | `OTHER_TOKEN`, fake `LLM_API_KEY` and `QDRANT_API_KEY` in `.env` | each occurs **0** times in `docker inspect` of every container, `docker compose config` and the logs; the app's configured environment holds only the settings it reads (empty unless set), `QDRANT_URL`, the two key files and `OLLAMA_URL`, besides the image's own variables |
+| 3 Qdrant key | requests from the app container to `qdrant:6333` | `/collections` 401 without the key, 200 with it; `/readyz` 200 without; readiness `ok`, ingestion and a question work; Qdrant's configured environment holds only `QDRANT__TELEMETRY_DISABLED` |
+| 4 `$` in a key | `LLM_API_KEY='sk-...$fake$KEY-...'` (23 characters) single-quoted, then unquoted | quoted: the secret file is 23 bytes and the fake server's header digest equals that of `Bearer <key>`; unquoted: 14 bytes, with compose warnings `The "fake" variable is not set` (KNOWN_LIMITATIONS P14) |
+| 5 offline start | `ollama-pull` on the internal network only (no route out), real Ollama | model in the volume: exit 0, no download output; `LLM_MODEL=gemma4:no-such-tag`: exit 1, `lookup registry.ollama.ai ... server misbehaving` |
+| 6 thinking | `--profile gpu` with `LLM_BASE_URL=http://10.213.47.250:11434/v1` set explicitly | Uvicorn's environment `LLM_REASONING_EFFORT=none`; the fake received `reasoning_effort=none` |
+| 7, 9 image | hygiene service | 14 / 14 `ok` (new: no `.env` file under `/app`, no `uv` or `uvx`) |
+| 9 networks | real Ollama | serving Ollama only on `backend` at `10.213.47.250`, no DNS for `registry.ollama.ai`, `ollama pull` fails there; `ollama-pull` only on `egress`; `ollama ps` 100 % GPU |
+| 12 disk full | Qdrant on a 40 MB tmpfs volume, one ingestion | 503 `vector_store_unavailable`, detail `the vector store has no disk space left`, one ERROR line with that message; readiness 200 |
+| 16 subnet clash | a network `10.213.47.0/24` created first | `up` exit 1: `networks have overlapping IPv4`; a second stack with `BACKEND_NETWORK_PREFIX=10.213.48` ran beside the first |
+
+**Start times with the real Ollama** (`up -d --wait`, project `fx8g`): first start on the new volume (model present, no compiled kernels) 79.5 s, of which the warm-up prompt 63.6 s (85.5 s in 19.4); after `down` without `-v`, twice: 17.9 and 17.7 s, warm-up 3.1 and 2.7 s (15.8-19.4 s in 19.4). Without the profile: 9.9 s for one run on the fake stack's copy (13.4-13.6 s in 19.4; one run, not a comparison).
+
+**Smoke suite** from the copy: without the profile **12 passed, 2 skipped** (answerable questions: no model); with `COMPOSE_PROFILES=gpu` and the real model **12 passed, 2 skipped** (the "without a model" variants), and a direct question answered `The research department produced 23 peer-reviewed publications in fiscal year 2024.`
