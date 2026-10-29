@@ -62,7 +62,9 @@ class TesseractOcrConfig:
     ``languages`` are engine-neutral codes, read together when the document language is
     unknown. Detection reads pages with all of them until ``detect_language`` decides, giving
     up after ``detect_max_pages`` pages that contain alphabetic words. ``workers=None`` uses
-    ``min(4, cpu_count)`` concurrent Tesseract processes. ``max_pages`` is the largest page
+    ``min(4, cpu_count)`` concurrent Tesseract processes (the machine's CPUs: a container's CPU
+    quota is not seen; the service passes the value it derives from the CPUs available to the
+    process, quota included). ``max_pages`` is the largest page
     count accepted; a longer document is refused after opening, before any page is loaded or
     rendered. Invalid values raise ``ConfigurationError``.
     """

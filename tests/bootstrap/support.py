@@ -10,7 +10,7 @@ from app.adapters.llm.config import LLMClientConfig
 from app.adapters.ner.config import TransformersNerConfig
 from app.adapters.ocr.engine import TesseractOcrConfig
 from app.adapters.vector_store.config import QdrantStoreConfig
-from app.application.ports import Embedder, OcrEngine
+from app.application.ports import OcrEngine
 from app.bootstrap import AdapterFactories
 from app.domain.types import ChatMessage
 from app.settings import Settings, load_settings
@@ -74,6 +74,17 @@ class RecordingRecognizer(FakeNameRecognizer):
         self.events.append("recognizer.close")
 
 
+class RecordingEmbedder(FakeEmbedder):
+    """``FakeEmbedder`` with ``close``."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+
+    def close(self) -> None:
+        self.events.append("embedder.close")
+
+
 class RecordingLLM(FakeLLMClient):
     """``FakeLLMClient`` with ``close``."""
 
@@ -122,9 +133,9 @@ class Recorder:
         self._record("recognizer", config)
         return RecordingRecognizer(self.events)
 
-    def _embedder(self, config: E5EmbedderConfig) -> Embedder:
+    def _embedder(self, config: E5EmbedderConfig) -> RecordingEmbedder:
         self._record("embedder", config)
-        return FakeEmbedder()
+        return RecordingEmbedder(self.events)
 
     def _store(self, config: QdrantStoreConfig) -> RecordingStore:
         self._record("store", config)

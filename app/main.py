@@ -24,10 +24,11 @@ from starlette.types import Scope
 from app.api.dependencies import JobLimiter
 from app.api.errors import install_error_handlers
 from app.api.extract import router as extract_router
+from app.api.health import PROBE_ROUTES
 from app.api.health import router as health_router
 from app.api.middleware import BodyLimitMiddleware, RequestContextMiddleware, route_path
 from app.api.rag import router as rag_router
-from app.bootstrap import Container, build_container
+from app.bootstrap import Container, build_container, resolve_concurrency
 from app.observability import configure_logging
 from app.settings import Settings, load_settings
 
@@ -71,11 +72,14 @@ def create_app(settings: Settings | None = None, container: Container | None = N
             exception_messages=active.log_exception_messages,
         )
         begin = time.perf_counter()
-        services = container if container is not None else build_container(active)
+        concurrency = resolve_concurrency(active)
+        services = (
+            container if container is not None else build_container(active, concurrency=concurrency)
+        )
         app.state.settings = active
         app.state.services = services
         app.state.limiter = JobLimiter(
-            active.max_concurrent_jobs,
+            concurrency.max_concurrent_jobs,
             active.busy_wait_s,
             max_questions=active.max_concurrent_questions,
         )
@@ -94,7 +98,8 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     app = FastAPI(title=TITLE, version=VERSION, lifespan=lifespan)
     install_error_handlers(app)
     app.add_middleware(BodyLimitMiddleware, limit=lambda scope: body_limit(app, scope))
-    app.add_middleware(RequestContextMiddleware)  # added last: the outermost
+    # Added last: the outermost. Successful health probes are access-logged at DEBUG.
+    app.add_middleware(RequestContextMiddleware, probe_routes=PROBE_ROUTES)
     app.include_router(health_router)
     # The routers carry their "/api" prefix, so each route's path is its full template (the
     # access line logs it).

@@ -22,6 +22,10 @@ from app.models.schemas import HealthResponse
 from app.settings import Settings
 
 UNAVAILABLE = "unavailable"
+LIVENESS_PATH = "/health"
+READINESS_PATH = "/health/ready"
+PROBE_ROUTES = (LIVENESS_PATH, READINESS_PATH)
+"""The probe endpoints: their successful requests are access-logged at DEBUG (app.main)."""
 
 router = APIRouter(tags=["health"])
 _logger = logging.getLogger(__name__)
@@ -34,14 +38,14 @@ class ReadinessResponse(BaseModel):
     checks: dict[str, str]
 
 
-@router.get("/health", response_model=HealthResponse)
+@router.get(LIVENESS_PATH, response_model=HealthResponse)
 async def health() -> HealthResponse:
     """Liveness: the process is up and serving."""
     return HealthResponse(status="ok")
 
 
 @router.get(
-    "/health/ready",
+    READINESS_PATH,
     response_model=ReadinessResponse,
     responses={503: {"model": ReadinessResponse, "description": "A dependency is not ready"}},
 )

@@ -4,6 +4,7 @@ import dataclasses
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.adapters.embeddings.config import E5EmbedderConfig
 from app.adapters.llm.config import LLMClientConfig
@@ -15,7 +16,9 @@ from app.domain.chunking import ChunkingConfig
 from app.domain.errors import ConfigurationError
 from app.domain.matching import DEFAULT_THRESHOLD
 from app.settings import (
+    DEFAULT_TORCH_THREADS,
     MAX_BUSY_WAIT_S,
+    MAX_KEY_FILE_BYTES,
     MAX_READINESS_TIMEOUT_S,
     RETIRED_VARIABLES,
     Settings,
@@ -34,11 +37,7 @@ def _default(config: type, field: str) -> object:
     raise AssertionError(f"{config.__name__} has no field {field}")
 
 
-# TORCH_THREADS feeds both torch adapters, so both their defaults must equal it.
 CODE_DEFAULTS: list[tuple[str, object]] = [
-    ("torch_threads", _default(TransformersNerConfig, "threads")),
-    ("torch_threads", _default(E5EmbedderConfig, "threads")),
-    ("ner_pool_size", _default(TransformersNerConfig, "pool_size")),
     ("embedding_batch_size", _default(E5EmbedderConfig, "batch_size")),
     ("ocr_dpi", _default(TesseractOcrConfig, "dpi")),
     ("ocr_workers", _default(TesseractOcrConfig, "workers")),
@@ -62,13 +61,20 @@ CODE_DEFAULTS: list[tuple[str, object]] = [
     ("llm_total_timeout_s", _default(LLMClientConfig, "total_timeout_s")),
     ("llm_attempts", _default(LLMClientConfig, "attempts")),
     ("llm_max_tokens", _default(LLMClientConfig, "max_tokens")),
+    ("llm_reasoning_effort", _default(LLMClientConfig, "reasoning_effort")),
+    ("llm_max_tokens_field", _default(LLMClientConfig, "max_tokens_field")),
+    ("llm_send_temperature", _default(LLMClientConfig, "send_temperature")),
 ]
 
 AGREED_DEFAULTS: dict[str, object] = {
     "max_upload_mb": 20,
     "max_pages": 50,
     "max_names": 1000,
-    "max_concurrent_jobs": 12,
+    # Unset: derived from the CPUs by the composition root (tests/bootstrap pins the rule).
+    "torch_threads": None,
+    "max_concurrent_jobs": None,
+    "ner_pool_size": None,
+    "embedding_pool_size": None,
     "max_concurrent_questions": 16,
     "busy_wait_s": 10.0,
     "log_exception_messages": False,
@@ -76,9 +82,11 @@ AGREED_DEFAULTS: dict[str, object] = {
     "log_format": "json",
     "qdrant_location": None,
     "qdrant_api_key": None,
+    "qdrant_api_key_file": None,
     "llm_base_url": None,
     "llm_model": None,
     "llm_api_key": None,
+    "llm_api_key_file": None,
 }
 
 
@@ -95,6 +103,12 @@ def test_defaults_equal_the_code_defaults(field: str, expected: object) -> None:
     value = getattr(load_settings(), field)
     assert value == expected
     assert type(value) is type(expected)
+
+
+@pytest.mark.parametrize("config", [TransformersNerConfig, E5EmbedderConfig])
+def test_the_default_torch_threads_is_both_torch_adapters_default(config: type) -> None:
+    """TORCH_THREADS feeds both torch adapters, so both their defaults must equal it."""
+    assert _default(config, "threads") == DEFAULT_TORCH_THREADS == 2
 
 
 @pytest.mark.usefixtures("required_env")
@@ -139,7 +153,7 @@ def test_a_retired_thread_variable_in_dotenv_or_an_override_fails(
 @pytest.mark.usefixtures("required_env")
 def test_an_empty_retired_variable_counts_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("NER_THREADS", "")
-    assert load_settings().torch_threads == 2
+    assert load_settings().torch_threads is None
 
 
 @pytest.mark.usefixtures("required_env")
@@ -190,6 +204,53 @@ def test_environment_overrides_defaults(monkeypatch: pytest.MonkeyPatch) -> None
     assert settings.log_exception_messages is True
 
 
+CONCURRENCY_VARIABLES = [
+    "MAX_CONCURRENT_JOBS",
+    "NER_POOL_SIZE",
+    "EMBEDDING_POOL_SIZE",
+    "OCR_WORKERS",
+]
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize("variable", CONCURRENCY_VARIABLES)
+@pytest.mark.parametrize("value", [None, ""])
+def test_an_unset_or_empty_concurrency_value_is_left_to_derive(
+    monkeypatch: pytest.MonkeyPatch, variable: str, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv(variable, raising=False)
+    else:
+        monkeypatch.setenv(variable, value)
+
+    assert getattr(load_settings(), variable.lower()) is None
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize("variable", CONCURRENCY_VARIABLES)
+@pytest.mark.parametrize(("value", "expected"), [("1", 1), ("7", 7), (" 24 ", 24)])
+def test_a_set_concurrency_value_is_read(
+    monkeypatch: pytest.MonkeyPatch, variable: str, value: str, expected: int
+) -> None:
+    monkeypatch.setenv(variable, value)
+
+    assert getattr(load_settings(), variable.lower()) == expected
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize("variable", CONCURRENCY_VARIABLES)
+@pytest.mark.parametrize("value", ["0", "-2", "1.5", "many", "true"])
+def test_an_invalid_concurrency_value_fails_naming_the_variable(
+    monkeypatch: pytest.MonkeyPatch, variable: str, value: str
+) -> None:
+    monkeypatch.setenv(variable, value)
+
+    message = _error()
+
+    assert f"{variable}: " in message
+    assert "many" not in message
+
+
 @pytest.mark.usefixtures("required_env")
 def test_names_are_case_insensitive_and_unknown_variables_ignored(
     monkeypatch: pytest.MonkeyPatch,
@@ -215,6 +276,46 @@ def test_log_level_and_format_are_normalised(monkeypatch: pytest.MonkeyPatch) ->
     settings = load_settings()
     assert settings.log_level == "DEBUG"
     assert settings.log_format == "text"
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("none", "none"),
+        ("NONE", "none"),
+        (" Low ", "low"),
+        ("minimal", "minimal"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("xhigh", "xhigh"),
+        ("", None),
+    ],
+)
+def test_reasoning_effort_is_read_and_normalised(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: str | None
+) -> None:
+    monkeypatch.setenv("LLM_REASONING_EFFORT", value)
+    assert load_settings().llm_reasoning_effort == expected
+
+
+@pytest.mark.usefixtures("required_env")
+def test_hosted_reasoning_model_options_are_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_MAX_TOKENS_FIELD", "MAX_COMPLETION_TOKENS")
+    monkeypatch.setenv("LLM_SEND_TEMPERATURE", "false")
+    settings = load_settings()
+    assert settings.llm_max_tokens_field == "max_completion_tokens"
+    assert settings.llm_send_temperature is False
+
+
+@pytest.mark.usefixtures("required_env")
+def test_empty_request_options_keep_their_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in ("LLM_REASONING_EFFORT", "LLM_MAX_TOKENS_FIELD", "LLM_SEND_TEMPERATURE"):
+        monkeypatch.setenv(variable, "")
+    settings = load_settings()
+    assert settings.llm_reasoning_effort is None
+    assert settings.llm_max_tokens_field == "max_tokens"
+    assert settings.llm_send_temperature is True
 
 
 @pytest.mark.usefixtures("required_env")
@@ -274,6 +375,10 @@ def test_bad_threshold_names_the_variable(monkeypatch: pytest.MonkeyPatch) -> No
         ("LOG_EXCEPTION_MESSAGES", "maybe"),
         ("LOG_FORMAT", "xml"),
         ("LOG_LEVEL", "verbose"),
+        ("LLM_REASONING_EFFORT", "off"),
+        ("LLM_REASONING_EFFORT", "true"),
+        ("LLM_MAX_TOKENS_FIELD", "max_output_tokens"),
+        ("LLM_SEND_TEMPERATURE", "maybe"),
     ],
 )
 def test_out_of_range_values_name_the_variable(
@@ -462,3 +567,229 @@ def test_error_message_never_contains_the_value(monkeypatch: pytest.MonkeyPatch)
     # The pydantic ValidationError shows input values, so it is not chained.
     assert error.__cause__ is None
     assert error.__suppress_context__ is True
+
+
+def _key_file(tmp_path: Path, content: bytes) -> Path:
+    path = tmp_path / "secrets" / "llm_api_key"
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize("content", [API_KEY.encode(), f"  {API_KEY}\r\n".encode()])
+def test_the_key_is_read_from_the_key_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> None:
+    monkeypatch.setenv("LLM_API_KEY_FILE", str(_key_file(tmp_path, content)))
+
+    settings = load_settings()
+
+    assert settings.llm_api_key is not None
+    assert settings.llm_api_key.get_secret_value() == API_KEY
+    assert API_KEY not in repr(settings)
+    assert API_KEY not in settings.model_dump_json()
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize("content", [b"", b"\n", b"  \r\n"])
+def test_an_empty_key_file_means_no_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes
+) -> None:
+    """Compose mounts an empty file when ``LLM_API_KEY`` is unset (docker-compose.yml)."""
+    monkeypatch.setenv("LLM_API_KEY_FILE", str(_key_file(tmp_path, content)))
+
+    assert load_settings().llm_api_key is None
+
+
+@pytest.mark.usefixtures("required_env")
+def test_an_empty_key_variable_leaves_the_key_to_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty ``LLM_API_KEY`` counts as unset, so the file is used."""
+    monkeypatch.setenv("LLM_API_KEY", "")
+    monkeypatch.setenv("LLM_API_KEY_FILE", str(_key_file(tmp_path, API_KEY.encode())))
+
+    key = load_settings().llm_api_key
+
+    assert key is not None
+    assert key.get_secret_value() == API_KEY
+
+
+def test_the_key_file_can_be_an_override(tmp_path: Path, required_env: dict[str, str]) -> None:
+    path = _key_file(tmp_path, API_KEY.encode())
+
+    key = load_settings(llm_api_key_file=str(path)).llm_api_key
+
+    assert key is not None
+    assert key.get_secret_value() == API_KEY
+
+
+@pytest.mark.usefixtures("required_env")
+def test_the_key_variable_still_works_without_a_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_API_KEY", API_KEY)
+
+    settings = load_settings()
+
+    assert settings.llm_api_key is not None
+    assert settings.llm_api_key.get_secret_value() == API_KEY
+    assert settings.llm_api_key_file is None
+
+
+@pytest.mark.usefixtures("required_env")
+def test_a_key_and_a_key_file_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_API_KEY", API_KEY)
+    monkeypatch.setenv("LLM_API_KEY_FILE", str(_key_file(tmp_path, b"other-key-0123456789")))
+
+    message = _error()
+
+    assert "LLM_API_KEY, LLM_API_KEY_FILE: set at most one of them" in message
+    assert API_KEY not in message
+    assert "other-key" not in message
+
+
+@pytest.mark.usefixtures("required_env")
+def test_a_missing_key_file_fails_without_its_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "nowhere" / "llm_api_key"
+    monkeypatch.setenv("LLM_API_KEY_FILE", str(path))
+
+    message = _error()
+
+    assert message.endswith(
+        "invalid configuration: LLM_API_KEY_FILE: cannot be read (FileNotFoundError)"
+    )
+    assert "nowhere" not in message
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize(
+    ("content", "rule"),
+    [
+        (b"k" * (MAX_KEY_FILE_BYTES + 1), f"the file is over {MAX_KEY_FILE_BYTES} bytes"),
+        (b"secret-\xff\xfe-0123456789", "the file is not UTF-8 text"),
+    ],
+    ids=["too-large", "not-utf8"],
+)
+def test_an_unusable_key_file_fails_without_its_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes, rule: str
+) -> None:
+    monkeypatch.setenv("LLM_API_KEY_FILE", str(_key_file(tmp_path, content)))
+
+    message = _error()
+
+    assert message.endswith(f"invalid configuration: LLM_API_KEY_FILE: {rule}")
+    assert "secret-" not in message
+
+
+@pytest.mark.usefixtures("required_env")
+def test_a_key_file_of_the_largest_size_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"k" * MAX_KEY_FILE_BYTES
+    monkeypatch.setenv("LLM_API_KEY_FILE", str(_key_file(tmp_path, content)))
+
+    key = load_settings().llm_api_key
+
+    assert key is not None
+    assert key.get_secret_value() == content.decode()
+
+
+def test_the_key_file_hook_leaves_other_input_to_validation() -> None:
+    """Only a mapping of values is looked at; anything else fails as usual, not in the hook."""
+    with pytest.raises(ValidationError) as caught:
+        Settings.model_validate("not a mapping")
+
+    assert caught.value.errors()[0]["type"] == "model_type"
+
+
+KEYS = [
+    ("llm_api_key", "LLM_API_KEY", "LLM_API_KEY_FILE"),
+    ("qdrant_api_key", "QDRANT_API_KEY", "QDRANT_API_KEY_FILE"),
+]
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize(("field", "key_variable", "file_variable"), KEYS)
+@pytest.mark.parametrize(
+    "content",
+    [API_KEY.encode(), b"\xef\xbb\xbf" + API_KEY.encode() + b"\r\n"],
+    ids=["plain", "byte-order-mark"],
+)
+def test_each_key_is_read_from_its_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    key_variable: str,
+    file_variable: str,
+    content: bytes,
+) -> None:
+    """A UTF-8 byte order mark (Notepad writes one) is not part of the key."""
+    monkeypatch.setenv(file_variable, str(_key_file(tmp_path, content)))
+
+    settings = load_settings()
+
+    key = getattr(settings, field)
+    assert key is not None
+    assert key.get_secret_value() == API_KEY
+    assert settings.key_variable(field) == file_variable
+    assert API_KEY not in repr(settings)
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize(("field", "key_variable", "file_variable"), KEYS)
+def test_a_key_from_its_variable_names_the_variable(
+    monkeypatch: pytest.MonkeyPatch, field: str, key_variable: str, file_variable: str
+) -> None:
+    monkeypatch.setenv(key_variable, API_KEY)
+
+    settings = load_settings()
+
+    assert settings.key_variable(field) == key_variable
+    assert getattr(settings, f"{field}_file") is None
+
+
+@pytest.mark.usefixtures("required_env")
+@pytest.mark.parametrize(("field", "key_variable", "file_variable"), KEYS)
+def test_a_key_and_its_file_are_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    key_variable: str,
+    file_variable: str,
+) -> None:
+    monkeypatch.setenv(key_variable, API_KEY)
+    monkeypatch.setenv(file_variable, str(_key_file(tmp_path, b"other-key-0123456789")))
+
+    message = _error()
+
+    assert f"{key_variable}, {file_variable}: set at most one of them" in message
+    assert API_KEY not in message
+
+
+@pytest.mark.usefixtures("required_env")
+def test_an_unreadable_qdrant_key_file_names_its_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("QDRANT_API_KEY_FILE", str(tmp_path / "nowhere"))
+
+    assert _error().endswith(
+        "invalid configuration: QDRANT_API_KEY_FILE: cannot be read (FileNotFoundError)"
+    )
+
+
+@pytest.mark.usefixtures("required_env")
+def test_both_key_files_are_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    llm = tmp_path / "llm"
+    qdrant = tmp_path / "qdrant"
+    llm.write_bytes(b"llm-key-0123456789")
+    qdrant.write_bytes(b"")
+    monkeypatch.setenv("LLM_API_KEY_FILE", str(llm))
+    monkeypatch.setenv("QDRANT_API_KEY_FILE", str(qdrant))
+
+    settings = load_settings()
+
+    assert settings.llm_api_key is not None
+    assert settings.llm_api_key.get_secret_value() == "llm-key-0123456789"
+    assert settings.qdrant_api_key is None

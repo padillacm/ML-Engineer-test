@@ -12,9 +12,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api import middleware
 from app.api.middleware import DRAIN_LIMIT_BYTES, BodyLimitMiddleware, RequestContextMiddleware
+from app.domain.errors import DependencyUnavailable
 from app.main import FORM_ALLOWANCE_BYTES
 from app.observability import request_id_var
-from tests.api.conftest import LogLines
+from tests.api.conftest import ClientFactory, LogLines
 from tests.api.support import MIB, PDF, Fakes, chunked, multipart
 from tests.fakes.ocr import FakeOcrEngine
 
@@ -69,6 +70,60 @@ def test_access_line_has_method_route_template_status_and_duration(
     assert isinstance(access["duration_ms"], float)
     (failed,) = logs.with_message("request failed")
     assert (failed["code"], failed["category"]) == ("not_a_pdf", "invalid_input")
+
+
+def _store_down() -> str:
+    raise DependencyUnavailable("the vector store could not be reached", "vector_store_unavailable")
+
+
+def test_successful_probes_are_not_access_logged_at_info(
+    client: TestClient, logs: LogLines
+) -> None:
+    """The container's healthcheck probes readiness every 15 s; client requests stay logged."""
+    assert client.get("/health").status_code == 200
+    assert client.get("/health/ready").status_code == 200
+    client.post("/api/extract", files={"pdf_file": ("a.pdf", b"nope", "application/pdf")})
+
+    assert [line["route"] for line in logs.with_message("request")] == ["/api/extract"]
+
+
+def test_a_failing_readiness_probe_is_access_logged(
+    make_client: ClientFactory, fakes: Fakes, logs: LogLines
+) -> None:
+    fakes.readiness = (("vector_store", _store_down),)
+    client = make_client()
+
+    assert client.get("/health/ready").status_code == 503
+
+    (access,) = logs.with_message("request")
+    assert (access["level"], access["route"], access["status"]) == ("INFO", "/health/ready", 503)
+
+
+def test_probes_are_access_logged_at_debug(make_client: ClientFactory, logs: LogLines) -> None:
+    client = make_client(log_level="DEBUG")
+
+    client.get("/health")
+    client.get("/health/ready")
+
+    access = [line for line in logs.with_message("request") if line["logger"] == "app.access"]
+    assert [(line["level"], line["route"], line["status"]) for line in access] == [
+        ("DEBUG", "/health", 200),
+        ("DEBUG", "/health/ready", 200),
+    ]
+
+
+def test_without_probe_routes_every_request_is_logged_at_info(logs: LogLines) -> None:
+    async def ok(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    logging.getLogger().setLevel(logging.INFO)  # restored by the restore_logging fixture
+    client = TestClient(RequestContextMiddleware(ok))
+
+    client.get("/health")
+
+    (access,) = logs.with_message("request")
+    assert (access["level"], access["route"]) == ("INFO", middleware.UNMATCHED_ROUTE)
 
 
 def test_declared_body_over_the_limit_is_413_before_anything_is_parsed(

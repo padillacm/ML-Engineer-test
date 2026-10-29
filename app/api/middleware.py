@@ -4,7 +4,11 @@
 ``request_context`` for the whole request (handlers, exception handlers and the worker
 threads of sync handlers, which copy the context), returns it in ``X-Request-ID``, turns an
 exception that escapes the application into a 500 ``internal_error`` (logged with its stack
-trace) and writes one access line per request.
+trace) and writes one access line per request: at INFO, except a successful request (status
+below 400) to one of its ``probe_routes`` (the health endpoints), which is logged at DEBUG. The
+container's healthcheck probes readiness every 15 s, and an orchestrator's probes as often, so
+at INFO they would bury the client requests; a failing probe (503) stays at INFO, next to the
+readiness warning naming the failed check, and ``LOG_LEVEL=DEBUG`` shows every probe.
 
 ``BodyLimitMiddleware`` applies the limit ``limit(scope)`` chooses for the request's path (the
 upload routes accept a PDF, the others a small JSON body or none): it rejects a request whose
@@ -31,7 +35,7 @@ sends sees the 413 at once.
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 
 import anyio
 from starlette.datastructures import Headers
@@ -54,6 +58,7 @@ UNMATCHED_ROUTE = "unmatched"
 _REQUEST_ID_KEY = REQUEST_ID_HEADER.lower().encode("latin-1")
 _CONNECTION_KEY = b"connection"
 _TOO_LARGE_STATUS = 413
+_FIRST_ERROR_STATUS = 400
 _CANCELLED_STATUS = 499  # the request was cancelled before any response (client gone, shutdown)
 _MAX_LENGTH_DIGITS = 18
 """A declared length with more significant digits than this (an exabyte or more) is taken as
@@ -76,10 +81,14 @@ _access_logger = logging.getLogger("app.access")
 
 
 class RequestContextMiddleware:
-    """Request id, ``X-Request-ID`` response header, unexpected errors and the access line."""
+    """Request id, ``X-Request-ID`` response header, unexpected errors and the access line.
 
-    def __init__(self, app: ASGIApp) -> None:
+    ``probe_routes``: route templates whose successful requests are logged at DEBUG.
+    """
+
+    def __init__(self, app: ASGIApp, probe_routes: Collection[str] = ()) -> None:
         self.app = app
+        self.probe_routes = frozenset(probe_routes)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -117,15 +126,23 @@ class RequestContextMiddleware:
                 log_unexpected(error)
                 await internal_error_response()(scope, receive, send_with_id)
             finally:
-                _access_logger.info(
+                route = _route_template(scope)
+                _access_logger.log(
+                    self._access_level(route, status),
                     "request",
                     extra={
                         "method": scope.get("method"),
-                        "route": _route_template(scope),
+                        "route": route,
                         "status": status,
                         "duration_ms": round((time.perf_counter() - begin) * 1000, 1),
                     },
                 )
+
+    def _access_level(self, route: str, status: int) -> int:
+        """DEBUG for a successful probe, INFO for every other request."""
+        if route in self.probe_routes and status < _FIRST_ERROR_STATUS:
+            return logging.DEBUG
+        return logging.INFO
 
 
 class BodyLimitMiddleware:

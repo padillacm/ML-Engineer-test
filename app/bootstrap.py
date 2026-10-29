@@ -10,9 +10,17 @@ never contain a secret.
 
 ``TORCH_THREADS`` is given to both the recogniser and the embedder configuration: torch's
 intra-op thread count is process-wide, so each adapter's creation sets it for the whole process
-and they must agree. When ``NER_POOL_SIZE`` x ``TORCH_THREADS`` (the CPUs concurrent
-recognitions can use) exceeds the CPUs available to the process (``available_cpus``), one
-warning is logged at start-up; nothing is changed.
+and they must agree. Unset, it is ``DEFAULT_TORCH_THREADS`` lowered to the CPUs available.
+
+Concurrency: ``MAX_CONCURRENT_JOBS``, ``NER_POOL_SIZE``, ``EMBEDDING_POOL_SIZE`` and
+``OCR_WORKERS`` that are not set are derived from the CPUs available to the process
+(``available_cpus``: affinity and the cgroup v2 or v1 quota) by ``concurrency_for``; a set value
+is used as given. ``resolve_concurrency`` is the one place that does this, and every consumer (the
+adapter configurations here, the HTTP job limiter in ``app.main``) uses its result. Building the
+container logs the values in use in one line, and one warning per pool whose size x
+``TORCH_THREADS`` (the CPUs its concurrent calls can use) exceeds the available CPUs; nothing is
+changed. The pools are checked one by one: a job uses one of them at a time, and the job limit
+bounds them together.
 
 Without ``LLM_BASE_URL`` the questions use case gets an ``UnconfiguredLLM`` and readiness
 reports the language model as ``not_configured``. Nothing contacts the vector store here, so the
@@ -44,7 +52,7 @@ from app.application.ports import Embedder, LLMClient, NameRecognizer, OcrEngine
 from app.application.unconfigured_llm import UnconfiguredLLM
 from app.domain.chunking import ChunkingConfig
 from app.domain.errors import ConfigurationError
-from app.settings import Settings
+from app.settings import DEFAULT_TORCH_THREADS, Settings
 
 type ReadinessCheck = Callable[[], str]
 """Returns the check's status ("ok", "configured", ...) when it passes and raises otherwise."""
@@ -53,8 +61,21 @@ LLM_CONFIGURED = "configured"
 LLM_NOT_CONFIGURED = "not_configured"
 STORE_OK = "ok"
 
+MAX_DERIVED_JOBS = 12
+"""Largest derived ``MAX_CONCURRENT_JOBS``: the measured best on 16 CPUs (BENCHMARKS 15.6)."""
+MAX_DERIVED_NER_POOL = 8
+"""Largest derived ``NER_POOL_SIZE``: the measured best on 16 CPUs (BENCHMARKS 15.6)."""
+MAX_DERIVED_EMBEDDING_POOL = 4
+"""Largest derived ``EMBEDDING_POOL_SIZE``: the smallest pool within 5 % of the best ingestion
+throughput on 16 CPUs (BENCHMARKS 18.5)."""
+MAX_DERIVED_OCR_WORKERS = 4
+"""Largest derived ``OCR_WORKERS``: the adapter's own ``min(4, CPUs)`` (BENCHMARKS 15.2)."""
+
 CGROUP_CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
 """The cgroup v2 CPU quota of the process's cgroup (``"<quota> <period>"`` or ``"max ..."``)."""
+CGROUP_V1_CPU = Path("/sys/fs/cgroup/cpu")
+"""The cgroup v1 CPU controller: ``cpu.cfs_quota_us`` (``-1`` without a quota) and
+``cpu.cfs_period_us``, read when there is no cgroup v2 ``cpu.max``."""
 _CPU_MAX_FIELDS = 2
 
 _logger = logging.getLogger(__name__)
@@ -80,6 +101,29 @@ class ManagedLLMClient(LLMClient, Protocol):
     def close(self) -> None: ...
 
 
+class ManagedEmbedder(Embedder, Protocol):
+    """An ``Embedder`` holding a loaded model that must be released."""
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class Concurrency:
+    """How much work runs at once, resolved from ``Settings`` and the CPUs (``cpus``).
+
+    ``torch_threads`` torch intra-op threads, ``max_concurrent_jobs`` extraction and ingestion
+    jobs, ``ner_pool_size`` concurrent recognitions, ``embedding_pool_size`` concurrent passage
+    batches and ``ocr_workers`` Tesseract processes per document.
+    """
+
+    cpus: int
+    max_concurrent_jobs: int
+    ner_pool_size: int
+    embedding_pool_size: int
+    ocr_workers: int
+    torch_threads: int = DEFAULT_TORCH_THREADS
+
+
 @dataclass(frozen=True, slots=True)
 class AdapterFactories:
     """How each adapter is built from its configuration; tests replace them with fakes."""
@@ -88,7 +132,7 @@ class AdapterFactories:
     recognizer: Callable[[TransformersNerConfig], ManagedNameRecognizer] = (
         TransformersNameRecognizer
     )
-    embedder: Callable[[E5EmbedderConfig], Embedder] = E5Embedder
+    embedder: Callable[[E5EmbedderConfig], ManagedEmbedder] = E5Embedder
     store: Callable[[QdrantStoreConfig], ManagedVectorStore] = QdrantVectorStore
     llm: Callable[[LLMClientConfig], ManagedLLMClient] = OpenAICompatibleClient
 
@@ -121,8 +165,8 @@ class Container:
     closers: tuple[Callable[[], None], ...] = field(default=())
 
     def close(self) -> None:
-        """Close the recogniser (its pipeline pool), the language-model client and the vector
-        store (once per container)."""
+        """Close the embedder and the recogniser (their models), the language-model client and
+        the vector store (once per container)."""
         _close_all(self.closers)
 
 
@@ -144,6 +188,7 @@ _EMBEDDER_VARIABLES = {
     "revision": "EMBEDDING_MODEL_REVISION",
     "batch_size": "EMBEDDING_BATCH_SIZE",
     "threads": "TORCH_THREADS",
+    "pool_size": "EMBEDDING_POOL_SIZE",
 }
 _STORE_VARIABLES = {
     "url": "QDRANT_URL",
@@ -164,6 +209,9 @@ _LLM_VARIABLES = {
     "total_timeout_s": "LLM_TOTAL_TIMEOUT_S",
     "attempts": "LLM_ATTEMPTS",
     "max_tokens": "LLM_MAX_TOKENS",
+    "reasoning_effort": "LLM_REASONING_EFFORT",
+    "max_tokens_field": "LLM_MAX_TOKENS_FIELD",
+    "send_temperature": "LLM_SEND_TEMPERATURE",
 }
 _CHUNKING_VARIABLES = {"max_chars": "CHUNK_SIZE", "overlap_ratio": "CHUNK_OVERLAP"}
 _ASK_VARIABLES = {
@@ -174,11 +222,13 @@ _ASK_VARIABLES = {
 }
 
 
-def adapter_configs(settings: Settings) -> AdapterConfigs:
+def adapter_configs(settings: Settings, concurrency: Concurrency | None = None) -> AdapterConfigs:
     """Map ``settings`` onto the adapter configurations, validating each one.
 
-    Raises ``ConfigurationError`` naming the variable(s) of the first invalid configuration.
+    ``concurrency`` defaults to ``resolve_concurrency(settings)``. Raises ``ConfigurationError``
+    naming the variable(s) of the first invalid configuration.
     """
+    sizes = resolve_concurrency(settings) if concurrency is None else concurrency
     return AdapterConfigs(
         ocr=_named(
             _OCR_VARIABLES,
@@ -186,7 +236,7 @@ def adapter_configs(settings: Settings) -> AdapterConfigs:
                 dpi=settings.ocr_dpi,
                 flatten=settings.ocr_flatten,
                 timeout_s=settings.ocr_timeout_s,
-                workers=settings.ocr_workers,
+                workers=sizes.ocr_workers,
                 max_pages=settings.max_pages,
             ),
         ),
@@ -194,8 +244,8 @@ def adapter_configs(settings: Settings) -> AdapterConfigs:
             _NER_VARIABLES,
             lambda: TransformersNerConfig(
                 model_path=settings.ner_model_path,
-                threads=settings.torch_threads,
-                pool_size=settings.ner_pool_size,
+                threads=sizes.torch_threads,
+                pool_size=sizes.ner_pool_size,
             ),
             fallback="NER_MODEL_PATH",
         ),
@@ -205,12 +255,15 @@ def adapter_configs(settings: Settings) -> AdapterConfigs:
                 model_path=settings.embedding_model_path,
                 revision=settings.embedding_model_revision,
                 batch_size=settings.embedding_batch_size,
-                threads=settings.torch_threads,
+                threads=sizes.torch_threads,
+                pool_size=sizes.embedding_pool_size,
             ),
             fallback="EMBEDDING_MODEL_PATH",
         ),
         store=_named(
-            _STORE_VARIABLES, lambda: _store_config(settings), "QDRANT_URL, QDRANT_LOCATION"
+            _store_variables(settings),
+            lambda: _store_config(settings),
+            "QDRANT_URL, QDRANT_LOCATION",
         ),
         llm=_llm_config(settings),
         chunking=_named(
@@ -222,18 +275,25 @@ def adapter_configs(settings: Settings) -> AdapterConfigs:
     )
 
 
-def build_container(settings: Settings, factories: AdapterFactories | None = None) -> Container:
+def build_container(
+    settings: Settings,
+    factories: AdapterFactories | None = None,
+    concurrency: Concurrency | None = None,
+) -> Container:
     """Build every adapter and use case once from ``settings``.
 
-    ``factories`` replaces the adapter constructors (tests). Raises ``ConfigurationError``
-    naming the variable(s) at fault; adapters already built are closed first.
+    ``factories`` replaces the adapter constructors (tests); ``concurrency`` defaults to
+    ``resolve_concurrency(settings)``. Logs the concurrency in use (and any oversubscription
+    warning) once. Raises ``ConfigurationError`` naming the variable(s) at fault; adapters
+    already built are closed first.
     """
     make = factories if factories is not None else AdapterFactories()
-    configs = adapter_configs(settings)
-    _warn_if_oversubscribed(settings.ner_pool_size, settings.torch_threads, available_cpus())
+    sizes = resolve_concurrency(settings) if concurrency is None else concurrency
+    configs = adapter_configs(settings, sizes)
+    _log_concurrency(sizes)
     closers: list[Callable[[], None]] = []
     try:
-        store = _named(_STORE_VARIABLES, lambda: make.store(configs.store))
+        store = _named(_store_variables(settings), lambda: make.store(configs.store))
         closers.append(store.close)
         llm: LLMClient = UnconfiguredLLM()
         if configs.llm is not None:
@@ -251,6 +311,7 @@ def build_container(settings: Settings, factories: AdapterFactories | None = Non
             lambda: make.embedder(configs.embedder),
             fallback="EMBEDDING_MODEL_PATH",
         )
+        closers.insert(0, embedder.close)
         container = Container(
             extract=_named(
                 {"threshold": "MATCH_THRESHOLD"},
@@ -276,21 +337,78 @@ def build_container(settings: Settings, factories: AdapterFactories | None = Non
     return container
 
 
+def concurrency_for(cpus: int, torch_threads: int) -> Concurrency:
+    """The concurrency derived for ``cpus`` available CPUs and ``torch_threads``: the rule.
+
+    - jobs: three quarters of the CPUs rounded up, at most ``MAX_DERIVED_JOBS``;
+    - NER pool: CPUs / ``torch_threads`` rounded down, at most ``MAX_DERIVED_NER_POOL``;
+    - embedder pool: CPUs / (2 x ``torch_threads``) rounded down, at most
+      ``MAX_DERIVED_EMBEDDING_POOL``;
+    - OCR workers: the CPUs, at most ``MAX_DERIVED_OCR_WORKERS``;
+
+    each at least 1. With 2 threads this gives the measured sizing (BENCHMARKS 17.4 and 18):
+    16 CPUs 12 / 8 / 4 / 4, 8 CPUs 6 / 4 / 2 / 4, 4 CPUs 3 / 2 / 1 / 4. Jobs round up because
+    one job too few cost more than one too many where measured (4 CPUs: 2 jobs -22 %, 4 jobs
+    -3 %); the pools round down so that a derived pool never exceeds the CPUs (no warning).
+    """
+    jobs = (3 * cpus + 3) // 4
+    return Concurrency(
+        cpus=cpus,
+        torch_threads=torch_threads,
+        max_concurrent_jobs=_at_least_one(min(jobs, MAX_DERIVED_JOBS)),
+        ner_pool_size=_at_least_one(min(cpus // torch_threads, MAX_DERIVED_NER_POOL)),
+        embedding_pool_size=_at_least_one(
+            min(cpus // (2 * torch_threads), MAX_DERIVED_EMBEDDING_POOL)
+        ),
+        ocr_workers=_at_least_one(min(cpus, MAX_DERIVED_OCR_WORKERS)),
+    )
+
+
+def resolve_concurrency(settings: Settings, cpus: int | None = None) -> Concurrency:
+    """The concurrency in use: each of ``settings``' four values as set, or else derived.
+
+    Unset values come from ``concurrency_for`` with ``cpus`` (default ``available_cpus()``)
+    and ``TORCH_THREADS`` (unset: ``DEFAULT_TORCH_THREADS``, at most ``cpus``); a set value
+    always wins.
+    """
+    available = available_cpus() if cpus is None else cpus
+    threads = _given(settings.torch_threads, min(DEFAULT_TORCH_THREADS, available))
+    derived = concurrency_for(available, threads)
+    return Concurrency(
+        cpus=available,
+        torch_threads=threads,
+        max_concurrent_jobs=_given(settings.max_concurrent_jobs, derived.max_concurrent_jobs),
+        ner_pool_size=_given(settings.ner_pool_size, derived.ner_pool_size),
+        embedding_pool_size=_given(settings.embedding_pool_size, derived.embedding_pool_size),
+        ocr_workers=_given(settings.ocr_workers, derived.ocr_workers),
+    )
+
+
+def _at_least_one(value: int) -> int:
+    return max(1, value)
+
+
+def _given(value: int | None, derived: int) -> int:
+    return derived if value is None else value
+
+
 def available_cpus(
     cpu_max: Path = CGROUP_CPU_MAX,
     affinity: Callable[[], int | None] | None = None,
     cpu_count: Callable[[], int | None] = os.cpu_count,
+    cgroup_v1_cpu: Path = CGROUP_V1_CPU,
 ) -> int:
     """The whole CPUs this process may use, at least 1.
 
     The CPUs the process may run on (``os.sched_getaffinity`` where the platform has it,
-    otherwise ``cpu_count``), lowered to the cgroup v2 quota in ``cpu_max`` when that file sets
-    one (a container's ``--cpus``), rounded down. An unreadable or malformed ``cpu_max`` is
-    ignored. ``affinity`` and ``cpu_count`` replace the platform calls (tests).
+    otherwise ``cpu_count``), lowered to the cgroup quota (a container's ``--cpus``), rounded
+    down: the cgroup v2 ``cpu_max`` file when it exists, otherwise the cgroup v1
+    ``cpu.cfs_quota_us`` and ``cpu.cfs_period_us`` in ``cgroup_v1_cpu``. Unreadable or malformed
+    files are ignored. ``affinity`` and ``cpu_count`` replace the platform calls (tests).
     """
     count = (affinity or _affinity)()
     cpus = count if count is not None else (cpu_count() or 1)
-    quota = _cgroup_quota(cpu_max)
+    quota = _cgroup_quota(cpu_max) if cpu_max.exists() else _cgroup_v1_quota(cgroup_v1_cpu)
     if quota is not None:
         cpus = min(cpus, math.floor(quota))
     return max(1, cpus)
@@ -314,8 +432,23 @@ def _cgroup_quota(cpu_max: Path) -> float | None:
         return None
     if len(fields) != _CPU_MAX_FIELDS or fields[0] == "max":
         return None
+    return _quota(fields[0], fields[1])
+
+
+def _cgroup_v1_quota(directory: Path) -> float | None:
+    """The CPUs allowed by the cgroup v1 CFS files, ``None`` without a (readable) quota."""
     try:
-        quota, period = int(fields[0]), int(fields[1])
+        quota = (directory / "cpu.cfs_quota_us").read_text(encoding="ascii")
+        period = (directory / "cpu.cfs_period_us").read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return _quota(quota.strip(), period.strip())
+
+
+def _quota(quota_text: str, period_text: str) -> float | None:
+    """``quota / period`` in CPUs; ``None`` when either is not a positive integer (v1: ``-1``)."""
+    try:
+        quota, period = int(quota_text), int(period_text)
     except ValueError:
         return None
     if quota <= 0 or period <= 0:
@@ -323,14 +456,47 @@ def _cgroup_quota(cpu_max: Path) -> float | None:
     return quota / period
 
 
-def _warn_if_oversubscribed(pool_size: int, threads: int, cpus: int) -> None:
-    requested = pool_size * threads
-    if requested > cpus:
-        _logger.warning(
-            "NER_POOL_SIZE x TORCH_THREADS exceeds the CPUs available to the process; "
-            "concurrent recognitions will compete for CPUs",
-            extra={"cpus_requested": requested, "cpus_available": cpus},
-        )
+_OVERSUBSCRIBED = {
+    "NER_POOL_SIZE": (
+        "NER_POOL_SIZE x TORCH_THREADS exceeds the CPUs available to the process; "
+        "concurrent recognitions will compete for CPUs"
+    ),
+    "EMBEDDING_POOL_SIZE": (
+        "EMBEDDING_POOL_SIZE x TORCH_THREADS exceeds the CPUs available to the process; "
+        "concurrent embeddings will compete for CPUs"
+    ),
+}
+
+
+def _log_concurrency(concurrency: Concurrency) -> None:
+    threads = concurrency.torch_threads
+    _logger.info(
+        "concurrency in use",
+        extra={
+            "cpus_available": concurrency.cpus,
+            "torch_threads": threads,
+            "max_concurrent_jobs": concurrency.max_concurrent_jobs,
+            "ner_pool_size": concurrency.ner_pool_size,
+            "embedding_pool_size": concurrency.embedding_pool_size,
+            "ocr_workers": concurrency.ocr_workers,
+        },
+    )
+    pools = {
+        "NER_POOL_SIZE": concurrency.ner_pool_size,
+        "EMBEDDING_POOL_SIZE": concurrency.embedding_pool_size,
+    }
+    for variable, pool_size in pools.items():
+        requested = pool_size * threads
+        if requested > concurrency.cpus:
+            _logger.warning(
+                _OVERSUBSCRIBED[variable],
+                extra={"cpus_requested": requested, "cpus_available": concurrency.cpus},
+            )
+
+
+def _store_variables(settings: Settings) -> dict[str, str]:
+    """``_STORE_VARIABLES``, naming ``QDRANT_API_KEY_FILE`` when the key came from that file."""
+    return {**_STORE_VARIABLES, "api_key": settings.key_variable("qdrant_api_key")}
 
 
 def _store_config(settings: Settings) -> QdrantStoreConfig:
@@ -352,11 +518,8 @@ def _llm_config(settings: Settings) -> LLMClientConfig | None:
     if base_url is None or model is None:
         return None
     key = settings.llm_api_key
-    api_key = (
-        None
-        if key is None
-        else _named({}, lambda: Secret(key.get_secret_value()), fallback="LLM_API_KEY")
-    )
+    variable = settings.key_variable("llm_api_key")
+    api_key = None if key is None else _named({}, lambda: Secret(key.get_secret_value()), variable)
     return _named(
         _LLM_VARIABLES,
         lambda: LLMClientConfig(
@@ -368,6 +531,9 @@ def _llm_config(settings: Settings) -> LLMClientConfig | None:
             total_timeout_s=settings.llm_total_timeout_s,
             attempts=settings.llm_attempts,
             max_tokens=settings.llm_max_tokens,
+            reasoning_effort=settings.llm_reasoning_effort,
+            max_tokens_field=settings.llm_max_tokens_field,
+            send_temperature=settings.llm_send_temperature,
         ),
         fallback="LLM_BASE_URL",
     )

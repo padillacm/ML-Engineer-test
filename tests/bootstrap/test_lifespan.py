@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 import app.bootstrap
 import app.main
-from app.bootstrap import build_container
+from app.bootstrap import Concurrency, build_container
 from app.domain.errors import ConfigurationError
 from app.main import create_app
 from app.observability import JsonFormatter
@@ -47,9 +47,9 @@ def _with_recorder(monkeypatch: pytest.MonkeyPatch, recorder: Recorder) -> list[
     """Make the lifespan build its container from ``recorder``'s fakes; return the settings."""
     seen: list[Settings] = []
 
-    def build(settings: Settings) -> object:
+    def build(settings: Settings, *, concurrency: Concurrency) -> object:
         seen.append(settings)
-        return build_container(settings, recorder.factories())
+        return build_container(settings, recorder.factories(), concurrency)
 
     monkeypatch.setattr(app.main, "build_container", build)
     return seen
@@ -78,7 +78,7 @@ def test_models_are_built_once_at_start_up_and_closed_at_shutdown(
         assert recorder.built["recognizer"] == 1
         assert recorder.events == []
 
-    assert recorder.events == ["recognizer.close", "llm.close", "store.close"]
+    assert recorder.events == ["embedder.close", "recognizer.close", "llm.close", "store.close"]
 
 
 def test_an_injected_container_is_used_as_given_and_not_closed() -> None:
@@ -188,10 +188,50 @@ def test_start_up_logs_one_line_without_secrets(
 
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line]
     assert [line["message"] for line in lines] == [
+        "concurrency in use",
         "service started (language model configured)",
         "service stopped",
     ]
+    assert lines[0]["cpus_available"] == 1024
     assert key not in json.dumps(lines)
+
+
+@pytest.mark.parametrize(("cpus", "jobs"), [(4, 3), (8, 6), (16, 12), (64, 12)])
+def test_the_job_limit_is_derived_from_the_cpus_when_unset(
+    models: Path, monkeypatch: pytest.MonkeyPatch, cpus: int, jobs: int
+) -> None:
+    recorder = Recorder()
+    _with_recorder(monkeypatch, recorder)
+    monkeypatch.setattr(app.bootstrap, "available_cpus", lambda: cpus)
+    application = create_app(settings=bootstrap_settings(models))
+
+    with TestClient(application):
+        assert application.state.limiter.free_slots == jobs
+        assert recorder.configs["recognizer"].pool_size == min(8, cpus // 2)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("cpus", [1, 4, 64])
+def test_a_set_job_limit_wins_whatever_the_cpus(
+    models: Path, monkeypatch: pytest.MonkeyPatch, cpus: int
+) -> None:
+    _with_recorder(monkeypatch, Recorder())
+    monkeypatch.setattr(app.bootstrap, "available_cpus", lambda: cpus)
+    application = create_app(settings=bootstrap_settings(models, max_concurrent_jobs=5))
+
+    with TestClient(application):
+        assert application.state.limiter.free_slots == 5
+
+
+def test_an_injected_container_still_gets_the_derived_job_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app.bootstrap, "available_cpus", lambda: 8)
+    fakes = Fakes()
+    settings = api_settings(max_concurrent_jobs=None)
+    application = create_app(settings=settings, container=fakes.container(settings))
+
+    with TestClient(application):
+        assert application.state.limiter.free_slots == 6
 
 
 def test_importing_the_module_reads_no_environment() -> None:
