@@ -3,7 +3,12 @@
 import json
 import math
 import shutil
+import threading
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -185,3 +190,125 @@ def test_a_failed_load_leaves_the_thread_count_unchanged(copied_model: Path) -> 
         E5Embedder(config)
 
     assert torch.get_num_threads() == before
+
+
+class Concurrency:
+    """Counts how many calls of one kind run at once; each call lasts at least ``pause``."""
+
+    def __init__(self, pause: float) -> None:
+        self.pause = pause
+        self.guard = threading.Lock()
+        self.active = 0
+        self.peak = 0
+        self.calls = 0
+
+    def wrap(self, function: Callable[..., Any]) -> Callable[..., Any]:
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            with self.guard:
+                self.active += 1
+                self.calls += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                time.sleep(self.pause)
+                return function(*args, **kwargs)
+            finally:
+                with self.guard:
+                    self.active -= 1
+
+        return counted
+
+
+def _loaded(monkeypatch: pytest.MonkeyPatch) -> tuple[list[Any], list[Any]]:
+    """Record every tokenizer and model ``load_encoder`` loads."""
+    import transformers  # noqa: PLC0415 - patched only in these tests
+
+    tokenizers: list[Any] = []
+    models: list[Any] = []
+    real_tokenizer = transformers.AutoTokenizer.from_pretrained
+    real_model = transformers.AutoModel.from_pretrained
+
+    def tokenizer(*args: Any, **kwargs: Any) -> Any:
+        tokenizers.append(real_tokenizer(*args, **kwargs))
+        return tokenizers[-1]
+
+    def model(*args: Any, **kwargs: Any) -> Any:
+        loaded = real_model(*args, **kwargs)
+        models.append(loaded[0] if isinstance(loaded, tuple) else loaded)
+        return loaded
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", tokenizer)
+    monkeypatch.setattr(transformers.AutoModel, "from_pretrained", model)
+    return tokenizers, models
+
+
+def test_a_pool_loads_one_model_and_one_tokenizer(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokenizers, models = _loaded(monkeypatch)
+
+    E5Embedder(E5EmbedderConfig(tiny_model_dir, REVISION, max_length=MAX_LENGTH, pool_size=4))
+
+    assert (len(tokenizers), len(models)) == (1, 1)
+    assert models[0].training is False
+
+
+def test_loading_settles_the_tokenizer_settings(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokenizers, _ = _loaded(monkeypatch)
+    embedder = E5Embedder(E5EmbedderConfig(tiny_model_dir, REVISION, max_length=MAX_LENGTH))
+    backend = tokenizers[0]._tokenizer
+    settled = (backend.truncation, backend.padding, backend.encode_special_tokens)
+
+    embedder.embed_passages(["alpha beta", "the invoice was paid on monday by a short contract"])
+    embedder.embed_query("who signed the contract ?")
+
+    assert settled[0] is not None
+    assert settled[0]["max_length"] == MAX_LENGTH
+    assert settled[1] is not None
+    assert (backend.truncation, backend.padding, backend.encode_special_tokens) == settled
+
+
+def test_tokenising_is_serialised_while_forward_passes_overlap(
+    tiny_model_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tokenizers, models = _loaded(monkeypatch)
+    embedder = E5Embedder(
+        E5EmbedderConfig(tiny_model_dir, REVISION, max_length=MAX_LENGTH, pool_size=4)
+    )
+    tokenizing = Concurrency(pause=0.01)
+    forward = Concurrency(pause=0.03)
+    tokenizer_type = type(tokenizers[0])
+    monkeypatch.setattr(tokenizer_type, "__call__", tokenizing.wrap(tokenizer_type.__call__))
+    models[0].forward = forward.wrap(models[0].forward)
+    texts = [f"passage number {index} of the contract ." for index in range(12)]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(lambda text: embedder.embed_passages([text]), texts))
+
+    assert tokenizing.calls == forward.calls == 12
+    assert tokenizing.peak == 1
+    assert 1 < forward.peak <= 4
+
+
+def test_concurrent_calls_on_a_pool_match_a_pool_of_one(tiny_model_dir: Path) -> None:
+    words = ["the", "invoice", "was", "paid", "on", "monday"]
+    words += ["by", "a", "short", "contract", "of", "delta"]
+    texts = [" ".join(words[: 2 + index % 10]) for index in range(40)]
+    batches = [texts[start : start + 1 + start % 3] for start in range(0, 40, 3)]
+    single = E5Embedder(E5EmbedderConfig(tiny_model_dir, REVISION, max_length=MAX_LENGTH))
+    pooled = E5Embedder(
+        E5EmbedderConfig(tiny_model_dir, REVISION, max_length=MAX_LENGTH, pool_size=4)
+    )
+    expected = [single.embed_passages(batch) for batch in batches]
+    expected_queries = [single.embed_query(text) for text in texts]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(pooled.embed_passages, batches * 3))
+        queries = list(executor.map(pooled.embed_query, texts))
+
+    for got, want in zip(results, expected * 3, strict=True):
+        assert torch.allclose(torch.tensor(got), torch.tensor(want), rtol=0, atol=1e-6)
+    assert torch.allclose(torch.tensor(queries), torch.tensor(expected_queries), rtol=0, atol=1e-6)
+    pooled.close()
+    single.close()

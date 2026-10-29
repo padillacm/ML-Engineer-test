@@ -7,6 +7,7 @@ import socket
 import time
 import warnings
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -182,3 +183,18 @@ def test_loading_does_not_warn(caplog: pytest.LogCaptureFixture) -> None:
 
     assert [str(warning.message) for warning in caught] == []
     assert [record.getMessage() for record in caplog.records] == []
+
+
+def test_concurrent_calls_give_the_vectors_of_one_call_at_a_time(embedder: E5Embedder) -> None:
+    passages = [*UNRELATED.values(), *(pair[0] for pair in PARAPHRASES.values())]
+    batches = [passages[start : start + 3] for start in range(len(passages))]
+    queries = [triple[0] for triple in TRIPLES.values()]
+    expected = [embedder.embed_passages(batch) for batch in batches]
+    expected_queries = [embedder.embed_query(query) for query in queries]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(embedder.embed_passages, batches * 2))
+        answers = list(executor.map(embedder.embed_query, queries * 2))
+
+    for got, want in zip([*results, *answers], [*expected * 2, *expected_queries * 2], strict=True):
+        assert torch.allclose(torch.tensor(got), torch.tensor(want), rtol=0, atol=1e-6)

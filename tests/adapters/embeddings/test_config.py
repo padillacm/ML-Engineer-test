@@ -16,6 +16,7 @@ def test_defaults_are_the_benchmarked_configuration(model_dir: Path) -> None:
 
     assert (config.max_length, config.batch_size, config.threads) == (512, 16, 2)
     assert config.max_chars == 50_000
+    assert config.pool_size == 4
     assert config.path == model_dir
 
 
@@ -32,7 +33,7 @@ def test_revision_must_be_a_clean_string(model_dir: Path, revision: object) -> N
         E5EmbedderConfig(model_dir, revision)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("field", ["max_length", "batch_size", "threads", "max_chars"])
+@pytest.mark.parametrize("field", ["max_length", "batch_size", "threads", "max_chars", "pool_size"])
 @pytest.mark.parametrize("value", [0, -1, 1.5, True, "2"])
 def test_sizes_must_be_positive_integers(model_dir: Path, field: str, value: object) -> None:
     with pytest.raises(ConfigurationError, match=field):

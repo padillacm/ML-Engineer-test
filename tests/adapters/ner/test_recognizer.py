@@ -296,6 +296,7 @@ class GatedPipeline:
             assert not self.busy, "one pipeline ran two calls at once"
             self.busy = True
             self.calls += 1
+            self.pool.texts.append(text)
             self.pool.active += 1
             self.pool.peak = max(self.pool.peak, self.pool.active)
         try:
@@ -313,6 +314,7 @@ class GatedPool:
         self.release = threading.Event()
         self.active = 0
         self.peak = 0
+        self.texts: list[str] = []
         self.pipelines: list[GatedPipeline] = []
 
     def factory(self, config: TransformersNerConfig) -> list[TokenClassifier]:
@@ -342,6 +344,22 @@ def join_all(threads: list[threading.Thread]) -> None:
         assert not thread.is_alive()
 
 
+def wait_until(condition: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + 5
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never held"
+        time.sleep(0.005)
+
+
+def queue_one(recognizer: TransformersNameRecognizer, text: str) -> threading.Thread:
+    """Start a call on ``text`` and return once it waits for a pipeline (arrival order fixed)."""
+    before = recognizer._slots.waiting()
+    thread = threading.Thread(target=recognizer.find_persons, args=(text,))
+    thread.start()
+    wait_until(lambda: recognizer._slots.waiting() == before + 1)
+    return thread
+
+
 def test_a_pool_of_one_serialises_inference(model_dir: Path) -> None:
     pool = GatedPool()
     recognizer = TransformersNameRecognizer(
@@ -351,7 +369,7 @@ def test_a_pool_of_one_serialises_inference(model_dir: Path) -> None:
 
     threads = run_concurrently(6, lambda: results.append(recognizer.find_persons(TEXT)))
     pool.wait_for_active(1)
-    time.sleep(0.05)
+    wait_until(lambda: recognizer._slots.waiting() == 5)  # the others queue
     assert pool.active == 1
     pool.release.set()
     join_all(threads)
@@ -368,7 +386,7 @@ def test_at_most_pool_size_calls_run_at_once(model_dir: Path) -> None:
 
     threads = run_concurrently(8, lambda: results.append(recognizer.find_persons(TEXT)))
     pool.wait_for_active(3)
-    time.sleep(0.05)  # a fourth call, were it admitted, would start now
+    wait_until(lambda: recognizer._slots.waiting() == 5)  # the others queue
     assert pool.active == 3
     assert all(pipeline.busy for pipeline in pool.pipelines)
     pool.release.set()
@@ -411,6 +429,60 @@ def test_every_failure_gives_the_pipeline_back(model_dir: Path) -> None:
     with pytest.raises(ProcessingFailed, match="cannot read"):
         recognizer.find_persons(TEXT)
     assert recognizer.find_persons(TEXT) == [TextSpan(0, 14)]
+
+
+def test_waiting_calls_get_a_pipeline_in_arrival_order(model_dir: Path) -> None:
+    pool = GatedPool()
+    recognizer = TransformersNameRecognizer(
+        TransformersNerConfig(model_dir, pool_size=1), pool.factory
+    )
+    first = run_concurrently(1, lambda: recognizer.find_persons("first"))
+    pool.wait_for_active(1)
+    waiting = [queue_one(recognizer, f"page {index}") for index in range(5)]
+
+    pool.release.set()
+    join_all(first + waiting)
+
+    assert pool.texts == ["first"] + [f"page {index}" for index in range(5)]
+
+
+def test_a_job_calling_page_after_page_does_not_overtake_a_waiting_one(model_dir: Path) -> None:
+    pool = GatedPool()
+    recognizer = TransformersNameRecognizer(
+        TransformersNerConfig(model_dir, pool_size=1), pool.factory
+    )
+
+    def long_job() -> None:
+        for page in range(3):
+            recognizer.find_persons(f"long page {page}")
+
+    long_thread = run_concurrently(1, long_job)
+    pool.wait_for_active(1)
+    short_thread = queue_one(recognizer, "short page")
+
+    pool.release.set()  # the long job gives its pipeline back between pages
+    join_all([*long_thread, short_thread])
+
+    assert pool.texts == ["long page 0", "short page", "long page 1", "long page 2"]
+
+
+def test_a_close_between_the_slot_and_the_pipeline_refuses_the_call(
+    config: TransformersNerConfig,
+) -> None:
+    recognizer, pipeline = recognizer_for(config, entity("PER", 0, 14))
+    acquire = recognizer._slots.acquire
+
+    def acquire_then_close(lane: int = 0) -> bool:
+        granted = acquire(lane)
+        recognizer.close()  # the close lands after the slot was granted
+        return granted
+
+    recognizer._slots.acquire = acquire_then_close  # type: ignore[method-assign]
+
+    with pytest.raises(ProcessingFailed, match="NER model is closed"):
+        recognizer.find_persons(TEXT)
+    assert pipeline.calls == []
+    assert (recognizer._slots.held(), recognizer._slots.waiting()) == (0, 0)
 
 
 @pytest.mark.parametrize("built", [0, 1, 3])
@@ -468,7 +540,7 @@ def test_close_lets_running_calls_finish_and_wakes_waiting_ones(model_dir: Path)
 
     threads = run_concurrently(3, call)
     pool.wait_for_active(1)
-    time.sleep(0.05)  # the two other calls are now waiting for the only pipeline
+    wait_until(lambda: recognizer._slots.waiting() == 2)  # both wait for the only pipeline
     recognizer.close()
     deadline = time.monotonic() + 5
     while len(outcomes) < 2 and time.monotonic() < deadline:

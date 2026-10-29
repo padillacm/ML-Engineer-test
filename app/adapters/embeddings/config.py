@@ -26,8 +26,14 @@ class E5EmbedderConfig:
     adapter created wins, so the service passes the one ``TORCH_THREADS`` to the embedder and the
     recogniser; the field stays for standalone use by benchmarks and scripts). ``max_chars``
     bounds one text: a longer one is refused without running the model, because it would be
-    truncated anyway and its tokenisation holds the embedder's lock. Invalid values raise
-    ``ConfigurationError``.
+    truncated anyway and it would hold one of the embedder's slots meanwhile. ``pool_size`` is
+    the number of passage batches embedded at once: they share one copy of the model weights
+    and one tokenizer (tokenising runs under one lock), and a call waits for a free slot; one
+    more slot is reserved for queries, which also go before waiting passages. Each running
+    batch uses ``threads`` intra-op threads, so up to ``pool_size`` x ``threads`` CPUs are busy.
+    The default 4 is the smallest pool within 5 % of the best ingestion throughput on 16 CPUs
+    with 2 threads (BENCHMARKS 18); the service derives the size from the CPUs when
+    ``EMBEDDING_POOL_SIZE`` is unset. Invalid values raise ``ConfigurationError``.
     """
 
     model_path: str | Path
@@ -36,6 +42,7 @@ class E5EmbedderConfig:
     batch_size: int = 16
     threads: int = 2
     max_chars: int = 50_000
+    pool_size: int = 4
 
     def __post_init__(self) -> None:
         _require(
@@ -48,6 +55,7 @@ class E5EmbedderConfig:
         _require(_is_positive_int(self.batch_size), "batch_size must be a positive integer")
         _require(_is_positive_int(self.threads), "threads must be a positive integer")
         _require(_is_positive_int(self.max_chars), "max_chars must be a positive integer")
+        _require(_is_positive_int(self.pool_size), "pool_size must be a positive integer")
         _validate_model_directory(self.path)
 
     @property

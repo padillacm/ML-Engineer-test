@@ -7,8 +7,10 @@ model fails creation with ``ConfigurationError`` instead of failing the first re
 Thread safety: ``find_persons`` may be called from several threads. The recogniser keeps a pool
 of ``config.pool_size`` pipeline objects (each with its own per-call state) that share one model
 and one tokenizer. A call takes a free pipeline, waiting while all are busy, and always gives it
-back. The model only runs forward in ``eval`` mode without gradients, which torch allows from
-several threads at once, so up to ``pool_size`` forward passes run in parallel. The fast
+back; waiting calls get the pipelines in arrival order (``FifoSlots``), so a job that calls page
+after page does not keep a pipeline from a job that waits. The model only runs forward in
+``eval`` mode without gradients, which torch allows from several threads at once, so up to
+``pool_size`` forward passes run in parallel. The fast
 tokenizer is not thread-safe (it switches its truncation and padding settings in place, and a
 concurrent use then fails), so every step of the pipelines that uses it (tokenising a text,
 grouping the predicted tokens into entities) runs under one lock shared by the pool; those steps
@@ -33,6 +35,7 @@ from typing import Any, TypeGuard
 import torch
 
 from app.adapters.ner.config import TransformersNerConfig
+from app.adapters.slots import FifoSlots
 from app.domain.errors import ConfigurationError, ProcessingFailed, ServiceError
 from app.domain.types import TextSpan
 
@@ -75,7 +78,8 @@ class TransformersNameRecognizer:
         self._max_chars = config.max_chars
         self._labels = frozenset(config.labels)
         self._free = classifiers
-        self._changed = threading.Condition()
+        self._slots = FifoSlots(config.pool_size)
+        self._guard = threading.Lock()  # the free list and the closed flag
         self._closed = False
 
     def find_persons(self, text: str) -> list[TextSpan]:
@@ -111,24 +115,25 @@ class TransformersNameRecognizer:
 
         A pipeline in use when ``close`` runs is dropped as soon as its call returns.
         """
-        with self._changed:
+        with self._guard:
             self._closed = True
             self._free.clear()
-            self._changed.notify_all()
+        self._slots.close()
 
     def _acquire(self) -> TokenClassifier:
-        with self._changed:
-            while not self._free and not self._closed:
-                self._changed.wait()
-            if self._closed:
-                raise ProcessingFailed("NER model is closed", "ner_failed")
-            return self._free.pop()
+        """Wait in line for a slot of the pool, then take a free pipeline (one exists per slot)."""
+        if self._slots.acquire():
+            with self._guard:
+                if not self._closed:
+                    return self._free.pop()
+            self._slots.release()  # closed after the slot was granted
+        raise ProcessingFailed("NER model is closed", "ner_failed")
 
     def _release(self, classify: TokenClassifier) -> None:
-        with self._changed:
+        with self._guard:
             if not self._closed:
                 self._free.append(classify)
-                self._changed.notify()
+        self._slots.release()
 
 
 def load_pipelines(config: TransformersNerConfig) -> list[TokenClassifier]:
