@@ -3,14 +3,20 @@
 # Stages:
 #   model - downloads the NER model (Davlan/xlm-roberta-base-ner-hrl) and the embedding model
 #           (intfloat/multilingual-e5-base), each at a pinned revision with sha256-checked files
-#   base  - Python 3.12 on Debian 13 (trixie) + Tesseract 5 with eng/spa/por/fra/deu + uv
+#   uv    - the uv binaries only (pinned by digest); copied into `test`, mounted while `runtime`
+#           installs, so the runtime image has no uv
+#   base  - Python 3.12 on Debian 13 (trixie) + Tesseract 5 with eng/spa/por/fra/deu
 #           + both models at /models (read-only; Hugging Face offline mode)
-#   test  - project + dev dependencies; runs the full pytest suite (incl. `tesseract` tests)
-# A `runtime` stage (no dev deps) is added later on top of `base`.
+#   test    - project + dev dependencies + uv; runs the full pytest suite (incl. `tesseract` tests)
+#   runtime - the service: runtime dependencies and `app/` only (no tests, no dev tools, no uv),
+#             non-root, tini as PID 1, Uvicorn on port 8000 with a readiness healthcheck. Last stage, so a
+#             plain `docker build .` builds it; docker-compose.yml runs it with Qdrant.
 #
 # Build and run the tests:
 #   docker build --target test -t docintel-test .
 #   docker run --rm docintel-test
+# Build the service image (docker compose build does the same):
+#   docker build --target runtime -t docintel .
 
 # python:3.12-slim-trixie, pinned by digest (resolved 2026-10-27). Debian 13 ships Tesseract 5.5,
 # the version the OCR defaults were benchmarked with; bump tag and digest together.
@@ -185,12 +191,13 @@ PY
 RUN chmod -R a=rX /models
 
 
+# uv 0.12.19 (same version as the host), pinned by digest.
+FROM ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 AS uv
+
+
 FROM ${PYTHON_IMAGE} AS base
 
 ARG E5_MODEL_REVISION
-
-# uv 0.12.19 (same version as the host), pinned by digest.
-COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 /uv /uvx /usr/local/bin/
 
 # Apt packages pinned to the versions resolved on 2026-10-27 so a rebuild cannot silently change
 # the OCR engine. To bump: build with the pins removed (or run
@@ -246,6 +253,8 @@ COPY --from=model /models /models
 
 FROM base AS test
 
+COPY --from=uv /uv /uvx /usr/local/bin/
+
 WORKDIR /app
 
 # Dependencies first so the layer is reused while only source changes.
@@ -269,3 +278,42 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 # Plain `pytest -q`: the coverage gate is enforced by the pre-push hook on the host.
 # For a coverage report here: docker run --rm docintel-test pytest -q --cov
 CMD ["pytest", "-q"]
+
+
+FROM base AS runtime
+
+WORKDIR /app
+
+# Runtime dependencies only: no `dev` extra (pytest, ruff, mypy, pre-commit, PyMuPDF), no
+# project yet, so this layer is reused while only the source changes. Same cache mount as `test`.
+# --compile-bytecode: the app user cannot write .pyc files into the root-owned venv (and
+# PYTHONDONTWRITEBYTECODE is set), so without precompiled bytecode every start would recompile
+# torch and transformers in memory. uv is mounted for these two steps only, never copied.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv     --mount=from=uv,source=/uv,target=/usr/local/bin/uv     uv sync --frozen --no-dev --no-install-project --compile-bytecode
+
+# Only the service code. The build backend (hatchling, `packages = ["app"]`) needs nothing else:
+# pyproject.toml declares no readme or licence file. Code and venv stay owned by root, so the
+# service cannot modify them.
+COPY app/ ./app/
+RUN --mount=type=cache,target=/root/.cache/uv     --mount=from=uv,source=/uv,target=/usr/local/bin/uv     uv sync --frozen --no-dev --compile-bytecode
+
+USER app
+
+EXPOSE 8000
+
+# Healthy only when readiness succeeds (vector store reachable). Python's urllib, because the slim
+# image has no curl; a 503 raises HTTPError, so the probe exits non-zero. The models load in about
+# 10 s, hence the start period; start-interval probes every second until the first success, so
+# the service is marked healthy at most 1 s after it is ready (docs/BENCHMARKS.md 19.4). A
+# successful probe's access line is logged at DEBUG, so the 15 s probes do not flood the log.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --start-interval=1s --retries=3     CMD ["python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health/ready', timeout=4)"]
+
+# tini as PID 1: reaps orphaned tesseract processes and forwards SIGTERM to Uvicorn.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# One worker per container (every worker loads every model, about 2.3 GB RSS; scale by replicas).
+# --http h11: httptools hides a client's disconnect while a pipelined request waits (block 5 P5).
+# --timeout-graceful-shutdown 30: running requests get 30 s after SIGTERM (compose waits longer).
+# Uvicorn's access log is replaced by the service's own request log (app/observability.py).
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--http", "h11",      "--timeout-graceful-shutdown", "30", "--no-server-header"]

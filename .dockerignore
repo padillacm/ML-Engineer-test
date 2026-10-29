@@ -22,9 +22,11 @@ openspec
 .idea
 .vscode
 
-# Secrets
-.env
-.env.*
+# Secrets, in any directory (the example holds placeholders only; the test image's suite checks
+# it). A pattern without **/ matches only at the root of the build context.
+**/.env
+**/.env.*
+!**/.env.example
 
 # Docker files themselves
 Dockerfile

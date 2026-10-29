@@ -1,0 +1,315 @@
+# The service stack: the runtime image with a persistent Qdrant, optionally a local language model.
+#
+#   docker compose up -d --wait                         # app + Qdrant; questions need a model
+#   COMPOSE_PROFILES=gpu docker compose up -d --wait    # also Ollama on an NVIDIA GPU (LLM_MODEL)
+#   docker compose --profile gpu down                   # stop; indexed documents and models are kept
+#   docker compose --profile gpu down -v                # ... and delete them (named volumes)
+#
+# Configuration: copy .env.example to .env (optional; the stack starts without it). Compose reads
+# .env for the ${...} values below; the app gets only the settings listed under its
+# `environment` (an empty value means the setting's default) and its keys as secret files.
+# Values with `$` must be in single quotes in .env, or compose replaces `$name` with a variable.
+# Language model, one of:
+#   - none: questions that need a model answer 503 llm_unavailable; readiness says not_configured;
+#   - a hosted OpenAI-compatible model: LLM_BASE_URL, LLM_MODEL and LLM_API_KEY in .env (the key
+#     reaches the app as a secret file, not as a variable; see `secrets` below);
+#   - the `gpu` profile, switched on by COMPOSE_PROFILES=gpu (in .env or the environment): Ollama
+#     serves LLM_MODEL (default below) at a fixed address of the internal network, and the app is
+#     pointed at it. `--profile gpu` alone cannot point the app at Ollama (compose does not show
+#     the command line's profiles to the file), so `ollama-pull` then stops with an error and the
+#     app runs without a model. Not together with a hosted model: LLM_MODEL names the model of
+#     both, so `ollama-pull` also refuses to start when LLM_BASE_URL points elsewhere.
+# Only the app publishes a port, on 127.0.0.1 by default: the service has no authentication, so
+# exposing it beyond this host belongs behind a reverse proxy with TLS and auth.
+
+name: docintel
+
+x-ollama-image: &ollama-image ollama/ollama:0.40.12@sha256:20d1bbfbabe1c97ba4b16301f08a20d8484bcf77047742a3cb71c613d8e12d0b
+# The model Ollama pulls and serves with the `gpu` profile.
+x-ollama-model: &ollama-model ${LLM_MODEL:-gemma4:e4b-it-qat}
+# Ollama's address: fixed on the internal network, so the app reaches it without a name lookup.
+# A name (`ollama`) is resolved through Docker's DNS, which forwards unknown names to the host's
+# resolvers while Ollama is stopped or restarting: a LAN host or an ISP's catch-all answer could
+# then receive the questions and document text.
+x-ollama-url: &ollama-url http://${BACKEND_NETWORK_PREFIX:-10.213.47}.250:11434
+# The app's model server: LLM_BASE_URL from .env, else Ollama when COMPOSE_PROFILES is set (the
+# stack's only profile is `gpu`), else none.
+x-app-llm-base-url: &app-llm-base-url ${LLM_BASE_URL:-${COMPOSE_PROFILES:+http://${BACKEND_NETWORK_PREFIX:-10.213.47}.250:11434/v1}}
+# ... and its model: Gemma by default only for Ollama, so a hosted LLM_BASE_URL without LLM_MODEL
+# stops the app with "LLM_MODEL: required when LLM_BASE_URL is set".
+x-app-llm-model: &app-llm-model ${LLM_MODEL:-${COMPOSE_PROFILES:+gemma4:e4b-it-qat}}
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: ${APP_IMAGE:-docintel}
+    # Every setting the service reads (tests/deploy/test_compose_wiring.py keeps this list equal
+    # to app/settings.py), so nothing else from .env (another token, say) reaches the container.
+    # The model paths and revision come from the image; QDRANT_URL and the key files are fixed.
+    environment:
+      TORCH_THREADS: ${TORCH_THREADS:-}
+      NER_POOL_SIZE: ${NER_POOL_SIZE:-}
+      EMBEDDING_POOL_SIZE: ${EMBEDDING_POOL_SIZE:-}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-}
+      OCR_DPI: ${OCR_DPI:-}
+      OCR_WORKERS: ${OCR_WORKERS:-}
+      OCR_TIMEOUT_S: ${OCR_TIMEOUT_S:-}
+      OCR_FLATTEN: ${OCR_FLATTEN:-}
+      MAX_PAGES: ${MAX_PAGES:-}
+      MATCH_THRESHOLD: ${MATCH_THRESHOLD:-}
+      CHUNK_SIZE: ${CHUNK_SIZE:-}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-}
+      RAG_THRESHOLD: ${RAG_THRESHOLD:-}
+      RAG_TOP_K: ${RAG_TOP_K:-}
+      RAG_MAX_CHUNKS: ${RAG_MAX_CHUNKS:-}
+      RAG_MAX_CONTEXT_CHARS: ${RAG_MAX_CONTEXT_CHARS:-}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY_FILE: /run/secrets/qdrant_api_key
+      QDRANT_COLLECTION_PREFIX: ${QDRANT_COLLECTION_PREFIX:-}
+      QDRANT_TIMEOUT_S: ${QDRANT_TIMEOUT_S:-}
+      QDRANT_ATTEMPTS: ${QDRANT_ATTEMPTS:-}
+      QDRANT_DEADLINE_S: ${QDRANT_DEADLINE_S:-}
+      LLM_BASE_URL: *app-llm-base-url
+      LLM_MODEL: *app-llm-model
+      LLM_API_KEY_FILE: /run/secrets/llm_api_key
+      LLM_CONNECT_TIMEOUT_S: ${LLM_CONNECT_TIMEOUT_S:-}
+      LLM_READ_TIMEOUT_S: ${LLM_READ_TIMEOUT_S:-}
+      LLM_TOTAL_TIMEOUT_S: ${LLM_TOTAL_TIMEOUT_S:-}
+      LLM_ATTEMPTS: ${LLM_ATTEMPTS:-}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-}
+      LLM_MAX_TOKENS_FIELD: ${LLM_MAX_TOKENS_FIELD:-}
+      LLM_SEND_TEMPERATURE: ${LLM_SEND_TEMPERATURE:-}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-}
+      MAX_NAMES: ${MAX_NAMES:-}
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-}
+      MAX_CONCURRENT_QUESTIONS: ${MAX_CONCURRENT_QUESTIONS:-}
+      BUSY_WAIT_S: ${BUSY_WAIT_S:-}
+      READINESS_TIMEOUT_S: ${READINESS_TIMEOUT_S:-}
+      LOG_LEVEL: ${LOG_LEVEL:-}
+      LOG_FORMAT: ${LOG_FORMAT:-}
+      LOG_EXCEPTION_MESSAGES: ${LOG_EXCEPTION_MESSAGES:-}
+      # Not a setting: read by the start command below.
+      OLLAMA_URL: *ollama-url
+    # The keys (from .env or the shell) as files under /run/secrets. Compose refuses to create a
+    # container whose `environment` secret has no variable, so without a key (unset or empty) the
+    # app gets an empty file instead, which means no key.
+    secrets:
+      - source: llm_api_key${LLM_API_KEY:+_from_env}
+        target: llm_api_key
+      - source: qdrant_api_key${QDRANT_API_KEY:+_from_env}
+        target: qdrant_api_key
+    # The image's command, preceded by one default: Gemma 4 thinks unless asked not to, which cost
+    # 10-14 points of accuracy and 7.2 times the latency with e4b (2.8-5.3 times with 12B;
+    # docs/BENCHMARKS.md section 16.4), so thinking is turned off when the app uses the stack's
+    # Ollama, unless .env sets LLM_REASONING_EFFORT. `$$` keeps compose from interpolating.
+    command:
+      - sh
+      - -c
+      - |
+        case "$${LLM_BASE_URL:-}" in
+          "$${OLLAMA_URL}"/v1 | "$${OLLAMA_URL}"/v1/)
+            export LLM_REASONING_EFFORT="$${LLM_REASONING_EFFORT:-none}" ;;
+        esac
+        exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --http h11 \
+          --timeout-graceful-shutdown 30 --no-server-header
+    ports:
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8000}:8000"
+    networks:
+      - backend
+      - egress
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      llm-warmup:
+        condition: service_completed_successfully
+    # Longer than Uvicorn's 30 s graceful-shutdown timeout, so running requests can finish.
+    stop_grace_period: 40s
+    restart: unless-stopped
+
+  # One-shot, before the app, with or without the profile. When the app uses the stack's Ollama it
+  # checks that LLM_MODEL is there and asks one short prompt, so the model is loaded and its GPU
+  # kernels compiled before the first question (which could otherwise exceed LLM_TOTAL_TIMEOUT_S
+  # on a fresh volume); if Ollama does not answer within 30 s or lacks the model (its download
+  # failed), it exits 1 and the app is not started. Otherwise it exits 0 at once (app/llm_warmup.py).
+  llm-warmup:
+    image: ${APP_IMAGE:-docintel}
+    # Built by `app`; never pulled.
+    pull_policy: never
+    environment:
+      LLM_BASE_URL: *app-llm-base-url
+      LLM_MODEL: *app-llm-model
+      OLLAMA_URL: *ollama-url
+    command: ["python", "-m", "app.llm_warmup"]
+    networks:
+      - backend
+    depends_on:
+      # Only with the `gpu` profile; `required: false` lets the check run without it (it then
+      # exits 0, or fails visibly when the app was pointed at Ollama that is not there).
+      ollama:
+        condition: service_healthy
+        required: false
+    restart: "no"
+
+  qdrant:
+    # Same image and digest as docker-compose.test.yml (qdrant/qdrant v1.20.0, multi-arch index);
+    # bump both files together.
+    image: qdrant/qdrant:v1.20.0@sha256:9bfc89f9914fc14876a88c05270685921a55b8877b254a98bcc1cc2f0a424cd2
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    # With QDRANT_API_KEY set, Qdrant requires it (the app sends it): the image's start command
+    # runs with the key from the secret file in its environment, which `docker inspect` does not
+    # show. Health endpoints (the healthcheck below) need no key.
+    secrets:
+      - source: qdrant_api_key${QDRANT_API_KEY:+_from_env}
+        target: qdrant_api_key
+    command:
+      - bash
+      - -c
+      - |
+        key="$$(cat /run/secrets/qdrant_api_key)"
+        if [ -n "$$key" ]; then export QDRANT__SERVICE__API_KEY="$$key"; fi
+        unset key
+        exec ./entrypoint.sh
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - backend
+    healthcheck:
+      # The image has no curl or wget; bash's /dev/tcp sends a plain HTTP request to /readyz.
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/6333
+          && printf 'GET /readyz HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3
+          && head -n 1 <&3 | grep -q ' 200 '
+      # Probed every second while starting: with only the 5 s interval the app started about 5 s
+      # after Qdrant was ready (docs/BENCHMARKS.md section 17.6).
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+
+  ollama:
+    profiles: [gpu]
+    # ollama/ollama 0.40.12 (multi-arch index digest, resolved 2026-10-28); bump tag and digest
+    # together (docker buildx imagetools inspect ollama/ollama:<tag>).
+    image: *ollama-image
+    environment:
+      # Server-side context window (tokens); must hold the largest prompt plus the answer: measured
+      # at most about 3,100 + 512 tokens, and Ollama's own default on a 12 GB GPU is 4,096.
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-8192}
+      # Requests one loaded model serves at once (each gets its own context in VRAM): 2 gave 123-125
+      # questions/min against 94 with 1 and 128 with 4 (docs/BENCHMARKS.md section 16.7).
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
+      # One model in VRAM: the stack serves only LLM_MODEL.
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      # How long the model stays in VRAM after the last request; -1 keeps it loaded, because a
+      # reload takes 33-42 s and can exceed LLM_READ_TIMEOUT_S.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
+      # The driver compiles Ollama's GPU kernels on first use (measured on the RTX 4070 Ti: model
+      # load 33-50 s and 33-46 s more before the first token, so a first answer took 69-100 s).
+      # Kept in the models volume, the compiled kernels survive container recreation (then: load
+      # 1 s, first answer 1.8 s). 4 GiB is the driver's maximum cache size.
+      CUDA_CACHE_PATH: /root/.ollama/cuda-cache
+      CUDA_CACHE_MAXSIZE: "4294967296"
+    volumes:
+      - ollama_models:/root/.ollama
+    # Only the internal network, at the fixed address the app uses: the server never has a route
+    # out (downloads are `ollama-pull`'s job). No published port.
+    networks:
+      backend:
+        ipv4_address: ${BACKEND_NETWORK_PREFIX:-10.213.47}.250
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+
+  # One-shot, before `ollama`: a second Ollama server of its own (no GPU, egress network only,
+  # same volume) that downloads LLM_MODEL unless the volume already has it, so a warm volume
+  # starts offline. It first checks that the app is pointed at the stack's Ollama.
+  ollama-pull:
+    profiles: [gpu]
+    image: *ollama-image
+    environment:
+      LLM_MODEL: *ollama-model
+      APP_LLM_BASE_URL: *app-llm-base-url
+      OLLAMA_URL: *ollama-url
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - egress
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        case "$${APP_LLM_BASE_URL}" in
+          "$${OLLAMA_URL}/v1") ;;
+          "") echo "the app is not pointed at Ollama: start with COMPOSE_PROFILES=gpu (in .env or the environment), not --profile gpu" >&2
+              exit 1 ;;
+          *) echo "LLM_BASE_URL is not the stack's Ollama: leave it unset with the gpu profile, or start without the profile for a hosted model" >&2
+             exit 1 ;;
+        esac
+        ollama serve > /dev/null 2>&1 &
+        server=$$!
+        tries=0
+        until ollama list > /dev/null 2>&1; do
+          tries=$$((tries + 1))
+          if [ "$$tries" -ge 30 ]; then echo "the download server did not start" >&2; exit 1; fi
+          sleep 1
+        done
+        ollama show "$$LLM_MODEL" > /dev/null 2>&1 || ollama pull "$$LLM_MODEL"
+        status=$$?
+        kill "$$server"
+        wait "$$server"
+        exit "$$status"
+    restart: "no"
+
+networks:
+  # No route out: Qdrant and Ollama are reachable only from the stack. A fixed /24 so Ollama has a
+  # fixed address (.250, outside the .0/25 range given to the other containers); change
+  # BACKEND_NETWORK_PREFIX when the subnet is taken (another network, a second copy of the stack).
+  backend:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${BACKEND_NETWORK_PREFIX:-10.213.47}.0/24
+          ip_range: ${BACKEND_NETWORK_PREFIX:-10.213.47}.0/25
+  # The app's published port and outbound calls (a hosted model); Ollama's model downloads.
+  egress: {}
+
+volumes:
+  qdrant_data:
+  ollama_models:
+
+secrets:
+  # The hosted model's key, LLM_API_KEY from .env or the shell; used only when it is set.
+  llm_api_key_from_env:
+    environment: LLM_API_KEY
+  # Mounted in its place when LLM_API_KEY is unset or empty: an empty file (no key).
+  llm_api_key:
+    file: ./deploy/empty-secret
+  # Qdrant's key, QDRANT_API_KEY; the same empty file without one.
+  qdrant_api_key_from_env:
+    environment: QDRANT_API_KEY
+  qdrant_api_key:
+    file: ./deploy/empty-secret

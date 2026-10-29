@@ -7,6 +7,8 @@
   ``EMBEDDING_MODEL_PATH`` (baked into the container image; absent on the host).
 - ``qdrant_server``: needs a Qdrant server at ``QDRANT_URL`` (set by the test compose file).
 - ``llm_server``: needs an OpenAI-compatible LLM server at ``LLM_BASE_URL``.
+- ``deployed_service``: needs a running stack at ``SERVICE_URL`` (set by
+  docker-compose.smoke.yml for the ``smoke`` service).
 """
 
 import os
@@ -33,6 +35,12 @@ _NO_EMBEDDING_MODEL = pytest.mark.skip(
 )
 _NO_QDRANT = pytest.mark.skip(reason=f"QDRANT_URL unset; {_COMPOSE_HINT}")
 _NO_LLM = pytest.mark.skip(reason="LLM_BASE_URL unset (needs an OpenAI-compatible server)")
+_NO_SERVICE = pytest.mark.skip(
+    reason=(
+        "SERVICE_URL unset; run the smoke suite against the stack: docker compose "
+        "-f docker-compose.yml -f docker-compose.smoke.yml run --rm smoke"
+    )
+)
 
 
 def _directory_from_env(name: str) -> bool:
@@ -57,6 +65,8 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         missing.append(("qdrant_server", _NO_QDRANT))
     if not _env_set("LLM_BASE_URL"):
         missing.append(("llm_server", _NO_LLM))
+    if not _env_set("SERVICE_URL"):
+        missing.append(("deployed_service", _NO_SERVICE))
     for item in items:
         for keyword, skip in missing:
             if item.get_closest_marker(keyword) is not None:

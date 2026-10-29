@@ -76,6 +76,7 @@ markers = [
     "embedding_model: needs the local embedding model (skipped when EMBEDDING_MODEL_PATH is unset or the directory is missing)",
     "qdrant_server: needs a Qdrant server (skipped when QDRANT_URL is unset)",
     "llm_server: needs an OpenAI-compatible LLM server (skipped when LLM_BASE_URL is unset)",
+    "deployed_service: smoke test of a running stack over HTTP (skipped when SERVICE_URL is unset)",
 ]
 # pytest resets the warning filters for every test, so the adapter's process-wide filter for
 # this one transformers message (see app/adapters/ner/recognizer.py) does not survive between

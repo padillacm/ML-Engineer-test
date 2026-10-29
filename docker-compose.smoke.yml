@@ -1,0 +1,60 @@
+# Smoke tests of the running stack, and hygiene checks of the runtime image. Use together with
+# docker-compose.yml (with COMPOSE_PROFILES=gpu to test the stack with the local model):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.smoke.yml run --rm smoke
+#   docker compose -f docker-compose.yml -f docker-compose.smoke.yml run --rm hygiene
+#
+# `smoke` builds the test image (docintel-test), starts the stack if it is not running, waits
+# until the app is healthy and runs tests/deploy (marker deployed_service) against
+# http://app:8000 over the internal network. The tests ingest the sample PDFs into the stack's
+# store. `hygiene` runs the runtime image without a network and fails if it contains test or
+# development code, uv, a .env file, runs as root, can download models or lets the service change
+# its own code.
+
+services:
+  smoke:
+    profiles: [smoke]
+    build:
+      context: .
+      target: test
+    image: ${TEST_IMAGE:-docintel-test}
+    environment:
+      SERVICE_URL: http://app:8000
+    networks:
+      - backend
+    depends_on:
+      app:
+        condition: service_healthy
+    command:
+      ["pytest", "-q", "-rs", "-p", "no:cacheprovider", "-m", "deployed_service", "tests/deploy"]
+    restart: "no"
+
+  hygiene:
+    profiles: [smoke]
+    image: ${APP_IMAGE:-docintel}
+    network_mode: none
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        failed=0
+        check() {
+          if eval "$$2" > /dev/null 2>&1; then echo "ok    $$1"; else echo "FAIL  $$1"; failed=1; fi
+        }
+        check "runs as uid 10001" '[ "$$(id -u)" = 10001 ]'
+        check "tini is PID 1" '[ "$$(cat /proc/1/comm)" = tini ]'
+        check "pytest is not installed" '! python -c "import pytest"'
+        check "pymupdf is not installed" '! python -c "import pymupdf"'
+        check "no dev tools (ruff, mypy, pre-commit)" \
+          '! python -c "import ruff" && ! python -c "import mypy" && ! python -c "import pre_commit"'
+        check "no tests directory" '[ ! -e /app/tests ]'
+        check "no sample PDFs" '[ ! -e /app/sample_pdfs ]'
+        check "no .env files" '[ -z "$$(find /app -name ".env*")" ]'
+        check "no uv or uvx" '! command -v uv && ! command -v uvx'
+        check "Hugging Face offline" '[ "$$HF_HUB_OFFLINE" = 1 ] && [ "$$TRANSFORMERS_OFFLINE" = 1 ]'
+        check "MALLOC_ARENA_MAX=2" '[ "$$MALLOC_ARENA_MAX" = 2 ]'
+        check "service code is read-only" '! touch /app/app/main.py'
+        check "models are read-only" '! touch /models/multilingual-e5-base/config.json'
+        check "the service imports" 'python -c "import app.main"'
+        exit $$failed
