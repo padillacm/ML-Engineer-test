@@ -2,6 +2,7 @@
 
 import math
 from collections.abc import Sequence
+from dataclasses import replace
 
 import pytest
 
@@ -75,6 +76,19 @@ def test_repeated_name_on_two_pages_gives_one_mention_per_page_with_its_own_box(
     assert result.names[0].box == union(word_boxes(first, "Maria", "Gonzalez"))
     assert result.names[1].box == union(word_boxes(second, "Maria", "Gonzalez"))
     assert result.names[0].box != result.names[1].box
+
+
+def test_a_name_whose_words_were_all_read_with_low_confidence_is_not_reported() -> None:
+    page = make_page(0, ["Signed Pivo Wviy for Maria Gonzalez"])
+    confidences = {"Pivo": 0.0, "Wviy": 12.0, "Maria": 18.0, "Gonzalez": 95.0}
+    words = tuple(replace(w, confidence=confidences.get(w.text, 90.0)) for w in page.words)
+    page = replace(page, words=words)
+    use_case, _, _ = extract([page], ["Pivo Wviy", "Maria Gonzalez"])
+
+    result = use_case(b"%PDF", [NamePair("Pivo", "Wviy")])
+
+    assert [mention.name for mention in result.names] == ["Maria Gonzalez"]
+    assert result.matches == ()
 
 
 def test_box_covers_the_name_words_only() -> None:

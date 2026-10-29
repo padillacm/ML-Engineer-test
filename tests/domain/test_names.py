@@ -1,17 +1,20 @@
 import random
 import unicodedata
 from collections.abc import Sequence
+from dataclasses import replace
 
 import pytest
 
 from app.domain.geometry import PageText
 from app.domain.names import (
+    MIN_NAME_CONFIDENCE,
     WordRange,
     clean_mentions,
     drop_digits,
     drop_lowercase,
     drop_short,
     drop_single_words,
+    drop_unreadable,
     extend_initials,
     mention_text,
     merge_hyphenated,
@@ -45,6 +48,14 @@ def _page(*lines: str) -> PageText:
 
 def _words(*lines: str) -> tuple[PageWord, ...]:
     return _page(*lines).words
+
+
+def _with_confidences(page: PageText, *confidences: float | None) -> PageText:
+    """``page`` with its words given ``confidences`` in order."""
+    assert len(confidences) == len(page.words)
+    return PageText.from_words(
+        [replace(word, confidence=c) for word, c in zip(page.words, confidences, strict=True)]
+    )
 
 
 def _span(page: PageText, phrase: str, occurrence: int = 0) -> TextSpan:
@@ -461,6 +472,30 @@ class TestDropShort:
         assert drop_short(words, [_r(0, 1, titled=True)]) == [_r(0, 1, titled=True)]
 
 
+class TestDropUnreadable:
+    @pytest.mark.parametrize("confidences", [(0.0, 9.0), (19.9, 0.0)])
+    def test_every_word_below_the_minimum_drops_the_range(
+        self, confidences: tuple[float, float]
+    ) -> None:
+        words = _with_confidences(_page("Co Jrrao"), *confidences).words
+        assert drop_unreadable(words, [_r(0, 2)]) == []
+
+    @pytest.mark.parametrize(
+        "confidences",
+        [(0.0, MIN_NAME_CONFIDENCE), (0.0, 63.0), (None, 0.0), (None, None)],
+        ids=["one-at-the-minimum", "one-readable", "one-without-confidence", "no-confidences"],
+    )
+    def test_one_readable_word_or_no_confidence_keeps_the_range(
+        self, confidences: tuple[float | None, float | None]
+    ) -> None:
+        words = _with_confidences(_page("Lay Nal"), *confidences).words
+        assert drop_unreadable(words, [_r(0, 2)]) == [_r(0, 2)]
+
+    def test_only_the_words_of_each_range_count(self) -> None:
+        words = _with_confidences(_page("Ana Lopez Co Jrrao"), 96.0, 91.0, 18.0, 9.0).words
+        assert drop_unreadable(words, [_r(0, 2), _r(2, 4)]) == [_r(0, 2)]
+
+
 # --- reported text ----------------------------------------------------------------------------
 
 
@@ -494,6 +529,12 @@ class TestMentionText:
 
 
 class TestCleanMentionsScenarios:
+    def test_name_read_with_low_confidence_throughout_is_not_reported(self) -> None:
+        # A signature scribble read as two capitalised words, next to a real name.
+        page = _with_confidences(_page("Signed Pivo Wviy", "Maria Gonzalez"), 90, 0, 12, 95, 18)
+        spans = [_span(page, "Pivo Wviy"), _span(page, "Maria Gonzalez")]
+        assert [name for name, _ in clean_mentions(page, spans)] == ["Maria Gonzalez"]
+
     def test_box_covers_the_name_only(self) -> None:
         page = _page("Dr. Maria Gonzalez, CEO")
         mentions = clean_mentions(page, [_span(page, "Maria Gonzalez")])

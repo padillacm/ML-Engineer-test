@@ -102,6 +102,21 @@ def test_page_words_in_different_paragraphs_are_unequal() -> None:
     assert PageWord("a", Box(0, 1, 2, 3, 4), 0, 0) != PageWord("a", Box(0, 1, 2, 3, 4), 0, 1)
 
 
+@pytest.mark.parametrize("confidence", [None, 0.0, 19.99, 100.0])
+def test_page_word_accepts_no_confidence_or_one_from_0_to_100(confidence: float | None) -> None:
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 0, 0, confidence).confidence == confidence
+
+
+def test_page_word_has_no_confidence_by_default() -> None:
+    assert PageWord("a", Box(0, 1, 2, 3, 4), 0, 0).confidence is None
+
+
+@pytest.mark.parametrize("confidence", [-0.1, 100.1, float("nan"), float("inf")])
+def test_page_word_rejects_a_confidence_outside_0_to_100(confidence: float) -> None:
+    with pytest.raises(ValueError, match=r"confidence must be None or in 0\.\.100"):
+        PageWord("a", Box(0, 1, 2, 3, 4), 0, 0, confidence)
+
+
 @pytest.mark.parametrize("name", ["", " ", "\t\n"])
 def test_name_mention_rejects_a_blank_name(name: str) -> None:
     with pytest.raises(ValueError, match="name must not be blank"):

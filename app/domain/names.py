@@ -12,6 +12,9 @@ benchmark's recommended chain (``docs/BENCHMARKS.md`` section 4.3, "REC"):
 4. T ``strip_titles``: strip leading titles and mark ranges a title stripped or preceded.
 5. Dsingle, Dlower, Ddigit, Dshort: drop one-word ranges unless titled, ranges without an
    upper-case letter, ranges with digits or "@", and ranges with fewer than three letters.
+6. Dconf ``drop_unreadable``: drop ranges whose every word was recognised with a confidence
+   below ``MIN_NAME_CONFIDENCE`` (signatures and noise read as letters; measured in
+   ``docs/BENCHMARKS.md`` section 21, not part of the benchmark's chain).
 
 ``clean_mentions`` runs the whole chain on one page.
 """
@@ -25,6 +28,9 @@ from functools import partial
 
 from app.domain.geometry import PageText
 from app.domain.types import PageWord, TextSpan
+
+MIN_NAME_CONFIDENCE = 20.0
+"""A name whose every word has a lower OCR confidence (0-100) is not reported."""
 
 _RIGHT_QUOTE = "\N{RIGHT SINGLE QUOTATION MARK}"
 _EN_DASH = "\N{EN DASH}"
@@ -66,6 +72,7 @@ _FULL_NAME_MIN_WORDS = 2
 # Languages whose "Last, First" forms often have two words on each side of the comma.
 _DOUBLE_NAME_LANGUAGES = frozenset({"es", "pt"})
 _MIN_LETTERS = 3
+
 _MIN_CAPS_LETTERS = 2
 _QUOTES = "\"'«»\N{LEFT DOUBLE QUOTATION MARK}\N{RIGHT DOUBLE QUOTATION MARK}" + (
     "\N{LEFT SINGLE QUOTATION MARK}\N{RIGHT SINGLE QUOTATION MARK}\N{DOUBLE LOW-9 QUOTATION MARK}"
@@ -452,6 +459,19 @@ def drop_short(words: Sequence[PageWord], ranges: Sequence[WordRange]) -> list[W
     )
 
 
+def drop_unreadable(words: Sequence[PageWord], ranges: Sequence[WordRange]) -> list[WordRange]:
+    """Dconf: drop ranges whose every word has a confidence below ``MIN_NAME_CONFIDENCE``.
+
+    A word without a confidence (``None``) counts as readable, so the rule never drops a range
+    from an engine that reports none.
+    """
+    return [r for r in ranges if not all(_unreadable(w) for w in words[r.start_word : r.end_word])]
+
+
+def _unreadable(word: PageWord) -> bool:
+    return word.confidence is not None and word.confidence < MIN_NAME_CONFIDENCE
+
+
 # --- reported text and pipeline ---------------------------------------------------------------
 
 
@@ -484,6 +504,6 @@ def clean_mentions(
     ranges = extend_initials(words, ranges, language=language)
     ranges = merge_names(words, ranges, language=language)
     ranges = strip_titles(words, ranges, language=language)
-    for drop in (drop_single_words, drop_lowercase, drop_digits, drop_short):
+    for drop in (drop_single_words, drop_lowercase, drop_digits, drop_short, drop_unreadable):
         ranges = drop(words, ranges)
     return [(mention_text(words, r), r) for r in ranges]

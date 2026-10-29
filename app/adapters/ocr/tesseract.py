@@ -43,6 +43,7 @@ _HEADER = (
     "text",
 )
 _WORD_LEVEL = 5
+_MAX_CONFIDENCE = 100
 _POSIX = sys.platform != "win32"
 _REAP_TIMEOUT_S = 5.0
 
@@ -216,7 +217,8 @@ def parse_tsv(tsv: str, raster: PageRaster, page: int) -> tuple[PageWord, ...]:
     """Return the words of a Tesseract TSV in reading order, with boxes in page points.
 
     Only word rows with non-blank text and a confidence of at least 0 are kept (a non-numeric,
-    non-finite or overflowing field fails with ``ocr_failed``); boxes are
+    non-finite or overflowing field, or a confidence above 100, fails with ``ocr_failed``); each
+    kept word carries its confidence. Boxes are
     converted with ``raster`` and clipped to the page, and words left without area are dropped.
     Each kept word gets the 0-based index of its ``(block_num, par_num, line_num)`` triple in
     order of first appearance among the kept words, so the lines of a page are numbered
@@ -232,17 +234,17 @@ def parse_tsv(tsv: str, raster: PageRaster, page: int) -> tuple[PageWord, ...]:
     for number, line in enumerate(lines[1:], start=2):
         row = _parse_row(line, number, raster, page)
         if row is not None:
-            text, box, key = row
+            text, box, key, confidence = row
             line_index = line_indices.setdefault(key, len(line_indices))
             paragraph_index = paragraph_indices.setdefault(key[:2], len(paragraph_indices))
-            words.append(PageWord(text, box, line_index, paragraph_index))
+            words.append(PageWord(text, box, line_index, paragraph_index, confidence))
     return tuple(words)
 
 
 def _parse_row(
     line: str, number: int, raster: PageRaster, page: int
-) -> tuple[str, Box, tuple[int, int, int]] | None:
-    """Return the text, page-space box and line key of a kept word row, else ``None``."""
+) -> tuple[str, Box, tuple[int, int, int], float] | None:
+    """Return the text, page-space box, line key and confidence of a kept word row, or ``None``."""
     fields = line.split("\t", len(_HEADER) - 1)
     if len(fields) != len(_HEADER):
         raise ProcessingFailed(f"tesseract TSV line {number} is malformed", "ocr_failed")
@@ -254,7 +256,7 @@ def _parse_row(
         confidence = float(fields[10])
     except (ValueError, OverflowError) as error:
         raise invalid from error
-    if not isfinite(confidence):
+    if not isfinite(confidence) or confidence > _MAX_CONFIDENCE:
         raise invalid
     text = fields[11]
     if level != _WORD_LEVEL or not text.strip() or confidence < 0:
@@ -271,4 +273,4 @@ def _parse_row(
         raise invalid from error
     if box.width <= 0 or box.height <= 0:
         return None
-    return text, box, (block, paragraph, text_line)
+    return text, box, (block, paragraph, text_line), confidence

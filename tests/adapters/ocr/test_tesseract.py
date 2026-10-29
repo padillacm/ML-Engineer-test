@@ -61,12 +61,18 @@ class TestParseTsv:
         words = parse_tsv(_fixture("page_words.tsv.txt"), RASTER, 3)
 
         assert words == (
-            PageWord("Ramírez", Box(3, 50.0, 25.0, 100.0, 20.0), 0, 0),
-            PageWord("Müller", Box(3, 160.0, 25.0, 50.0, 20.0), 0, 0),
-            PageWord("São", Box(3, 300.0, 25.0, 75.0, 20.0), 0, 0),
-            PageWord("edge", Box(3, 450.0, 230.0, 50.0, 20.0), 1, 0),
-            PageWord("beyond", Box(3, 475.0, 240.0, 25.0, 10.0), 1, 0),
+            PageWord("Ramírez", Box(3, 50.0, 25.0, 100.0, 20.0), 0, 0, 96.5),
+            PageWord("Müller", Box(3, 160.0, 25.0, 50.0, 20.0), 0, 0, 91.0),
+            PageWord("São", Box(3, 300.0, 25.0, 75.0, 20.0), 0, 0, 0.0),
+            PageWord("edge", Box(3, 450.0, 230.0, 50.0, 20.0), 1, 0, 75.0),
+            PageWord("beyond", Box(3, 475.0, 240.0, 25.0, 10.0), 1, 0, 70.0),
         )
+
+    def test_each_word_carries_its_confidence_with_both_ends_of_the_scale_kept(self) -> None:
+        (low,) = parse_tsv(_row(conf="0"), RASTER, 0)
+        (high,) = parse_tsv(_row(conf="100"), RASTER, 0)
+
+        assert (low.confidence, high.confidence) == (0.0, 100.0)
 
     def test_words_on_one_line_share_an_index_and_the_next_line_gets_the_next(self) -> None:
         tsv = _words((1, 1, 1, "Maria"), (1, 1, 1, "Gonzalez"), (1, 1, 2, "Director"))
@@ -150,6 +156,7 @@ class TestParseTsv:
             _row(conf="nan"),
             _row(conf="inf"),
             _row(conf="-inf"),
+            _row(conf="100.5"),
             _row(line="first"),
             _row(line="9" * 5000),
         ],
@@ -164,6 +171,7 @@ class TestParseTsv:
             "nan-conf",
             "inf-conf",
             "minus-inf-conf",
+            "conf-over-100",
             "bad-line",
             "line-over-digit-limit",
         ],

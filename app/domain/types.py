@@ -7,6 +7,8 @@ from typing import Literal
 from app.domain.errors import GeometryError
 from app.domain.language import SUPPORTED_LANGUAGES
 
+_MAX_CONFIDENCE = 100
+
 
 @dataclass(frozen=True, slots=True)
 class Box:
@@ -69,18 +71,25 @@ class PageWord:
     segmented by the recognition engine, with lines numbered in reading order. Words on the same
     printed line share an index. ``paragraph`` is the 0-based index of the paragraph the word
     belongs to on its page, numbered the same way; words of the same printed paragraph share it.
+    ``confidence`` is the recognition engine's confidence in the word, from 0 to 100, or
+    ``None`` when the engine reports none.
     """
 
     text: str
     box: Box
     line: int
     paragraph: int
+    confidence: float | None = None
 
     def __post_init__(self) -> None:
         if self.line < 0:
             raise ValueError(f"line index must be >= 0, got {self.line}")
         if self.paragraph < 0:
             raise ValueError(f"paragraph index must be >= 0, got {self.paragraph}")
+        if self.confidence is not None and not (
+            isfinite(self.confidence) and 0 <= self.confidence <= _MAX_CONFIDENCE
+        ):
+            raise ValueError(f"confidence must be None or in 0..100, got {self.confidence}")
 
 
 @dataclass(frozen=True, slots=True)
