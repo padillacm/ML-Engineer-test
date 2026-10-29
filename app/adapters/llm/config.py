@@ -9,6 +9,12 @@ from app.domain.errors import ConfigurationError
 
 _MAX_TEMPERATURE = 2.0
 
+REASONING_EFFORTS: frozenset[str] = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+"""Accepted ``reasoning_effort`` values (the OpenAI set; Ollama's endpoint honours ``none``)."""
+
+MAX_TOKENS_FIELDS: frozenset[str] = frozenset({"max_tokens", "max_completion_tokens"})
+"""Names the request may give the reply limit: hosted reasoning models reject ``max_tokens``."""
+
 
 @dataclass(frozen=True, slots=True)
 class LLMClientConfig:
@@ -35,7 +41,14 @@ class LLMClientConfig:
     by ``total_timeout_s + 2 * connect_timeout_s + min(read_timeout_s, total_timeout_s)`` (160 s
     with the defaults), assuming the request goes out in one write and the headers in one read;
     a server that trickles its status line and headers byte by byte is not bounded by httpx.
-    Invalid values raise ``ConfigurationError``.
+
+    The request adapts to the model's parameters: ``reasoning_effort`` (one of
+    ``REASONING_EFFORTS``) is sent only when set (``"none"`` turns thinking off on Ollama's
+    OpenAI-compatible endpoint, where thinking models otherwise reason by default),
+    ``max_tokens_field`` names the reply limit (``max_tokens``, or ``max_completion_tokens`` for
+    hosted reasoning models, which reject ``max_tokens``), and ``send_temperature=False`` leaves
+    ``temperature`` out for models that accept only their default. With the defaults the request
+    is the plain chat-completions request. Invalid values raise ``ConfigurationError``.
     """
 
     base_url: str
@@ -50,6 +63,9 @@ class LLMClientConfig:
     total_timeout_s: float = 90.0
     max_tokens: int = 512
     temperature: float = 0.0
+    reasoning_effort: str | None = None
+    max_tokens_field: str = "max_tokens"
+    send_temperature: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _normalise_base_url(self.base_url))
@@ -91,6 +107,19 @@ class LLMClientConfig:
             _is_non_negative(self.temperature) and self.temperature <= _MAX_TEMPERATURE,
             "temperature must be between 0 and 2",
         )
+        _require(
+            self.reasoning_effort is None
+            or (
+                isinstance(self.reasoning_effort, str)
+                and self.reasoning_effort in REASONING_EFFORTS
+            ),
+            "reasoning_effort must be None or one of none, minimal, low, medium, high, xhigh",
+        )
+        _require(
+            isinstance(self.max_tokens_field, str) and self.max_tokens_field in MAX_TOKENS_FIELDS,
+            "max_tokens_field must be max_tokens or max_completion_tokens",
+        )
+        _require(isinstance(self.send_temperature, bool), "send_temperature must be a boolean")
 
     @property
     def completions_url(self) -> str:

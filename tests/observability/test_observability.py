@@ -61,7 +61,9 @@ def test_allowed_fields_are_the_access_error_outcome_and_start_up_fields() -> No
         "names_found", "matches", "requested_names", "size_bytes", "document_id",
         "chunks_stored", "already_indexed", "hits", "hits_kept", "top_score", "refused",
         "refusal_reason", "llm_ms", "ocr_ms", "ner_ms", "embed_ms", "store_ms", "search_ms",
-        "sources", "check", "ready", "cpus_requested", "cpus_available",
+        "sources", "check", "ready", "cpus_requested", "cpus_available", "torch_threads",
+        "max_concurrent_jobs", "ner_pool_size", "embedding_pool_size", "ocr_workers",
+        "model", "max_tokens",
     }  # fmt: skip
     assert set(ALLOWED_FIELDS) == expected
 

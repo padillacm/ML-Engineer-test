@@ -24,6 +24,9 @@ def test_defaults() -> None:
     )
     assert config.total_timeout_s == 90.0
     assert (config.max_tokens, config.temperature) == (512, 0.0)
+    assert config.reasoning_effort is None
+    assert config.max_tokens_field == "max_tokens"
+    assert config.send_temperature is True
 
 
 @pytest.mark.parametrize(
@@ -93,6 +96,19 @@ def test_base_url_containing_the_key_is_rejected() -> None:
         {"temperature": -0.1},
         {"temperature": 2.5},
         {"temperature": float("nan")},
+        {"reasoning_effort": ""},
+        {"reasoning_effort": "None"},
+        {"reasoning_effort": "off"},
+        {"reasoning_effort": " low"},
+        {"reasoning_effort": 0},
+        {"reasoning_effort": ["low"]},
+        {"max_tokens_field": "max_output_tokens"},
+        {"max_tokens_field": "MAX_TOKENS"},
+        {"max_tokens_field": None},
+        {"max_tokens_field": ["max_tokens"]},
+        {"send_temperature": "false"},
+        {"send_temperature": 0},
+        {"send_temperature": None},
     ],
 )
 def test_invalid_values_are_rejected(overrides: dict[str, object]) -> None:
@@ -100,6 +116,36 @@ def test_invalid_values_are_rejected(overrides: dict[str, object]) -> None:
 
     with pytest.raises(ConfigurationError):
         LLMClientConfig(**settings)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high", "xhigh"])
+def test_every_reasoning_effort_is_accepted(effort: str) -> None:
+    assert LLMClientConfig("http://h/v1", "m", reasoning_effort=effort).reasoning_effort == effort
+
+
+@pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+@pytest.mark.parametrize("send_temperature", [True, False])
+def test_limit_field_and_temperature_switch_are_accepted(
+    field: str, send_temperature: bool
+) -> None:
+    config = LLMClientConfig(
+        "http://h/v1", "m", max_tokens_field=field, send_temperature=send_temperature
+    )
+
+    assert (config.max_tokens_field, config.send_temperature) == (field, send_temperature)
+
+
+def test_option_errors_are_fixed_text() -> None:
+    with pytest.raises(ConfigurationError) as info:
+        LLMClientConfig("http://h/v1", "m", reasoning_effort="sk-secret-value")
+
+    assert info.value.message == (
+        "reasoning_effort must be None or one of none, minimal, low, medium, high, xhigh"
+    )
+    with pytest.raises(ConfigurationError) as other:
+        LLMClientConfig("http://h/v1", "m", max_tokens_field="sk-secret-value")
+
+    assert "sk-secret-value" not in str(other.value)
 
 
 def test_key_is_masked_in_config_text() -> None:

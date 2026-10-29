@@ -13,14 +13,33 @@ starts and no wait is taken past it, each attempt's timeouts are cut to the time
 read in chunks with the deadline checked after each one, and running out raises
 ``DependencyTimeout("LLM request exceeded its deadline", "llm_timeout")``.
 
+The request carries ``model``, ``messages``, ``temperature`` (unless ``send_temperature`` is
+off), the reply limit under ``max_tokens_field``, ``stream: false`` and, only when configured,
+``reasoning_effort``; with the default config it is the plain chat-completions request.
+
 Error messages are fixed text with attempt counts, status codes and exception type names only:
-never the key, the prompt or the response body. The original exception is chained as
-``__cause__`` for logs; the key travels only in the ``Authorization`` header, never in the URL.
+never the key, the prompt or the response body. The one addition is a rejected request (a 4xx
+other than 429): the client reads at most ``_ERROR_BODY_LIMIT`` bytes of its body and, when that
+is OpenAI's ``{"error": {"code": ...}}`` (or ``type`` without a usable ``code``), names the code:
+``LLM request failed (status 400, unsupported_parameter)``. The code is used only if it is a
+short identifier (``_ERROR_CODE``: 1-64 ASCII letters, digits, ``_``, ``.`` or ``-``) that does
+not contain the key and is not part of it; the provider's message and the rest of the body are
+never used. The rejection is also logged at WARNING with the same text, so it is diagnosable
+from the logs (the service logs a failed request's code, not its message). The original
+exception is chained as ``__cause__`` for logs; the key travels only in the ``Authorization``
+header, never in the URL.
+
+A 2xx reply that stopped at the token limit (``finish_reason`` ``length``) with empty or blank
+content (a thinking model that spent the whole budget reasoning) is logged at WARNING with the
+configured ``model`` name and ``max_tokens`` as fields, without its content, and still returned:
+the caller decides what an empty reply means.
 """
 
 import json
+import logging
 import math
 import random
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -39,6 +58,12 @@ _UNAVAILABLE = "llm_unavailable"
 _TIMEOUT = "llm_timeout"
 _RETRYABLE_TRANSPORT_ERRORS = (httpx.NetworkError, httpx.RemoteProtocolError)
 _DEADLINE_MESSAGE = "LLM request exceeded its deadline"
+_ERROR_BODY_LIMIT = 16 * 1024
+_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+_MIN_KEY_FRAGMENT = 8
+_TRUNCATED_MESSAGE = "LLM reply was cut at the token limit (%d tokens) with no content"
+
+_logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> datetime:
@@ -114,13 +139,7 @@ class OpenAICompatibleClient:
         self.close()
 
     def complete(self, messages: Sequence[ChatMessage]) -> str:
-        payload = {
-            "model": self._config.model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
-            "temperature": self._config.temperature,
-            "max_tokens": self._config.max_tokens,
-            "stream": False,
-        }
+        payload = self._payload(messages)
         deadline = self._monotonic() + self._config.total_timeout_s
         attempts = self._config.attempts
         cause: BaseException | None = None
@@ -146,6 +165,21 @@ class OpenAICompatibleClient:
             self._sleep(delay)
         raise AssertionError("unreachable")  # pragma: no cover
 
+    def _payload(self, messages: Sequence[ChatMessage]) -> dict[str, object]:
+        """The request body; with the default config, the plain chat-completions request."""
+        config = self._config
+        payload: dict[str, object] = {
+            "model": config.model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+        }
+        if config.send_temperature:
+            payload["temperature"] = config.temperature
+        payload[config.max_tokens_field] = config.max_tokens
+        payload["stream"] = False
+        if config.reasoning_effort is not None:
+            payload["reasoning_effort"] = config.reasoning_effort
+        return payload
+
     def _timeout(self, remaining: float) -> httpx.Timeout:
         """The configured per-operation timeouts, none longer than the time left."""
         connect = min(self._config.connect_timeout_s, remaining)
@@ -163,12 +197,8 @@ class OpenAICompatibleClient:
                 if self._monotonic() >= deadline:
                     return _Transient(detail="deadline", past_deadline=True)
                 if response.is_success:
-                    body = bytearray()
-                    for chunk in response.iter_bytes():
-                        body += chunk
-                        if self._monotonic() >= deadline:
-                            return _Transient(detail="deadline", past_deadline=True)
-                    return _parse_content(bytes(body), response.status_code)
+                    return self._reply(response, deadline)
+                code = self._error_code(response, deadline)
         except httpx.TimeoutException as error:
             return _Transient(timed_out=True, detail="timeout", cause=error)
         except _RETRYABLE_TRANSPORT_ERRORS as error:
@@ -180,7 +210,53 @@ class OpenAICompatibleClient:
         status = response.status_code
         if status == httpx.codes.TOO_MANY_REQUESTS or response.is_server_error:
             return _Transient(detail=f"status {status}", retry_after=self._retry_after(response))
-        raise DependencyUnavailable(f"LLM request failed (status {status})", _UNAVAILABLE)
+        message = f"LLM request failed (status {status})"
+        if code is not None:
+            message = f"LLM request failed (status {status}, {code})"
+        _logger.warning("%s", message)
+        raise DependencyUnavailable(message, _UNAVAILABLE)
+
+    def _reply(self, response: httpx.Response, deadline: float) -> "str | _Transient":
+        """The content of a 2xx reply, read in chunks with the deadline checked after each one."""
+        body = bytearray()
+        for chunk in response.iter_bytes():
+            body += chunk
+            if self._monotonic() >= deadline:
+                return _Transient(detail="deadline", past_deadline=True)
+        content, finish_reason = _parse_content(bytes(body), response.status_code)
+        if finish_reason == "length" and not content.strip():
+            _logger.warning(
+                _TRUNCATED_MESSAGE,
+                self._config.max_tokens,
+                extra={"model": self._config.model, "max_tokens": self._config.max_tokens},
+            )
+        return content
+
+    def _error_code(self, response: httpx.Response, deadline: float) -> str | None:
+        """The provider's error code of a rejected request (a 4xx other than 429), when usable.
+
+        Reads at most ``_ERROR_BODY_LIMIT`` bytes and stops at the deadline. A body that cannot
+        be read in time, is longer, is not JSON or names no short identifier gives ``None``, as
+        does a code that contains the key or is a fragment of it at least ``_MIN_KEY_FRAGMENT``
+        characters long. Read errors are swallowed: the status alone still fails the request.
+        """
+        if not response.is_client_error or response.status_code == httpx.codes.TOO_MANY_REQUESTS:
+            return None
+        body = bytearray()
+        try:
+            for chunk in response.iter_bytes():
+                body += chunk
+                if len(body) > _ERROR_BODY_LIMIT or self._monotonic() >= deadline:
+                    return None
+        except httpx.HTTPError:
+            return None
+        code = _provider_error_code(bytes(body))
+        if code is None or self._config.api_key is None:
+            return code
+        key = self._config.api_key.reveal()
+        if key in code or (len(code) >= _MIN_KEY_FRAGMENT and code in key):
+            return None
+        return code
 
     def _backoff(self, attempt: int) -> float:
         ceiling = min(
@@ -227,16 +303,35 @@ class _Transient:
         )
 
 
-def _parse_content(body: bytes, status: int) -> str:
+def _parse_content(body: bytes, status: int) -> tuple[str, object]:
+    """The reply's content and the first choice's ``finish_reason`` (``None`` when absent)."""
     malformed = DependencyUnavailable(f"LLM response is malformed (status {status})", _UNAVAILABLE)
     try:
         document = json.loads(body)
     except ValueError as error:
         raise malformed from error
     try:
-        content = document["choices"][0]["message"]["content"]
+        choice = document["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError) as error:
         raise malformed from error
     if not isinstance(content, str):
         raise malformed
-    return content
+    return content, choice.get("finish_reason")
+
+
+def _provider_error_code(body: bytes) -> str | None:
+    """``error.code`` (or ``error.type`` without a usable code) of an OpenAI-style error body,
+    when it is a short identifier; ``None`` for anything else."""
+    try:
+        document = json.loads(body)
+    except ValueError:
+        return None
+    error = document.get("error") if isinstance(document, dict) else None
+    if not isinstance(error, dict):
+        return None
+    for field in ("code", "type"):
+        value = error.get(field)
+        if isinstance(value, str) and _ERROR_CODE.fullmatch(value):
+            return value
+    return None

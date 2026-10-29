@@ -75,14 +75,23 @@ ALLOWED_FIELDS: frozenset[str] = frozenset(
         "ready",
         "cpus_requested",
         "cpus_available",
+        "torch_threads",
+        "max_concurrent_jobs",
+        "ner_pool_size",
+        "embedding_pool_size",
+        "ocr_workers",
+        "model",
+        "max_tokens",
     }
 )
 """``extra=`` keys a log line may carry; every other key is dropped.
 
 Each holds a count, size, duration (``*_ms``), status, code, id, score, boolean or a short
 fixed enum (``category``, ``refusal_reason``, ``check``): the access line (``app.access``), the
-error lines, the one outcome line each use case writes (``app.application.*``) and the
-start-up CPU warning (``app.bootstrap``).
+error lines, the one outcome line each use case writes (``app.application.*``), the
+start-up concurrency line and CPU warnings (``app.bootstrap``) and the language model client's
+warning for a reply cut at its token limit (``model``, the configured model name, and
+``max_tokens``, the configured limit).
 """
 
 LogFormat = Literal["json", "text"]
