@@ -29,6 +29,8 @@ Environment recorded in the sources (details per section): Windows 11 (10.0.2263
 19. Deployed stack after task 6.2 and the FIFO hand-off (`add-deployment` task 6.3): derived defaults at 16, 8 and 4 CPUs, questions during ingestion, cold start with `start_interval`, parity, smoke suite
 20. Audit viewer in headless Chromium (`add-audit-viewer` tasks 5.1-6.2): browser suite, frame tests, ink-check calibration on the 60-document sample with every failure classified, pdf.js against PDFium, viewer performance for 1, 10 and 50 pages, image sizes
 21. Low-confidence OCR names (`add-audit-viewer` task 9): word filter before recognition against rules on candidate names on the 600-document corpus, the adopted rule end to end
+22. Defensive hardening (`add-defensive-hardening` task 7.2): answer quality, support share, detector precision and recall, cost per page and per question, before and after
+23. In-process models on the GPU (`add-gpu-inference` task 4.1): VRAM, per-stage times, per-component impact, GPU pool calibration, questions with Gemma on the shared GPU, parity, images and start-up
 
 ---
 
@@ -1949,3 +1951,607 @@ Paired: dP **+0.2 [+0.1, +0.3] \***, dR -0.0 [-0.1, +0.0], dF1 +0.1 [+0.0, +0.1]
 **Calibration cases of 20.3.** "Co Jrrao" (confidences 18 and 9) is removed. The two signatures keep one readable-looking word ("VACANA WAV AN A": 0, 63, 60, 69; "LAY NAL": 0, 60), and "karina Ávila" with the stray "a" (23, 48, 13) has a word above 20; a rule that removes them costs recall (A, and the mean and trim rows of B): KNOWN_LIMITATIONS N9.
 
 **Reproduce:** `benchmarks/ocr_conf/` (local): `run_conf.py` (A, and the T = 0 output for B), `score_conf.py`, `sim_guard.py` (B), `run_verify.py` and `score_verify.py` (C); results in `out/report.md`, `out/sim_guard.md` and `out/verify_report.md`.
+
+---
+
+## 22. Defensive hardening (`add-defensive-hardening` task 7.2, design D10)
+
+Scripts: `benchmarks/adversarial/` (local, like every benchmark script; `benchmarks/README.md` step 14). Raw outputs in `benchmarks/adversarial/out/` (local, not committed):
+- `llm/`: the quality run, the offline re-score, `analysis_*.{md,json}`.
+- `detector/`: the scores of every text and `detector_tables.md`.
+- `cost/`: the ingestion cells; `cost/image_without_patterns/` and `cost/invalid_429/` hold runs set aside (22.5).
+
+### 22.1 Method and environment
+
+**Question.** The change adds four things to the answer path:
+- **D8:** delimited passages (`<<<passage n: document <id>, page <p>>>>` ... `<<<end passage n>>>`) and the data-not-instructions rules in the system prompt.
+- **D7:** question screening by the injection detector.
+- **D9:** the support check (`RAG_SUPPORT_MIN_SHARE` 0.6), the output filter and the per-document chunk cap (`RAG_MAX_CHUNKS_PER_DOCUMENT` 2).
+- **D5, D5b:** the detector, Prompt Guard 2 86M and the instruction patterns, also screening pages at ingestion.
+
+The acceptance rules come from the design:
+- **D8:** the paired accuracy difference against the current prompt must include 0 in its 95 % interval.
+- **D9 and D10:** `RAG_SUPPORT_MIN_SHARE` must keep at least 99 % of correct answers, and the support check and output filter together must refuse fewer than 1 % of them.
+- **D10:** the detector's precision and recall, and its cost per page and per question.
+
+**Host.** RTX 4070 Ti 12 GB (driver 617.14), 16 logical CPUs, Docker Desktop 29.9.2, Compose 5.6.1. No other compose project ran during these measurements. Host CPU load was 4-34 % from desktop applications before the runs.
+
+**Images.** Two test images were built from the working tree with `docker compose -f docker-compose.test.yml build tests`, both carrying the detector model at `/models/prompt-guard`:
+- `docintel-test:hard` (2026-10-29 15:59 UTC, `sha256:2a8b2da9...`): commit `f37f774` plus the change's edits at that time. It holds the delimited prompt, the detector model, the support check, the output filter and the chunk cap. **It does not hold the instruction patterns (D5b)**, which reached the tree at 16:07-16:14 UTC. **The quality run of 22.2 used this image.**
+- `docintel-test:hard2` (17:27 UTC, tree sha256 `b0defcb4...`): adds the patterns (`CompositeDetector([PatternDetector(), PromptGuardDetector(...)])`, `INJECTION_PATTERNS` default true) and the corrected support rule of 22.3. **The cost cells of 22.5 used this image.**
+
+**Quality run.** As 16.1 and 16.4, with only the tree and the detector changed against the recorded `e4b_nt` run:
+- The `llm_eval` harness with its pass-through recording proxy, compose project `llmeval_hard`.
+- The 600-document index of section 16 (external volume `llmeval_qdrant`, 3,299 chunks, read only; no chunk is flagged). The first question of the fixed order got the same top-1 score, 0.8494.
+- The same 750-question sample (600 answerable, 150 unanswerable), in the same fixed order, after 3 uncounted warm-up questions.
+- `gemma4:e4b-it-qat` on Ollama 0.40.12 with thinking off (`--rewrite reasoning_none`), `OLLAMA_CONTEXT_LENGTH=8192`. No hosted model was called.
+- Default settings, detector threshold 0.5.
+- The same metrics and bootstrap (2,000 resamples, seed 0, paired per question).
+
+**Offline re-score.** The support rule was then corrected in the tree: the share is now computed against `render_context(pages)`, the context exactly as the model saw it, labels included. `rescore.py` re-ran the tree's `is_refusal`, `support_share` and `output_filter` on every recorded reply and its recorded context. No model was called: the model calls are identical, and only the post-processing differs. Questions refused before the model call (threshold, flagged) are copied unchanged. The figures below are the re-scored ones unless marked "as run". The share the service logged in the run equalled the host recomputation of the old rule in 576 of 576 replies.
+
+**Paired views.** Two views are paired against section 16's `e4b_nt`:
+- **The service's answer:** what the client gets, after the guardrails.
+- **The model's raw reply:** taken from the proxy recording, before the support check and the filter. It isolates the prompt wording.
+
+### 22.2 Answer quality
+
+| run | accuracy (containment) | token-F1 | accuracy, gold in context (n) | wrong refusals: all / threshold / model / unsupported / filtered | correct refusals: all / threshold / model / unsupported | language mismatch (undetermined of answered) |
+|---|---|---|---|---|---|---|
+| `e4b_nt`, section 16 (labels, no guardrails) | **72.3 (68.7-76.0)** | 27.5 (25.4-29.7) | 95.5 (93.5-97.3) (448) | 10.5 / 3.5 / 7.0 / 0.0 / 0.0 | 72.0 / 46.7 / 25.3 / 0.0 | 0.3 (0.0-1.0) (226 of 537) |
+| `hard_e4b_nt` as run (old support rule: page texts only) | 69.3 (65.7-73.0) | 26.4 (24.4-28.5) | 92.1 (89.4-94.4) (445) | 14.8 / 3.5 / 7.5 / 3.8 / 0.0 | 74.0 / 46.7 / 25.3 / 2.0 | 0.0 (216 of 511) |
+| **`hard_e4b_nt` re-scored (tree's rule: rendered context)** | **71.0 (67.3-74.7)** | 26.7 (24.6-28.8) | 94.4 (92.1-96.4) (445) | 11.8 (9.3-14.5) / 3.5 / 7.5 / 0.8 / 0.0 | 73.3 (66.0-80.0) / 46.7 / 25.3 / 1.3 | 0.0 (217 of 529) |
+
+Every request returned 200 (0 errors in 750).
+- **Accuracy by language** (en / es / pt / fr / de): 72 / 70 / 77 / 76 / 66 in section 16, 69 / 68 / 77 / 76 / 64 re-scored.
+- **Refused by category:** absent entity 100 %, off-topic 100 %, cross-document 16 % before and 20 % after.
+
+**Refusal reasons, re-scored**, over the 750 questions (answerable + unanswerable):
+
+| reason | answerable | unanswerable |
+|---|---|---|
+| `below_threshold` | 21 | 70 |
+| `model` | 45 | 38 |
+| `unsupported` | 5 | 2 |
+| `output_filtered` | 0 | 0 |
+| `question_flagged` | 0 | 0 |
+| `no_context` | 0 | 0 |
+
+The threshold refusals are identical to section 16, since retrieval is unchanged. In the run as made, `unsupported` was 23 + 3; the re-score answers 19 of those 26 replies and keeps 7 refused.
+
+**Paired differences against `e4b_nt`** (points):
+
+| view | measure | n | difference, 95 % interval |
+|---|---|---|---|
+| **service, re-scored** | **accuracy** | 600 | **-1.3 [-2.8, +0.0]** |
+| service, re-scored | wrong refusals | 600 | +1.3 [+0.3, +2.5] |
+| service, re-scored | correct refusals | 150 | +1.3 [+0.0, +3.3] |
+| service, re-scored | token-F1 | 600 | -0.8 [-1.8, +0.2] |
+| service, as run | accuracy | 600 | -3.0 [-4.7, -1.3] |
+| raw reply | accuracy, every question that called the model | 579 | -1.0 [-2.4, +0.3] |
+| **raw reply** | **accuracy, same context pages in both runs** | 498 | **-0.8 [-2.0, +0.4]** |
+| raw reply | accuracy, context changed by the chunk cap | 81 | -2.5 [-8.6, +3.7] |
+| raw reply | model refusals, same context | 498 | -0.4 [-1.0, +0.0] |
+
+Re-scored transitions (old, new): 421 right in both, 161 wrong in both, 13 lost, 5 gained.
+- **Lost (13):** 7 had the same context and a different reply (temperature 0 is not deterministic: the side probe reproduced the recorded reply in 86 of 100 replays), 4 had a context changed by the chunk cap, and 2 were refused by the support check.
+- **Gained (5):** 3 same context, 2 changed context.
+- By language the re-scored difference lies between -2.5 and +0.0 points, with every interval including 0 or touching it.
+
+**Chunk cap.** With `RAG_MAX_CHUNKS_PER_DOCUMENT` 2 the context changed for 83 of the 659 questions that called the model (81 of them answerable):
+- 64 got more pages: a skipped third chunk of the top document leaves room for another document's page.
+- 3 got fewer; 16 got a different page set of the same size.
+
+Gold-in-context fell from 448 to 445. On the 81 answerable questions, model refusals rose (+6.2 [+1.2, +11.1]): with a second document's page the model hedges more often on this near-duplicate corpus (section 1). The accuracy effect is within the noise.
+
+### 22.3 Support share and `RAG_SUPPORT_MIN_SHARE` (D9)
+
+The set is the model's raw replies that contain the gold answer: 428 replies, every one with content tokens. Each line is one choice of the context the answer's tokens are checked against:
+
+| known set (what the answer's tokens are checked against) | share p1 / p5 / p10 / p25 / p50 | minimum | below 0.5 / 0.6 / 0.7 / 0.8 | kept at 0.6 | largest threshold (step 0.05) keeping >= 99 % |
+|---|---|---|---|---|---|
+| page texts only (the rule of the run) | 0.452 / 0.705 / 0.750 / 0.889 / 1.000 | 0.349 | 7 / 12 / 21 / 49 | 97.2 % | 0.40 |
+| **rendered context, labels included (the tree's rule)** | **0.649 / 0.750 / 0.820 / 0.900 / 1.000** | 0.500 | 0 / 2 / 7 / 35 | **99.5 %** | **0.60** (0.65: 98.8 %) |
+| rendered context + the question | 0.698 / 0.868 / 0.899 / 1.000 / 1.000 | 0.643 | 0 / 0 / 5 / 12 | 100.0 % | 0.65 |
+
+**False-refusal rate**, the correct raw replies that the support check or the output filter refused:
+- **Tree's rule: 2 of 428 = 0.47 % (0.00-1.17)**, both `unsupported`. Both are short answers that echo the question's words: `Der Mehrwertsteuersatz beträgt 21,0%` (share 0.50) and a two-date reply (0.54).
+- **Rule of the run: 12 of 428 = 2.80 % (1.40-4.44).** In 10 of these 12 the model had copied the passage label into a correct answer, and the UUID's hex segments counted as unsupported tokens. 20 of the 576 answered replies copy a label.
+- The output filter refused none of the 659 legitimate model calls under either rule.
+
+**Result: `RAG_SUPPORT_MIN_SHARE=0.6` is kept.** With the share taken against the rendered context, 0.6 keeps 99.5 % of correct answers and refuses 0.47 % of them, which meets D9's 99 % and D10's 1 %. The next step, 0.65, would keep only 98.8 %. Counting the question's tokens as known would give 100 %, but it would let an answer that only restates the question through; that was not adopted.
+
+### 22.4 Injection detector: precision and recall (D5, D5b, D7)
+
+**Method** (`detector_eval.py`, on the host CPU with the project's venv: torch 2.14.1+cpu, transformers 5.21.0, 8 threads). The model is the vendor copy of Prompt Guard 2 86M used for the image. Three detectors, as the service builds them:
+- **model:** `PromptGuardDetector`, 512-token windows with a stride of 128, keeping the highest window score.
+- **patterns:** `PatternDetector`, scoring 1.0 or 0.
+- **combined:** `CompositeDetector([PatternDetector(), PromptGuardDetector(...)])`, keeping the higher score per text.
+
+**Sets.**
+- **Attack sets**, from `tests/adversarial/cases.py`, 40 cases each (8 attack classes x 5 languages):
+  - `DIRECT`: questions sent to the service.
+  - `DIRECT` with the suite's OCR-noise model applied (`noisy()`).
+  - `INDIRECT`: sentences an attacker would put in a document.
+  - `INDIRECT_NOISY`: the OCR-noisy variants of the indirect cases.
+- **Benign controls** of the suite: 30 sentences and 15 questions.
+- **Benign corpus sets.** The synthetic corpus holds no injections:
+  - every page text of the 600-document index (1,030 pages, mean 1,771 characters, the OCR text the service stored; `dump_pages.py`), which is what ingestion screens;
+  - every chunk (3,299, mean 616 characters);
+  - the 750 sample questions of section 16, which is what question screening sees.
+
+**The pattern rates on the suite are a floor check only.** The patterns were written against these cases, so their 100 % shows that nothing regressed, not that they recall attacks in general.
+
+**Flag rate by threshold** (flagged / n, %; recall on the attack sets, false-positive rate on the benign sets):
+
+| detector | set | n | 0.1 | 0.3 | 0.5 | 0.7 | 0.9 |
+|---|---|---|---|---|---|---|---|
+| model | direct | 40 | 75.0 | 75.0 | **75.0** | 72.5 | 72.5 |
+| model | direct, OCR-noisy | 40 | 62.5 | 62.5 | **57.5** | 55.0 | 45.0 |
+| model | indirect | 40 | 40.0 | 37.5 | **35.0** | 35.0 | 35.0 |
+| model | indirect, OCR-noisy | 40 | 40.0 | 32.5 | **32.5** | 32.5 | 32.5 |
+| model | corpus pages (benign) | 1,030 | 1.36 | 0.39 | **0.29** | 0.19 | 0.10 |
+| model | corpus chunks (benign) | 3,299 | 0.39 | 0.21 | **0.15** | 0.06 | 0.03 |
+| patterns | the four attack sets | 4 x 40 | 100 | 100 | 100 | 100 | 100 |
+| patterns | corpus pages / chunks (benign) | 1,030 / 3,299 | 0.10 / 0.03 | 0.10 / 0.03 | 0.10 / 0.03 | 0.10 / 0.03 | 0.10 / 0.03 |
+| **combined** | **the four attack sets** | 4 x 40 | 100 | 100 | **100** | 100 | 100 |
+| **combined** | **corpus pages (benign)** | 1,030 | 1.46 | 0.49 | **0.39** | 0.29 | 0.19 |
+| **combined** | **corpus chunks (benign)** | 3,299 | 0.42 | 0.24 | **0.18** | 0.09 | 0.06 |
+| all three | suite benign sentences and questions; the 750 sample questions | 30 + 15 + 750 | 0 | 0 | 0 | 0 | 0 |
+
+**The model alone.** At 0.5 it recalls the same share in every language: 6 of 8 direct cases per language, 2-3 of 8 indirect.
+
+By attack class, at 0.5, over 5 cases each (direct / indirect):
+
+| attack class | recalled (direct / indirect) |
+|---|---|
+| ignore-previous | 5 / 5 |
+| forged delimiter | 5 / 4 |
+| look-alike delimiter | 5 / 5 |
+| role override | 5 / 0 |
+| polite phrasing | 5 / 0 |
+| spacing or case obfuscation | 5 / 0 |
+| prompt exfiltration | 0 / 0 |
+| answer change ("say the contract is void") | 0 / 0 |
+
+The OCR noise costs it a further 17.5 points on direct cases. Its scores on the sample questions reach at most 0.0026, and on the suite's benign texts at most 0.0007.
+
+**Benign pages flagged at 0.5** (combined: 4 of 1,030 pages; none in the 60-document sample of 22.5):
+- One invoice page that the patterns match on an OCR artefact (a run of `>»` among prices read as a delimiter).
+- Three pages the model scores 0.54-1.00: a page of 29 garbled characters of a German invoice, a French KYC signature block, and an English minutes header full of OCR noise.
+
+These are OCR noise rather than instructions. A flagged page's chunks are kept but excluded from search (D6).
+
+**Threshold.** 0.5 is kept. Lowering it to 0.3 adds one indirect case to the model's recall (35.0 to 37.5 %; the combined detector is at 100 % either way) and adds benign pages (0.39 to 0.49 %). Raising it to 0.7 or 0.9 loses model recall on the noisy direct cases (57.5 to 55.0 and 45.0 %).
+
+### 22.5 Cost per page and per question
+
+**Method** (`cost_run.sh`, `ingest_cost.py`):
+- Image `docintel-test:hard2` with its default settings, on CPU. The detector runs with its default pool of 2 and `TORCH_THREADS` unset.
+- The 60-document sample: 58 documents and 98 pages counted, since the 2 warm-up documents come back already indexed and are excluded.
+- Ingested through `POST /api/ingest` of a real Uvicorn against the throwaway Qdrant of `docker-compose.test.yml`, a fresh index per cell. Compose project `advcost`, torn down with `down -v --remove-orphans` after every cell.
+- The detector is configured through the container environment, since the image's `INJECTION_MODEL` build argument cannot change at run time:
+  - model + patterns: the image's default;
+  - model only: `INJECTION_PATTERNS=false`;
+  - patterns only: `INJECTION_MODEL_PATH` unset;
+  - none: both off.
+- Each server's start-up lines confirm its configuration. `screen_ms` per document comes from the service's `ingestion completed` lines.
+
+**Benchmark-only overrides.** The 12-client cells set `MAX_JOBS_PER_CLIENT=0` and `RATE_LIMIT_UPLOADS_PER_MINUTE=0`, because the D1 limits key on the peer address and one benchmark client is one address. In a first attempt, 56 of 60 requests were answered 429 by the job cap of 4 (`cost/invalid_429/`). The sequential cells never reached either limit; they returned 60 x 200 with the defaults.
+
+| detector | clients | docs/min | pages/min | `screen_ms` per page p50 / p95 / mean | `screen_ms` per document p50 / p95 | ingestion `duration_ms` per document p50 / p95 | throughput against "none" |
+|---|---|---|---|---|---|---|---|
+| model + patterns | 1 | **9.85** | 16.6 | 1,472 / 1,929 / 1,358 | 2,882 / 3,859 | 6,653 / 8,466 | **-38 %** |
+| none | 1 | 15.78 | 26.7 | 0 | 0 | 3,777 / 5,247 | - |
+| model + patterns | 12 | **36.4** | 61.5 | 7,990 / 15,660 / 7,838 | 14,724 / 19,314 | 19,867 / 24,947 | **-59 %** |
+| model only | 12 | 37.1 | 62.7 | 7,860 / 15,291 / 7,605 | 14,363 / 17,642 | 19,641 / 23,743 | -58 % |
+| patterns only | 12 | 87.9 | 148.6 | 1.8 / 5.1 / 3.4 | 2.7 / 9.7 | 7,756 / 9,640 | +0 % |
+| none | 12 | 87.8 | 148.3 | 0 | 0 | 7,580 / 9,951 | - |
+
+- **The model is the whole cost.** Sequentially it adds about 1.36 s of CPU per page to an ingestion whose OCR takes about 2.7 s per document (`ocr_ms` p50 2,735-2,759 in both sequential cells).
+- **Under load it becomes the bottleneck.** With 12 documents in flight, the per-page `screen_ms` (7.8 s mean) is mostly waiting for the detector's 2 slots, and throughput falls from 87.8 to 36.4 docs/min.
+- **The patterns cost 1.8 ms per page** (p50) and nothing measurable in throughput.
+- The host measurement of 22.4 agrees: 613 ms per page for the model with 8 threads.
+
+**Question side.** Screening one question with the model takes about **130 ms** in the service: the time outside embedding, search and the model call rose from 0.1 ms to 129.9 ms p50, 156.6 ms p95, in the quality run on `docintel-test:hard`. On the host with 8 threads the model takes 18.7 ms per question and the patterns 0.07 ms. The service's median request (0.70 s against 0.52 s in section 16) includes this screening and the 9 % longer prompt (22.6).
+
+**Runs set aside.** The first cost cells, in `cost/image_without_patterns/`, ran on `docintel-test:hard`, which lacks the patterns. There, "model + patterns" was the model alone and "patterns only" had no detector at all. Their model figures agree with `hard2`: 9.95 docs/min sequential, 37.4-38.3 with 12 clients.
+
+### 22.6 Latency, tokens and memory of the quality run
+
+| run | requests p50 / p95 (s) | with a model call p50 / p95 / p99 / max (s) | `llm_ms` p50 / p95 (s) | generation / prefill tokens/s (p50) | prompt tokens: total / mean / max | completion tokens: total / p50 | VRAM, device max (GB) |
+|---|---|---|---|---|---|---|---|
+| `e4b_nt` | 0.52 / 1.74 | 0.56 / 1.79 / 2.26 / 6.57 | 0.50 / 1.74 | 113 / 7,183 | 983,283 / 1,493 / 2,661 | 26,408 / 27 | 5.7 |
+| `hard_e4b_nt` | 0.70 / 1.43 | 0.74 / 1.51 / 2.50 / 6.77 | 0.54 / 1.34 | 104 / 6,855 | 1,074,154 / 1,631 / 2,763 | 22,221 / 27 | 6.1 |
+
+- **Prompt length.** The system prompt grew from 116 to 188 tokens, and every passage adds two delimiter lines, so the mean prompt is 9 % longer.
+- **Context length.** The constructed worst case (the probe's densest pages packed by `select_context`, the longest question) is 2,647 prompt tokens, against 1,973 in 16.3. The upper bound of 16.3 becomes about 3,400 prompt tokens, about 3,900 with generation. `OLLAMA_CONTEXT_LENGTH=8192` keeps a margin of more than 100 %.
+- **Truncation and tokens.** No `truncating input prompt` line appears in the run's Ollama log. `prompt_eval_count` equals `usage.prompt_tokens` in 100 of 100 replays. No thinking tokens were produced.
+- **Memory.** The desktop used 1.4 GB of VRAM at idle, against 0.9 GB on the day of section 16.
+
+### 22.7 Findings
+
+1. **D8 holds.** On identical contexts, the delimited passages and the data-not-instructions rules change raw-reply accuracy by -0.8 [-2.0, +0.4] points. Model refusals and answer language are unchanged. The prompt is adopted as written.
+2. **The guardrails cost 1.3 points.** With the corrected support rule, service accuracy is 71.0 against 72.3 (paired -1.3 [-2.8, +0.0]). Of the 13 answers lost, 2 are support-check refusals, 4 come from the chunk cap and 7 from non-determinism.
+3. **`RAG_SUPPORT_MIN_SHARE=0.6` is kept.** The share must be taken against the rendered context, labels included, as the tree now does: that rule refuses 0.47 % of correct answers. The rule of the run refused 2.8 %, above the 1 % limit, because the model copies passage labels into its answers. The output filter refused no legitimate answer.
+4. **The model and the patterns complement each other.**
+   - The model alone recalls 75 % of direct and 35 % of indirect suite cases at 0.5, and misses every prompt-exfiltration and answer-change case in all five languages.
+   - The patterns cover the suite (a floor check).
+   - Combined, the false-positive rate is 0.39 % of corpus pages and 0.18 % of chunks, all on OCR noise, and 0 of the 750 sample questions are flagged.
+   - `INJECTION_THRESHOLD=0.5` is kept.
+5. **The model costs a lot of ingestion throughput on CPU.** Sequential ingestion falls by 38 % (+1.36 s per page) and ingestion with 12 clients by 59 %, where the detector's pool of 2 is the bottleneck. A question costs about 130 ms. The patterns cost about 2 ms per page.
+6. **The detector moves to the GPU in a follow-up change.** The user decided this because of the ingestion cost on CPU. This section (22.4 and 22.5, on `docintel-test:hard2`) is the CPU baseline that change will be compared against: the same 60-document sample, the same six cells and the same suite and benign sets.
+7. **The chunk cap changed 83 of 659 contexts** and raised model refusals on them. Its accuracy effect is within the noise. It is kept for D9's security argument, not for quality.
+
+**Caveats.**
+- **Two images.** The quality run used `docintel-test:hard`, which has no instruction patterns. The patterns flag none of the 750 sample questions (22.4), so the quality figures stand for `hard2`. The cost cells used `hard2`. The first cost cells, on `hard`, were set aside (22.5).
+- **Re-score, not re-run.** The final quality figures re-apply the tree's guardrails offline to the recorded replies and contexts. The model calls are identical, so only the post-processing differs; no new model run was made with the corrected rule.
+- **Benchmark-only limit overrides.** The 12-client cost cells ran with `MAX_JOBS_PER_CLIENT=0` and `RATE_LIMIT_UPLOADS_PER_MINUTE=0`. The service's defaults would answer 429 to a single client address sending 12 documents at once.
+- **Pattern rates are a floor check.** The patterns were written against the suite. Their recall on unseen phrasings is not measured here; the model's figures are the unbiased ones.
+- **Benign set.** The benign set is the synthetic corpus of section 1. Real scans with denser OCR noise may raise the false-positive rate, and the corpus has no forms with imperative instructions beyond the suite's benign sentences.
+- **One model, one quality run.** Only `gemma4:e4b-it-qat` was re-measured. Temperature 0 is not deterministic: 86 of 100 replays reproduce the recorded reply. The reference is the section 16 recording of 2026-10-28, so the latency columns compare across days.
+- **CPU timing.** The cost cells ran on a desktop with other applications open (4-34 % host CPU before the runs). The detector's ingestion figures depend on its pool size of 2 and the shared torch threads.
+
+### 22.8 What the security changes cost: time and resources before and after
+
+One table for the whole change, each row against the service before `add-defensive-hardening` (sections 16-19) or against the same image with the detector model switched off (`INJECTION_MODEL_PATH` unset). "Guard" below means the Prompt Guard 2 model; "patterns" the rule detector.
+
+**Start-up and memory** (`resources.sh`; runtime image `docintel:latest` built from the final tree, `QDRANT_LOCATION=:memory:`, no language model, the three sample PDFs ingested one after the other; two runs each, cgroup v2 `memory.current` and `memory.peak` of the container):
+
+| | guard off | guard on | change |
+|---|---|---|---|
+| start to `/health/ready` | 7.1 / 7.7 s | 8.7 / 8.7 s | +1.0-1.6 s |
+| lifespan (models loaded, `service started` line) | 4.5 s | 5.8 s | +1.3 s |
+| memory after start-up | 1,003 / 1,004 MiB | 1,234 / 1,233 MiB | +230 MiB |
+| memory peak, 3 sample PDFs sequential | 1,111 / 1,113 MiB | 1,409 / 1,351 MiB | +240-300 MiB |
+| hardened stack under the smoke and hygiene suites (cgroup peak, task 6.1) | 3.0 GB (section 19, 16 CPUs, ingest) | 3.45 GB | +0.45 GB, different loads: indicative |
+| runtime image (`docker images`) | 5.76 GB (`INJECTION_MODEL=0`) | 7.88 GB | +2.1 GB listed, +1.13 GB of layer (the model) |
+
+**Ingestion time** (CPU):
+
+| measurement | guard off | guard on | change |
+|---|---|---|---|
+| sample PDFs, sequential, idle host: `screen_ms` per page | about 1 ms (patterns) | 311-340 ms | +0.3 s per page |
+| sample PDFs, sequential: `duration_ms` per document (1-2 pages) | 1,612 / 2,075 / 2,112 ms | 1,906 / 2,767 / 2,719 ms | +18-34 % |
+| 60-document sample, sequential (22.5): docs/min | 15.78 | 9.85 | -38 %, +1.36 s per page |
+| 60-document sample, 12 clients (22.5): docs/min | 87.8 | 36.4 | -59 %, the detector's 2 slots are the bottleneck |
+| patterns alone, 12 clients | 87.8 | 87.9 | none measurable, about 1.8 ms per page |
+| OCR, embedding, store per document | unchanged (`ocr_ms`, `embed_ms`, `store_ms` within run-to-run spread) | | |
+
+The screening time per page differs between the samples (about 0.3 s) and the corpus cells (about 1.4 s): the corpus pages are denser (two 512-token windows instead of one) and the cost cells ran on a desktop with other applications open (22.5 caveats).
+
+**Questions** (22.2, 22.6; the GPU with Gemma 4 e4b):
+
+| | before | after | change |
+|---|---|---|---|
+| screening per question (model) | 0 | 130 ms p50, 157 ms p95 | +130 ms |
+| request p50 / p95 | 0.52 / 1.74 s | 0.70 / 1.43 s | +0.18 s p50; p95 lower (another day, see 22.6) |
+| system prompt | 116 tokens | 188 tokens | +72 |
+| prompt tokens, mean / max | 1,493 / 2,661 | 1,631 / 2,763 | +9 %; worst case about 3,400, within the 8,192 context |
+| VRAM, device max | 5.7 GB | 6.1 GB | the idle desktop rose by 0.5 GB that day: the model's share is unchanged (the guard runs on the CPU) |
+| service accuracy | 72.3 | 71.0 | -1.3 [-2.8, +0.0] |
+
+**The other defences** cost nothing measurable in these runs: the rate limiter and the headers run per request in microseconds (the 12-client cells match the throughput of section 19 with the detector off); the render budget and the image pre-check add a metadata walk per page that does not show in `ocr_ms`; the support check and the output filter take well under 1 ms per answer (a 100,000-token answer takes 0.06 s, review 9.1); the pattern set takes 20-35 ms on an adversarial 30,000-character text and about 1.8 ms on a corpus page.
+
+**Summary.** Everything but the guard model is free at this scale. The guard model costs about 230-300 MiB of RAM, 1-1.6 s of start-up, 1.1 GB of image, 130 ms per question, and on CPU 0.3-1.4 s per page, which is 38 % of sequential and 59 % of concurrent ingestion throughput. That cost is what `add-gpu-inference` addresses.
+
+---
+
+## 23. In-process models on the GPU (`add-gpu-inference` task 4.1, design D5)
+
+Scripts: `benchmarks/gpu/scripts/` (local, like every benchmark script; `benchmarks/README.md` step 15). Raw outputs in `benchmarks/gpu/out/` (local, not committed):
+- `cost/`: the ingestion and extraction cells, `tables.md`, `vram.csv` and `marks.txt`.
+- `vram/`: the models alone and together.
+- `ask/`: the question runs.
+- `parity/`: the model parity and the `cuda`-marked suite.
+- `cold/`: start-up and memory.
+
+**Two rounds.** 23.1-23.10 hold the first round (tree of 18:46 UTC). After it, three changes were made in the code:
+- NER stays in float32 on the GPU (`place(..., half=False)`), per D2, because fp16 moved name boundaries (23.7);
+- the detector gained a reserved question slot (`screen_query`, `FifoSlots` at pool + 1), because questions waited for it (23.6);
+- the GPU pool defaults became 1 / 1 / 1 (23.5).
+
+The affected numbers were re-measured on images rebuilt from that tree (23.11). Below, they are given as **now**, with the first round's figures kept as "before".
+
+### 23.1 Method and environment
+
+**Question.** What each component costs, and what moving the three in-process models (NER, e5 embedder, Prompt Guard 2 detector) to the GPU gains, measured against the CPU baseline of section 22 on the same sample and settings.
+
+**Host.** As in section 22:
+- RTX 4070 Ti 12 GB (driver 617.14, WDDM; CUDA 12.6 wheels, torch 2.14.1+cu126) and 16 logical CPUs.
+- Docker Desktop 29.9.2 on WSL2.
+- No other compose project ran. The desktop held 1,493-1,521 MiB of VRAM at idle (1.4 GB in 22.6).
+
+**Images.** All built from the current tree on 2026-10-29, between 18:46 and 18:55 UTC; no file of `app/`, `tests/`, the Dockerfile or the lock changed after the builds.
+- **`docintel-test:gpu`**: `TORCH_VARIANT=cuda TEST_IMAGE=docintel-test:gpu docker compose -f docker-compose.test.yml build tests`, `sha256:f8acb329...`. The `tests` service extends `torch-cuda`, which also reserves the GPU for the container.
+- **`docintel-test:cpu`**: the same tree with `TORCH_VARIANT=cpu`, `sha256:f90ec5a2...`. It is the CPU reference of this section, so CPU and GPU rows run the same code. Section 22's `docintel-test:hard2` predates the device change.
+- **Runtime images for 23.8**: `docintel:gpu41` (`--build-arg TORCH_VARIANT=cuda`) and `docintel:cpu41`.
+
+**Cells** (`gpu_cost.py`, a generalisation of `ingest_cost.py`):
+- The 60-document sample, with the same 2 warm-up documents, re-sent and excluded: 58 documents and 98 pages per cell.
+- A real Uvicorn in the test container against the throwaway Qdrant of `docker-compose.test.yml`, fresh per cell. Compose project `gpucost`, `down -v --remove-orphans` after every cell.
+- Default settings: on the GPU, `DEVICE=auto` resolves to `cuda:0`, and the derived pools are jobs 12, NER 2, embedder 2, detector 1, OCR workers 4. On the CPU they are 12 / 8 / 4 / 2 / 4. Every server's `concurrency in use` line confirms these.
+- **Benchmark-only overrides, as 22.5:** `MAX_JOBS_PER_CLIENT=0` and `RATE_LIMIT_UPLOADS_PER_MINUTE=0` in every cell. Their 12-client cells would otherwise be refused by the per-address limits.
+- Detector switches as 22.5: `INJECTION_MODEL_PATH` unset (model off) and `INJECTION_PATTERNS=false` (patterns off).
+- `/api/extract` sends the corpus name lists, as section 17's client does.
+- One pass per cell. The 12-client default and pool cells ran twice (23.5).
+
+**Placement of one model.** `DEVICE` is global (D1), so the settings cannot put one model on the CPU and the others on the GPU. `bench_app.py` does it for the benchmark only:
+- It wraps `app.bootstrap.adapter_configs` and sets `device="cpu"` on the adapters named in `BENCH_CPU_ADAPTERS`.
+- Each adapter moved to the CPU gets the pool the CPU rule derives on this host: embedder 4, detector 2.
+- The server logs a `bench device override` line naming the change. Nothing in `app/` changed.
+- NER on the CPU with the rest on the GPU is covered by extraction with `DEVICE=cpu`, since NER is the only model `/api/extract` runs.
+
+**VRAM.**
+- The host's `nvidia-smi` is sampled every second through every chain, and every 250 ms in `gpu_vram.sh`.
+- Inside a process, `torch.cuda.mem_get_info` and torch's allocator counters. Under WSL2 this view starts from a different base than the host's, so only its deltas are used.
+
+### 23.2 VRAM
+
+**Each model alone and the three together** (`vram_models.py`; the adapters as the service builds them, fp16 on `cuda:0`):
+- One fresh container per row, after the load.
+- 40 s of load from `pool` threads on the 200 densest corpus pages (NER `find_persons` and detector `screen`) or on batches of 16 chunks (embedder), plus one `embed_query` thread.
+- "Host" is the device's peak above the desktop's 1,493 MiB. It includes the process's CUDA context and libraries.
+
+| model(s) | pools (NER / emb / det) | torch allocated after load | in-process device use: after load / peak (above the context) | torch max reserved | **host peak above idle** |
+|---|---|---|---|---|---|
+| **NER, now fp32** | **1** | 1,066 MiB | 1,158 / 1,210 MiB | 1,160 MiB | **1,403 MiB** |
+| NER, before (fp16) | 2 | 544 MiB | 598 / 686 MiB | 622 MiB | 879 MiB |
+| NER | 4 | 544 | 598 / 774 | 694 | 967 |
+| e5 embedder | 2 (+1 query slot) | 546 | 598 / 1,100 | 1,028 | **1,293** |
+| e5 embedder | 4 (+1) | 546 | 598 / 1,326 | 1,238 | 1,519 |
+| Prompt Guard 2 | 1 | 547 | 602 / 794 | 738 | **987** |
+| Prompt Guard 2 | 2 | 547 | 602 / 960 | 896 | 1,153 |
+| **the three, now (NER fp32)** | **1 / 1 / 1 (defaults)** | 2,158 | 2,226 / 2,660 | 2,578 | **2,853** |
+| the three, before (fp16) | 2 / 2 / 1 | 1,622 | 1,680 / 2,252 | 2,154 | 2,445 |
+| the three | 4 / 4 / 2 | 1,622 | 1,680 / 2,612 | 2,474 | 2,805 |
+
+Each model's weights take about 545 MiB in fp16. The context and libraries of one process add about 280 MiB on the host; with the three models the peak adds 0.5-1.0 GB of working memory.
+
+**In service** (host peak of the device over each cell, desktop included):
+
+| situation | device peak | above the desktop |
+|---|---|---|
+| runtime image after start-up (23.8) | 3,394 MiB | 1,873 MiB |
+| 12-client ingestion, defaults | 3,818-3,820 MiB | 2.3 GB |
+| 12-client ingestion, detector pool 2 | 3,882-3,958 MiB | 2.4-2.5 GB |
+| 12-client extraction | 3,610-3,646 MiB | 2.1 GB |
+| Gemma 4 e4b alone (the CPU-image question run, `OLLAMA_NUM_PARALLEL=2`, context 8,192) | 6,264-6,305 MiB | 4.8 GB |
+| Gemma alone plus the three models, questions only | 8,179 MiB | 6.7 GB |
+| 12-client ingestion, now (NER fp32, pools 1 / 1 / 1) | 4,384-4,386 MiB | 2.9 GB |
+| 12-client extraction, now | 4,178 MiB | 2.7 GB |
+| Gemma plus the three models, questions only, now | 8,733 MiB | 7.2 GB |
+| **the three models and Gemma, 12-client ingestion during the questions, now (23.11)** | **9,369 MiB of 12,282** | **7.8 GB** |
+| the same, before (NER fp16, pools 2 / 2 / 1) | 8,803 MiB | 7.3 GB |
+
+**Margin.** The worst case measured is 12-client ingestion with questions on the shared GPU. With NER in fp32 and pools of 1 it leaves **2.91 GB (24 %)** of the 12 GB device free with the desktop's 1.5 GB in use, or about 4.4 GB on a headless host. Before, with NER in fp16 and pools 2 / 2 / 1, it left 3.48 GB (28 %). fp32 NER adds about 0.52 GB of weights. Raising the pools to 4 / 4 / 2 adds about 0.36 GB at peak (table above).
+
+### 23.3 Per-stage times and throughput: GPU image against the CPU image of the same tree
+
+Everything on, i.e. the image's defaults: detector model and patterns. Stage times are per page of each document (p50, p95 in the second line of a cell), from the outcome lines.
+
+| route | clients | image / device | docs/min | OCR ms/page | NER ms/page | screen ms/page | embed ms/page | store ms/doc | `duration_ms`/doc p50 / p95 |
+|---|---|---|---|---|---|---|---|---|---|
+| ingest | 1 | CPU image | 9.7 | 1,632 | - | 1,541 / 2,028 | 551 / 876 | 4.9 | 6,776 / 8,611 |
+| ingest | 1 | **GPU image** | **19.8 (+104 %)** | 1,619 | - | **94 / 181** | **16 / 39** | 4.0 | 3,032 / 4,166 |
+| ingest | 12 | CPU image | 35.3 | 2,126 | - | 8,340 / 16,815 | 832 / 1,340 | 5.8 | 20,446 / 24,798 |
+| ingest | 12 | **GPU image** | **135.4, 131.0 = 133.2 (x3.8)** | 2,624-2,658 | - | **78-79 / 214-243** | **17-20 / 104-109** | 6.2-6.8 | 4,899 / 6,167 |
+| extract | 1 | CPU image | 15.4 | 1,624 | 563 / 908 | - | - | - | 3,866 / 5,073 |
+| extract | 1 | **GPU image** | **19.7 (+28 %)** | 1,631 | **54 / 75** | - | - | - | 2,888 / 4,037 |
+| extract | 12 | CPU image | 86.0 | 2,818 | 1,528 / 2,624 | - | - | - | 7,707 / 10,118 |
+| extract | 12 | **GPU image** | **125.6, 129.9 = 127.8 (+49 %)** | 2,550-2,631 | **126-173 / 327-437** | - | - | - | 5,138 / 6,379 |
+
+- Every request of every cell returned 200.
+- The CPU image reproduces section 22.5: 9.7 against 9.85 docs/min sequential, 35.3 against 36.4 with 12 clients, and 15.6 / 85.8 against 15.78 / 87.8 with the detector off.
+- **Per page, the GPU is 10x faster for NER** (563 -> 54 ms), **16x for screening** (1,541 -> 94 ms) and **34x for embedding** (551 -> 16 ms) sequentially. With 12 jobs the gaps widen to 9x, 107x and 49x: on the CPU these stages also wait for pool slots.
+- **OCR is now the whole cost.** It is unchanged at about 1.62 s per page sequentially and 2.5-2.7 s with 12 jobs (CPU contention between 12 Tesseract jobs). On the GPU image OCR is 94 % of a document's ingestion time sequentially (mean 1,795 of 1,914 ms per page), against 48 % on the CPU image.
+- **The GPU is mostly idle.** Its mean utilisation was 7-16 % in every GPU cell (maximum 44-100 % in bursts).
+- Store stays at 4-7 ms per document.
+- **Container memory peak** (cgroup, client included): 3.6 GB on the GPU against 3.2 GB on the CPU for 12-client ingestion, and 2.5 GB against 1.8 GB sequentially, from the CUDA libraries.
+
+**NER in fp32, now (23.11).** Extraction runs at 19.3 docs/min sequentially, against 19.7 in fp16, and 125.3, 130.4 = 127.9 with 12 clients, against 127.8. NER takes 102 / 163 ms per page (p50 / p95) sequentially, against 54 / 75 in fp16 and 556 / 897 on the CPU, and 126-155 / 282-356 ms with 12 jobs. Ingestion with the 1 / 1 / 1 pools runs at 20.0 docs/min sequentially and 131.2, 134.6 = 132.9 with 12 clients, against 19.8 and 133.2. fp32 doubles NER's time per page on the GPU, but extraction stays OCR-bound and its throughput does not move.
+
+### 23.4 Per-component impact on the GPU, one switch at a time
+
+Ingestion; docs/min, with the change against "everything on" of the same image and clients. Per-page `screen_ms` and `embed_ms` are p50.
+
+| cell | device of NER / embedder / detector | 1 client | 12 clients | screen ms/page (1 / 12) | embed ms/page (1 / 12) |
+|---|---|---|---|---|---|
+| everything on | GPU / GPU / GPU | 19.8 | 135.4 (131.0) | 94 / 78 | 16 / 17 |
+| detector model off (`INJECTION_MODEL_PATH` unset) | GPU / GPU / - | 20.6 (+4 %) | 135.6 (+0 %) | 1.2 / 1.6 | 44 / 54 |
+| patterns off (`INJECTION_PATTERNS=false`) | GPU / GPU / GPU | 19.9 (+0 %) | 134.1 (-1 %) | 93 / 45 | 18 / 17 |
+| both off | GPU / GPU / - | 20.7 (+5 %) | 138.1 (+2 %) | 0 / 0 | 44 / 62 |
+| **all on the CPU** (`DEVICE=cpu`, CUDA image) | CPU / CPU / CPU | **9.7 (-51 %)** | **36.1 (-73 %)** | 1,538 / 8,220 | 553 / 842 |
+| embedder on the CPU (benchmark override, pool 4) | GPU / CPU / GPU | 14.9 (-25 %) | 85.1 (-37 %) | 108 / 94 | 557 / 1,637 |
+| detector on the CPU (benchmark override, pool 2) | GPU / GPU / CPU | 11.2 (-43 %) | 40.1 (-70 %) | 1,567 / 8,132 | 45 / 46 |
+
+Extraction, where NER is the only model:
+
+| cell | 1 client | 12 clients | NER ms/page (1 / 12) |
+|---|---|---|---|
+| GPU (default) | 19.7 | 125.6 (129.9) | 54 / 173 |
+| `DEVICE=cpu`, CUDA image | 15.4 (-22 %) | 85.5 (-33 %) | 567 / 1,636 |
+| CPU image | 15.4 | 86.0 | 563 / 1,528 |
+
+- **On the GPU no switch matters.** With all three models on the GPU, the detector model costs 4 % of sequential ingestion throughput and nothing measurable with 12 clients (135.4 against 135.6 docs/min), against -38 % and -59 % on the CPU (22.5). The patterns cost 1-2 ms per page here too.
+- In the cells without the detector the embedding takes 44-62 ms per page instead of 16-17 ms. Without screening first, each document's embedding call pays the GPU's first-touch costs (allocator growth, cuBLAS selection) on its own; this is noise of a few tens of ms against 2.6 s of OCR.
+- **Attribution to each model, by moving one back to the CPU:**
+  - **detector:** on the GPU it gains +77 % sequentially (11.2 -> 19.8) and **x3.4 with 12 clients** (40.1 -> 135.4). On the CPU it is still the bottleneck of 22.5: 8.1 s per page of screening, mostly waiting for its 2 slots.
+  - **embedder:** +33 % (14.9 -> 19.8) and +59 % (85.1 -> 135.4).
+  - **NER** (extraction): +28 % (15.4 -> 19.7) and +49 % (85.5 -> 127.8).
+- The CUDA build running on the CPU (`DEVICE=cpu`) matches the CPU image within 2.3 %: 9.7 / 36.1 against 9.7 / 35.3 docs/min ingesting, 15.4 / 85.5 against 15.4 / 86.0 extracting. The CUDA wheels cost nothing on the CPU path.
+
+### 23.5 Pool calibration on the GPU (D3)
+
+12 clients, two passes per configuration (the second in reverse order), docs/min. Section 18's rule: the smallest setting within 5 % of the best mean.
+
+| pool varied (others at the defaults) | 1 | 2 (default) | 4 | 8 | best mean, band from | smallest in band |
+|---|---|---|---|---|---|---|
+| NER, extraction | 130.8, 131.4 = **131.1** | 125.6, 129.9 = 127.8 | 130.4, 130.7 = 130.6 | 130.6, 128.8 = 129.7 | 131.1, 124.5 | **1** |
+| embedder, ingestion (detector 1) | 133.4, 131.2 = **132.3** | 135.4, 131.0 = 133.2 | 133.1, 132.0 = 132.6 | - | 133.2, 126.5 | **1** |
+| detector, ingestion (embedder 2) | 133.2 (default) | 133.5, 135.1 = **134.3** | - | - | 134.3, 127.6 | **1** |
+| embedder 1 + detector 2 | | 131.8, 133.2 = 132.5 | | | | |
+
+- Every configuration lies within 3 % of every other: 125.6-135.4 docs/min, a spread no larger than the two passes of one configuration (up to 4.3 docs/min). OCR bounds throughput at 12 jobs, and no pool size moves it.
+- The stage times confirm that the pools are not waited on:
+  - NER: 126-188 ms per page at p50 for pools 1-8;
+  - embedding: 17-21 ms;
+  - screening: 54-87 ms at p50, and 201-543 ms at p95 with the higher p95 at embedder 1 and 4 (passes vary).
+- The device peak rises by 60-140 MiB for detector pool 2 (23.2).
+
+**Recommended defaults: `GPU_NER_POOL = 1`, `GPU_EMBEDDING_POOL = 1`, `GPU_INJECTION_POOL = 1`, now applied in `app/bootstrap.py`; their throughput is confirmed in 23.11.** This is the rule's choice; it also gives the least VRAM (23.2: the pools add about 90-230 MiB each from 1 to 4). The embedder keeps its reserved query slot on top of the pool. Not measured here: a GPU-bound workload where the pools would matter, such as many more jobs than the 12 of `MAX_CONCURRENT_JOBS` or a host with more OCR capacity. The question runs of 23.6 used the pools in use at the time, 2 / 2 / 1; 23.11 repeats them with 1 / 1 / 1.
+
+### 23.6 Questions alone and during 12-client ingestion, the GPU shared with Gemma
+
+**Method** (`ask_gpu.py`, `ask_gpu.sh`):
+- The `llm_eval` compose override, project `llmeval_gpu`, with Ollama 0.40.12 and `gemma4:e4b-it-qat`: `OLLAMA_NUM_PARALLEL=2`, `OLLAMA_CONTEXT_LENGTH=8192`, thinking off (`reasoning_none`), no hosted model.
+- The index is a copy of `llmeval_qdrant` in the volume `gpu_qdrant`, made fresh before every run and removed at the end; `llmeval_qdrant` was only read.
+- **A subsample:** the first 200 questions of section 16's fixed order (177 call the model), one client, sequential, after 3 warm-up questions.
+- "Under load": 12 more clients ingest the 60-document sample over and over during the questions. Each file gets a comment line after `%%EOF`, so every ingestion OCRs, screens, embeds and stores, as in 19.3. The duplicates this adds to the index are in both load runs alike.
+- The same harness ran with the CPU image (Gemma still on the GPU) for the comparison.
+- The screening time is the time outside embedding, search and the model call, as 22.5 measured it. It also holds the prompt build and the answer guardrails, about 1.5 ms (below).
+
+| image | load | request p50 / p95 / max (s) | `embed_ms` p50 / p95 | screening p50 / p95 (ms) | `search_ms` p50 / p95 | `llm_ms` p50 / p95 | embed + screening share of service time | ingestion during the run |
+|---|---|---|---|---|---|---|---|---|
+| CPU | none | 0.7 / 1.2 / 6.6 | 49.9 / 68.6 | 128 / 152 | 3.5 / 4.9 | 520 / 1,056 | 24.7 % | - |
+| GPU, before (pools 2 / 2 / 1) | none | 0.6 / 1.1 / 6.7 | 5.6 / 7.7 | 18.7 / 25.9 | 3.3 / 4.2 | 565 / 1,131 | 4.1 % | - |
+| CPU, before (no question slot in the detector) | 12 clients | 12.8 / 16.8 / 22.7 | 88 / 200 | 11,721 / 15,451 | 6.8 / 15.7 | 999 / 1,801 | 91.9 % | 37.1 docs/min (screen 8.2 s/page) |
+| **CPU, now (reserved question slot)** | 12 clients | **1.0 / 2.0 / 10.9** | 81 / 164 | **236 / 368** | 5.5 / 14.2 | 690 / 1,699 | 30.1 % | 33.5 docs/min (130 documents in 233 s; screen 8.6 s/page) |
+| **GPU, now (pools 1 / 1 / 1, NER fp32)** | none | **0.6 / 1.1 / 6.5** | 5.5 / 7.3 | 16.7 / 22.6 | 3.4 / 12.7 | 558 / 1,131 | 3.8 % | - |
+| **GPU, now (pools 1 / 1 / 1, NER fp32)** | 12 clients | **0.9 / 1.6 / 10.2** | 26 / 166 | 96 / 321 | 8.1 / 108 | 749 / 1,380 | 19.4 % | **123.4 docs/min** (408 documents, 693 pages; screen 108 ms/page) |
+| GPU, before (pools 2 / 2 / 1) | 12 clients | 0.9 / 1.7 / 10.4 | 20 / 143 | 101 / 390 | 8.0 / 24.0 | 750 / 1,359 | 20.2 % | 124.4 docs/min (418 documents, 709 pages; screen 113 ms/page) |
+
+- All 200 questions returned 200 in every run, with the same refusals in both images: 23 threshold, 23-25 model, 1 unsupported, 0 flagged.
+- **On the GPU, screening takes 19 ms per question** (130 ms in 22.5, 128 ms on the CPU image here) and embedding the question 5.6 ms (50 ms).
+- **Under 12-client ingestion on the CPU, a question waits for the detector.** Question screening shares the detector's 2 FIFO slots with the pages of 12 ingestion jobs, and nothing reserves a slot for questions as the embedder's reserved query slot does (18.3). A question then waits behind the queued pages, 11.7 s at p50, and the request takes 12.8 s at p50. Before the detector, 19.3 measured a p95 under 2.5 s in this situation.
+  - **This was a defect of the CPU path. It is now fixed:** the detector reserves a question lane in its `FifoSlots` (`screen_query`), as the embedder does.
+  - **Re-measured (23.11):** on the CPU image under the same 12-client ingestion, questions take **1.0 / 2.0 s** (p50 / p95, against 12.8 / 16.8 s) and screening 236 / 368 ms (against 11.7 / 15.5 s). Ingestion during the run held 33.5 docs/min, against 37.1 before (-10 %). Questions now take their slot ahead of pages, and this run lasted 233 s against 2,529 s, so the two figures are not strictly comparable.
+  - On the GPU the same queue drains fast enough: screening 0.10 s p50, 0.39 s p95.
+- **On the GPU, Gemma and the models share the device.** Under load the model call rises from 0.57 to 0.75 s at p50 and from 1.13 to 1.36 s at p95. Questions run at p50 / p95 0.9 / 1.7 s, against 0.70 / 1.43 s idle in 22.6, while ingestion keeps 124 docs/min (93 % of the 133 without questions).
+- **Answer guardrails** (`guard_time.py`, on the host CPU): the tree's `is_refusal`, `support_share` against the rendered context and `output_filter` take **1.5 ms p50, 2.4 ms p95, 5.9 ms max** per answer, re-run 5 times on each recorded reply of the three runs (2,655 timings). They run on the CPU whatever the device.
+
+### 23.7 Parity, CPU against GPU
+
+| check | result |
+|---|---|
+| `/api/extract` on the 60-document sample, sequential: whole JSON bodies (names, boxes, matches, order), CPU image against GPU image | **60 / 60 identical**: 803 names, all 803 with boxes, 86 matches |
+| the same, CUDA image with `DEVICE=cpu` against the GPU and against the CPU image | 60 / 60 identical with each |
+| `/api/ingest`, sequential: status, result, `chunks_stored`, `chunks_flagged` | **60 / 60 identical**: 327 chunks, 0 flagged |
+| e5, 750 sample questions (`embed_query`): cosine GPU against CPU | min **0.999988**, mean 0.999999; 0 below 0.999 |
+| e5, the 3,299 chunks of the 600-document index (`embed_passages`, batches of 16) | min **0.999971**, mean 0.999996; 0 below 0.999 |
+| e5, nearest chunk of each of the 750 questions among the 3,299 | **top-1 746 / 750 (99.5 %)**; same top-5 set 718 / 750; top-1 score difference at most 0.0006; 0 questions cross `RAG_THRESHOLD` 0.808 |
+| detector, the adversarial suite (`tests/adversarial/cases.py`): direct, direct OCR-noisy, indirect, indirect noisy (4 x 40), benign sentences (30) and questions (15) | **identical flags at 0.5 in every set**: 30 / 23 / 14 / 13 flagged on both, 0 benign; score difference at most 0.057 (noisy direct) |
+| detector, 1,030 corpus pages and the 750 sample questions | identical flags: 3 pages flagged on both, 0 questions; score difference at most 0.008 |
+| detector, the 3,299 chunks: GPU against the host CPU scores of 22.4 | 3,299 / 3,299 identical flags (5 flagged); score difference at most 0.043 |
+| **NER now (fp32 on the GPU), the 1,030 corpus page texts** | **1,030 / 1,030 pages identical**, 8,414 spans on both; extraction 60 / 60 bodies identical (803 names); `pytest -m cuda` 9 passed, 5 skipped |
+| NER before (fp16), the 1,030 corpus page texts (`find_persons` after `title_case_caps`, without extraction's word-level rules) | 1,024 / 1,030 pages identical; 8,414 spans on the CPU against 8,412 on the GPU |
+| `pytest -m cuda` in `docintel-test:gpu` with the GPU (real models through the image's `NER_MODEL_PATH` and `EMBEDDING_MODEL_PATH`, and the detector) | **9 passed**, 5 skipped (the Playwright tests, e2e image only) |
+
+**The six NER differences** are all boundary cases on degraded text:
+- CPU only: `Arenas`, `Harmández` and `M.`;
+- GPU only: `Leonor`;
+- a span cut differently: `Gebrüder` against `Gebrüder Weiss`, and `Lázaro Quiñones` against `Lázaro`.
+
+None falls in the 60-document sample, whose extraction responses are identical. D2 keeps NER in fp32 on the GPU if spans differ; at 0.6 % of pages in both directions these look like fp16 rounding at decision boundaries, and fp16 was kept in the first round. Following D2, the code now keeps NER in fp32 on the GPU, and the re-measurement finds every span identical to the CPU's (23.11).
+
+In-image CPU against GPU time for these passes:
+- NER, 1,030 pages: 225 s on the CPU (16 threads) against 21 s on the GPU;
+- e5, 3,299 chunks: 257 s against 4.3 s;
+- detector, 1,030 pages: 583 s against 16 s.
+
+### 23.8 Images, start-up and memory
+
+**Images** (`docker images`: disk use / content):
+
+| image | CPU variant | CUDA variant | difference |
+|---|---|---|---|
+| runtime (`docintel:cpu41` / `docintel:gpu41`) | 7.89 GB / 2.95 GB | 17.2 GB / 6.42 GB | +9.3 GB disk, +3.5 GB content |
+| test (`docintel-test:cpu` / `docintel-test:gpu`) | 7.91 GB / 2.96 GB | 17.2 GB / 6.44 GB | the same |
+
+**Start-up and memory** (`cold_gpu.sh`, as 22.8's `resources.sh`):
+- `QDRANT_LOCATION=:memory:`, no language model, the three sample PDFs ingested one after the other.
+- Two rounds of three cells. Round 1 started with a cold file cache for the CUDA image, which inflates its memory figures.
+
+| cell | start to `/health/ready` (round 1 / 2) | lifespan (`service started`) | cgroup memory after start / peak (round 2) | device memory after start / after the PDFs |
+|---|---|---|---|---|
+| CPU image | 9.8 / 8.0 s | 6.6 / 5.6 s | 1,234 / 1,399 MiB | 0 |
+| **CUDA image on the GPU** | **12.0 / 9.7 s** | **8.0 / 6.9 s** | **2,227 / 2,473 MiB** | **+1,873 / +1,939 MiB** |
+| CUDA image, `DEVICE=cpu` | 8.4 / 8.4 s | - / 5.7 s | 1,363 / 1,523 MiB | 0 |
+
+- On the GPU, start-up is 1.3-2.2 s longer: CUDA initialisation and moving the models to the device.
+- The process uses about 1 GB more RAM: the CUDA libraries, and the weights are loaded on the CPU before they move.
+- Round 1 of the CUDA image peaked at 3,987 MiB with its cold page cache.
+- The start-up line names the device: `"device": "cuda:0", "gpu_name": "NVIDIA GeForce RTX 4070 Ti", "gpu_memory_mib": 12281`.
+
+### 23.9 Impact of each component on the GPU
+
+Against the CPU baseline: section 22.5 and this section's CPU image of the same tree. The 12-client figures carry the benchmark-only limit overrides of 23.1.
+
+| component | time per page or per question: CPU -> GPU | throughput, sequential and 12 clients | VRAM (peak above idle) | notes |
+|---|---|---|---|---|
+| **OCR** (Tesseract, stays on the CPU) | 1.62 s/page sequential, 2.1-2.8 s with 12 jobs; unchanged | the limit: 94 % of a document's time on the GPU image | 0 | now the only lever for throughput (`OCR_WORKERS`, CPUs) |
+| **NER** (xlm-roberta-base, **fp32** now) | 563 -> 102 ms/page (fp16 before: 54); 1,528 -> 126-155 with 12 jobs | extraction 15.4 -> 19.3 (+25 %); 86.0 -> 127.9 (+49 %) | 1,403 MiB (pool 1), 1.07 GB of weights (fp16 before: 879 MiB) | spans identical on all 1,030 corpus pages and the sample (fp16 before: 6 pages differed) |
+| **embedder** (e5-base, fp16) | 551 -> 16 ms/page; query 50 -> 5.6 ms | ingestion +33 % and +59 % (embedder alone moved back to the CPU) | 1,293 MiB (pool 2) | cosine >= 0.99997; top-1 99.5 % |
+| **detector model** (Prompt Guard 2) | 1,541 -> 94 ms/page (8,340 -> 78 with 12 jobs); question 128 -> 19 ms | its cost falls from -38 % / -59 % on the CPU to -4 % / 0 %; moving it to the GPU gives +77 % and x3.4 | 987 MiB (pool 1) | identical flags on every set |
+| **patterns** | 1.2-1.6 ms/page; 0.07 ms/question (22.4) | 0 % / -1 % | 0 | CPU code |
+| **answer guardrails** (support check, output filter) | 1.5 ms p50, 2.4 ms p95 per answer | none measurable (CPU code) | 0 | |
+| **Gemma sharing the GPU** | model call 0.57 -> 0.75 s p50, 1.13 -> 1.36 s p95 under 12-client ingestion; questions 0.9 / 1.6 s with pools 1 / 1 / 1 (0.9 / 1.7 before) | ingestion 133 -> 123-124 docs/min with questions running (-7 %) | Gemma 4.8 GB; all together peak 9.37 of 12.28 GB, **2.91 GB free** (before: 8.80, 3.48 free) | on the CPU image the same load gives questions 1.0 / 2.0 s with the reserved detector slot (before: 12.8 / 16.8 s) |
+| **all three models on the GPU** | ingestion 6.8 -> 3.0 s per document (p50) | ingestion **9.7 -> 19.8 (x2.0)** and **35.3 -> 133.2 (x3.8)**; extraction x1.3 and x1.5 | about 2.7-2.9 GB in service with NER fp32 (2.3-2.5 before) | + 1.0 GB RAM, + 1.3-2.2 s start-up, + 9.3 GB image |
+
+### 23.10 Findings
+
+1. **The GPU removes the detector's cost.** Ingestion with every defence on rises from 9.7 to 19.8 docs/min sequentially and from 35.3 to about 133 with 12 clients. That is above the 87.8 docs/min that 22.5 measured on the CPU with the detector off. On the GPU, switching the model or the patterns off changes throughput by 0-5 %.
+2. **Each model's gain:**
+   - the detector gives most of the 12-client gain: x3.4 with the detector alone moved;
+   - the embedder +59 %;
+   - NER +49 % on extraction.
+3. **OCR is now the bound.** It takes 94 % of an ingestion's time. The GPU stays at 7-16 % mean utilisation, and no pool size changes throughput.
+4. **GPU pools: 1 / 1 / 1 by section 18's rule**, every setting within 3 % (23.5). They are now the defaults in code (start values 2 / 2 / 1); 23.11 confirms ingestion 132.9 and extraction 127.9 docs/min with them.
+5. **VRAM fits with room.** With NER in fp32 the three models take about 2.7-2.9 GB in service and Gemma 4.8 GB. The worst measured case leaves 2.91 GB of the 12 GB device free with a desktop on it (3.48 GB with fp16 NER).
+6. **Results do not depend on the device.** Extraction and ingestion responses are identical on the 60-document sample; e5 vectors are within 0.99997 cosine with 99.5 % top-1 agreement; the detector flags are identical on every set. NER spans differed on 6 of 1,030 raw corpus pages in fp16; in fp32, now the code's choice, all 1,030 are identical.
+7. **Defect found on the CPU path, now fixed:** question screening had no reserved detector slot, so under 12-client ingestion on the CPU a question waited about 12 s for the detector (23.6). With the reserved question lane (`screen_query`), questions on the CPU under that load take 1.0 / 2.0 s (p50 / p95), and ingestion during the run held 33.5 docs/min (23.11).
+8. **The CUDA build costs nothing on the CPU** (`DEVICE=cpu` within 2.3 % of the CPU image). It costs 9.3 GB of image and about 1 GB more RAM on the GPU path.
+
+**Caveats.**
+- **Benchmark-only overrides.** The limit overrides of 22.5 apply to every cell. The one-model-on-the-CPU cells use `bench_app.py`; the service's settings cannot express them (`DEVICE` is global).
+- **Short cells.** One pass per cell, two for the defaults and the pools. A 12-client GPU cell lasts about 26 s, so differences under 4 % between GPU cells are noise.
+- **Questions.** The question runs are a subsample (200 of the 750 questions), one run per configuration. The first round used pools 2 / 2 / 1; 23.11 repeats the GPU runs with 1 / 1 / 1. The load runs add duplicates of the sample to a copy of the index, as 19.3 did.
+- **VRAM and memory.** Host `nvidia-smi` under WDDM reports the whole device, desktop included, with 1 s or 250 ms sampling, so short peaks can be missed. The in-process figures are deltas from a WSL2 base. RAM figures are cgroup `memory.current`, page cache included.
+- **One host, synthetic scans, short documents** (1-2 pages). Workloads where the GPU is the bound were not measured: long documents, more than 12 jobs, several replicas on one GPU. The NER parity of 23.7 uses page texts from the index, not extraction's word-level pipeline (that is the 60-document HTTP check).
+
+### 23.11 Re-measurement after the code changes (NER fp32, detector question slot, pools 1 / 1 / 1)
+
+**Images.** `docintel-test:gpu` (`sha256:e9380ff8...`), `docintel-test:cpu` (`c911c1e8...`), `docintel:gpu41` (`dbfa7656...`) and `docintel:cpu41` (`1e34e097...`), rebuilt from the changed tree on 2026-10-29 at 21:58 UTC, with the same commands as 23.1. Each server's start-up line confirms the GPU pools 1 / 1 / 1.
+
+**Method.** The scripts of 23.2-23.7 unchanged, outputs in `benchmarks/gpu/out/v2/`:
+- `gpu_vram.sh ner:1,1,1 all:1,1,1`;
+- `parity_models.py --skip e5,detector` with `pytest -m cuda`;
+- `cells_v2.txt` through `gpu_run.sh` (one pass, two for the 12-client cells);
+- `ask_gpu.sh`: GPU alone, GPU under load, CPU under load.
+
+| measurement | before (round 1) | now |
+|---|---|---|
+| NER raw-page spans, GPU against CPU (1,030 pages) | 1,024 identical (fp16) | **1,030 / 1,030 identical**, 8,414 spans each |
+| extraction bodies, GPU against CPU image (60 documents) | 60 / 60 | **60 / 60** (803 names, all with boxes); also 60 / 60 against round 1's CPU bodies |
+| `pytest -m cuda` in the CUDA image | 9 passed, 5 skipped | 9 passed, 5 skipped |
+| NER ms/page on the GPU, sequential p50 / p95 | 54 / 75 (fp16, pool 2) | **102 / 163** (fp32, pool 1); CPU image 556 / 897 |
+| NER ms/page on the GPU, 12 jobs p50 | 126-173 | 126-155 |
+| extraction docs/min, sequential / 12 clients | 19.7 / 127.8 | **19.3 / 127.9** (125.3, 130.4); CPU image 15.6 sequential |
+| ingestion docs/min, sequential / 12 clients | 19.8 / 133.2 | **20.0 / 132.9** (131.2, 134.6) |
+| NER VRAM alone, host peak above idle | 879 MiB (fp16, pool 2) | **1,403 MiB** (fp32, pool 1); weights 1,066 MiB |
+| the three models alone, host peak above idle | 2,445 MiB (2 / 2 / 1) | **2,853 MiB** (1 / 1 / 1) |
+| device peak, 12-client ingestion (no Gemma) | 3,820 MiB | 4,386 MiB |
+| **worst case: the three and Gemma, 12-client ingestion with questions** | 8,803 of 12,282 MiB, 3.48 GB free | **9,369 MiB, 2.91 GB free (24 %)** |
+| questions on the GPU alone, p50 / p95 / max | 0.6 / 1.1 / 6.7 s | **0.6 / 1.1 / 6.5 s** (screening 17 / 23 ms, embed 5.5 / 7.3 ms) |
+| questions on the GPU under 12-client ingestion | 0.9 / 1.7 / 10.4 s; ingestion 124.4 docs/min | **0.9 / 1.6 / 10.2 s**; ingestion 123.4 docs/min |
+| **questions on the CPU image under 12-client ingestion** | 12.8 / 16.8 / 22.7 s, screening 11.7 / 15.5 s | **1.0 / 2.0 / 10.9 s**, screening 236 / 368 ms |
+| ingestion during that CPU run | 37.1 docs/min | 33.5 docs/min |
+
+All 200 questions of every run returned 200, with the refusals of round 1: 23 threshold, 23-25 model, 1 unsupported, 0 flagged. Every ingestion and extraction request returned 200.
+
+**Result.**
+- NER in fp32 restores span parity on every corpus page. It costs about 0.5 GB more VRAM and 48 ms more NER time per page sequentially, and no extraction throughput.
+- The reserved detector slot removes the question wait on the CPU (12.8 -> 1.0 s p50). Ingestion during that run ran 10 % slower, in a run ten times shorter.
+- Pools 1 / 1 / 1 keep throughput and question latency.
+- The worst-case margin on the 12 GB device is now 2.9 GB.
+

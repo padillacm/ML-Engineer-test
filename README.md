@@ -157,7 +157,7 @@ batching, or other production hardening. Not required — credited when present.
 ## Getting started
 
 ```bash
-uv sync --extra dev                          # create .venv and install deps from pyproject.toml
+uv sync --extra dev --extra cpu             # create .venv: dev tools and the CPU build of torch
 # Vector DB: Qdrant server (see "Tests with Qdrant (compose)" below); unit tests use an in-memory Qdrant.
 uv run uvicorn app.main:app --reload         # needs the variables of "Running the service"
 ```
@@ -201,14 +201,18 @@ Required variables are marked **R**; every default is the benchmarked value (`do
 
 | Group | Variable (default) |
 |---|---|
-| Models | `NER_MODEL_PATH` **R**, `EMBEDDING_MODEL_PATH` **R**, `EMBEDDING_MODEL_REVISION` **R**, `TORCH_THREADS` (2, at most the CPUs available: torch intra-op threads, process-wide, shared by the recogniser and the embedder; the former `NER_THREADS`/`EMBEDDING_THREADS` stop start-up), `NER_POOL_SIZE` (derived*: texts recognised at once, sharing one model), `EMBEDDING_POOL_SIZE` (derived*: passage batches embedded at once, sharing one model; one more slot is reserved for questions' queries), `EMBEDDING_BATCH_SIZE` (16); start-up warns when a pool x `TORCH_THREADS` exceeds the CPUs available |
-| OCR | `OCR_DPI` (200), `OCR_WORKERS` (derived*: Tesseract processes per document), `OCR_TIMEOUT_S` (60), `OCR_FLATTEN` (true), `MAX_PAGES` (50) |
+| Models | `NER_MODEL_PATH` **R**, `EMBEDDING_MODEL_PATH` **R**, `EMBEDDING_MODEL_REVISION` **R**, `TORCH_THREADS` (2, at most the CPUs available: torch intra-op threads, process-wide, shared by the recogniser and the embedder; the former `NER_THREADS`/`EMBEDDING_THREADS` stop start-up), `NER_POOL_SIZE` (derived*: texts recognised at once, sharing one model), `EMBEDDING_POOL_SIZE` (derived*: passage batches embedded at once, sharing one model; one more slot is reserved for questions' queries), `EMBEDDING_BATCH_SIZE` (16); start-up warns when a pool x `TORCH_THREADS` exceeds the CPUs available (CPU only) |
+| Device | `DEVICE` (auto: the GPU when torch sees one, else the CPU; `cpu`; `cuda`, which stops start-up without a GPU): where the recogniser, the embedder and the detector run, logged in the `concurrency in use` line with the GPU's name and memory. On the GPU the embedder and the detector run in fp16 and the recogniser in fp32; the image must be the CUDA build (below) |
+| OCR | `OCR_DPI` (200), `OCR_WORKERS` (derived*: Tesseract processes per document), `OCR_TIMEOUT_S` (60), `OCR_FLATTEN` (true), `MAX_PAGES` (50), `OCR_RENDER_TIMEOUT_S` (10: time budget of one page render, then `pdf_unreadable`), `OCR_MAX_IMAGE_PIXELS` (80,000,000: decoded image pixels a page may declare, checked before rendering, then `too_large`), `MAX_PAGE_CHARS` (30,000: longest recognised text of one page, then `too_large`; the densest sample page has about 1,000 characters) |
 | Matching | `MATCH_THRESHOLD` (0.90) |
 | Chunking | `CHUNK_SIZE` (800 characters), `CHUNK_OVERLAP` (0.12, a ratio of the size) |
-| Retrieval | `RAG_THRESHOLD` (0.808), `RAG_TOP_K` (5), `RAG_MAX_CHUNKS` (3), `RAG_MAX_CONTEXT_CHARS` (6000) |
+| Retrieval | `RAG_THRESHOLD` (0.808), `RAG_TOP_K` (5), `RAG_MAX_CHUNKS` (3), `RAG_MAX_CONTEXT_CHARS` (6000), `RAG_MAX_CHUNKS_PER_DOCUMENT` (2: context chunks one document may give when chunks of other documents also matched) |
+| Guardrails | `INJECTION_MODEL_PATH` (unset: no detector, every score 0; the images set `/models/prompt-guard` when built with the model), `INJECTION_THRESHOLD` (0.5: score at or above which a page's chunks are stored flagged and never retrieved, or a question is refused), `INJECTION_POOL_SIZE` (unset: 2 on the CPU, 1 on the GPU; concurrent page screenings on the one loaded model, plus one slot reserved for questions), `INJECTION_PATTERNS` (true: instruction patterns in the five languages, combined with the model's score by the higher one), `RAG_SUPPORT_MIN_SHARE` (0.6: share of an answer's content tokens that must appear in the context, else the fixed refusal) |
 | Vector store | `QDRANT_URL` or `QDRANT_LOCATION` **R** (exactly one; `:memory:` is the embedded, non-persistent mode), `QDRANT_API_KEY` or `QDRANT_API_KEY_FILE` (a file holding the key, as for the language model), `QDRANT_COLLECTION_PREFIX` (chunks), `QDRANT_TIMEOUT_S` (10), `QDRANT_ATTEMPTS` (3), `QDRANT_DEADLINE_S` (20) |
 | Language model | `LLM_BASE_URL` (unset: no model), `LLM_MODEL` (required with a base URL), `LLM_API_KEY`, `LLM_API_KEY_FILE` (unset; a file holding the key, read once at start-up, an empty file meaning no key; not together with `LLM_API_KEY`; compose sets it to its secret), `LLM_CONNECT_TIMEOUT_S` (5), `LLM_READ_TIMEOUT_S` (60), `LLM_TOTAL_TIMEOUT_S` (90), `LLM_ATTEMPTS` (3), `LLM_MAX_TOKENS` (512), `LLM_REASONING_EFFORT` (unset: not sent), `LLM_MAX_TOKENS_FIELD` (`max_tokens`), `LLM_SEND_TEMPERATURE` (true) |
 | Limits | `MAX_UPLOAD_MB` (20), `MAX_NAMES` (1000), `MAX_CONCURRENT_JOBS` (derived*), `MAX_CONCURRENT_QUESTIONS` (16), `BUSY_WAIT_S` (10, at most 300), `READINESS_TIMEOUT_S` (2, at most 30) |
+| Rate limits (per client address) | `RATE_LIMIT_UPLOADS_PER_MINUTE` (60) and `RATE_LIMIT_UPLOADS_BURST` (20) for `/api/extract` and `/api/ingest`, `RATE_LIMIT_QUESTIONS_PER_MINUTE` (240) and `RATE_LIMIT_QUESTIONS_BURST` (60) for `/api/ask`, `MAX_JOBS_PER_CLIENT` (4: extraction and ingestion jobs one address may hold at once); a rate or cap of 0 turns that limit off; over a limit the client gets 429 `rate_limited` with `Retry-After` |
+| API docs | `EXPOSE_DOCS` (false: `/docs`, `/redoc` and `/openapi.json` answer 404; true serves them) |
 | Audit viewer | `AUDIT_VIEWER_ENABLED` (true: the page at `/audit` and its files; false: they answer 404, the API is unaffected), `PDFJS_DIR` (unset: `vendor/pdfjs` at the project root, where `uv run python scripts/fetch_pdfjs.py` puts the pinned pdf.js files; the images set `/app/vendor/pdfjs`) |
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (json, or text), `LOG_EXCEPTION_MESSAGES` (false; local debugging only: logs exception messages, which may contain document text) |
 
@@ -217,7 +221,9 @@ container's CPU quota, cgroup v2 or v1), and logged in one `concurrency in use` 
 always wins.
 The rule (`app/bootstrap.py` `concurrency_for`, with `TORCH_THREADS` T): jobs = 3/4 of the CPUs
 rounded up, at most 12; NER pool = CPUs / T, at most 8; embedder pool = CPUs / (2 T), at most 4;
-OCR workers = CPUs, at most 4; each at least 1. With T = 2:
+OCR workers = CPUs, at most 4; each at least 1. On the GPU the NER, embedder and detector pools
+are 1 each instead (every size tried came within 3 %, `docs/BENCHMARKS.md` 23.5); jobs and OCR
+workers keep the CPU rule, because OCR stays on the CPUs. With T = 2:
 
 | CPUs | 1 | 2 | 4 | 6 | 8 | 12 | 16 or more |
 |---|---|---|---|---|---|---|---|
@@ -292,9 +298,10 @@ The derived sizes were measured on a 16-CPU host, with CPU quotas of 8 and 4
 | 400 | `empty_file`, `http_error` (a form the multipart parser refuses, e.g. a field over 1 MiB) |
 | 413 | `too_large` (file over `MAX_UPLOAD_MB`, refused while reading or from `Content-Length`, or a body over the endpoint's limit: 64 KiB for `/api/ask` and other routes without uploads; a body up to 1 MiB over is read to its end so the client can read the 413), `too_many_pages` (over `MAX_PAGES`, refused before any page is rendered) |
 | 415 | `not_a_pdf` |
+| 429 | `rate_limited` (the client address is over its rate, burst or job cap; `Retry-After` in seconds) |
 | 499 | `request_cancelled` (the client disconnected; logged only, no response reaches it) |
 | 422 | `pdf_unreadable`, `invalid_names` (names the wrong entry, e.g. `names[1]`, including a name over 100 characters), `unsupported_language` (not en, es, pt, fr, de), `invalid_question` (blank), `invalid_request` (validation `detail` list of `{type, loc, msg}`; the rejected value is never echoed) |
-| 500 | `ocr_failed`, `ner_failed`, `embedding_failed`, `geometry_error`, `incompatible_embedding`, `invalid_configuration`, `internal_error` (anything unexpected; no internal detail is returned) |
+| 500 | `ocr_failed`, `ner_failed`, `embedding_failed`, `detector_failed`, `geometry_error`, `incompatible_embedding`, `invalid_configuration`, `internal_error` (anything unexpected; no internal detail is returned) |
 | 503 | `vector_store_unavailable`, `llm_unavailable`, `service_busy`, with `Retry-After` (5 s; `BUSY_WAIT_S` rounded up for `service_busy`) |
 | 504 | `vector_store_timeout`, `llm_timeout`, with `Retry-After: 5` |
 
@@ -360,8 +367,45 @@ revision opens a new vector collection). It loads offline in about 5 s; one 800-
 passage (~180 tokens) takes about 0.16 s at 2 threads. To bump it, set the global
 `E5_MODEL_REVISION` build arg and every `E5_MODEL_*_SHA256` arg in the `Dockerfile` (same
 sources as the NER model), rebuild and rerun the suite.
-`torch` is CPU-only on every platform: `pyproject.toml` takes it from the PyTorch CPU
-wheel index (`[tool.uv.sources]`), so neither the host nor the image installs CUDA.
+
+The injection detector (`meta-llama/Llama-Prompt-Guard-2-86M`, about 1.1 GB) is baked in the
+same way by the `prompt-guard` stage (config, `model.safetensors`, the tokenizer files, the
+model card, `LICENSE` and `USE_POLICY.md` at a pinned commit, every sha256 checked, a `NOTICE`
+with the licence) and copied read-only to `/models/prompt-guard` (`INJECTION_MODEL_PATH`). The
+model is gated: the account that builds the image must have accepted the Llama 4 Community
+License on its Hugging Face page, and a read token must be in `.env` as `HF_TOKEN` (never
+committed). Compose hands it to the build as a BuildKit secret, so it is in no layer and in no
+container (`docker history` and `docker inspect` show none). `INJECTION_MODEL=0` (in `.env` or
+`--build-arg`) builds every image without the model; the service then runs with injection
+detection off. To bump it, run `uv run python scripts/resolve_model_hashes.py
+meta-llama/Llama-Prompt-Guard-2-86M <commit>` with `HF_TOKEN` in the environment, paste the
+printed `ARG` lines over the `PROMPT_GUARD_*` ones in the `Dockerfile`, rebuild and rerun the
+suite. Tests marked `injection_model` need the model directory and are skipped without it.
+
+This service is **built with Llama**: Llama 4 is licensed under the Llama 4 Community
+License, Copyright © Meta Platforms, Inc. All Rights Reserved (the `NOTICE` next to the model
+carries the full attribution; the licence is not OSI-approved, see `docs/KNOWN_LIMITATIONS.md`).
+`torch` comes in two builds, chosen by exactly one of two extras that uv declares conflicting:
+`cpu` from the PyTorch CPU wheel index (no NVIDIA libraries) and `cuda` from the CUDA 12.6 index.
+A sync needs one of them (`uv sync --extra dev --extra cpu` on the host; without either, no torch is
+installed). The images take it from the `TORCH_VARIANT` build argument (`cpu` by default); in
+compose, `TORCH_VARIANT` empty means `cuda` with `COMPOSE_PROFILES=gpu` and `cpu` otherwise, and
+the CUDA build also reserves the GPU for the service (`docker-compose.torch.yml`). The test image
+stays `cpu` unless `TORCH_VARIANT=cuda`. To run the GPU tests on the host, keep a second
+environment beside `.venv` so the two builds never replace each other:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-cuda uv sync --extra dev --extra cuda
+```
+
+```bash
+.venv-cuda/Scripts/python.exe -m pytest -m cuda
+```
+
+(`.venv-cuda/bin/python` on Linux.) Tests marked `cuda` compare the three adapters on the GPU with
+the CPU and are skipped without a visible GPU; with `NER_MODEL_PATH`, `EMBEDDING_MODEL_PATH` and
+`INJECTION_MODEL_PATH` set they also compare the real models. In the CUDA test image:
+`TORCH_VARIANT=cuda docker compose -f docker-compose.test.yml run --rm tests pytest -m cuda`.
 
 #### Tests with Qdrant (compose)
 
@@ -378,6 +422,68 @@ docker compose -f docker-compose.test.yml down -v            # remove the Qdrant
 ```
 
 On the host, the same contract runs against qdrant-client's embedded `:memory:` mode.
+
+#### Defences of a service without authentication
+
+The service is a proof of concept with no authentication, so the application itself bounds
+what one client and one document can cost it, and what a document can make the language
+model say (`openspec/specs/client-rate-limiting`, `injection-detection` and the deltas of the
+other specs; design `add-defensive-hardening`):
+
+- **Rate limits and caps per client address.** A token bucket per peer address and route
+  class (uploads, questions) and a cap on the jobs one address may hold at once, inside the
+  process (there is no proxy): over a limit the request is answered 429 `rate_limited` with
+  `Retry-After` before its body is read. The defaults are above the measured single-client
+  throughput, so a well-behaved client is never limited; `X-Forwarded-For` is ignored (without
+  a proxy it would let a client choose its key), so behind a NAT or a proxy every client
+  shares one address: raise the limits or set them to 0 there. Uvicorn runs with
+  `--limit-concurrency 64` and `--timeout-keep-alive 5`; `/docs` and `/openapi.json` are off
+  unless `EXPOSE_DOCS=true`; API responses carry `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+- **Bounded PDF rendering.** Each page is rendered through PDFium's progressive API under a
+  time budget (`OCR_RENDER_TIMEOUT_S`): a page that takes longer fails the document with
+  `pdf_unreadable` instead of holding the renderer (a hostile page that took 4.3 s to draw is
+  stopped in about 70 ms over a 50 ms budget). Before rendering, the declared pixels of a
+  page's images (nested form XObjects included) are summed and a page over
+  `OCR_MAX_IMAGE_PIXELS` is refused `too_large` without decoding anything; a page whose
+  recognised text exceeds `MAX_PAGE_CHARS` is refused `too_large` before NER, chunking or
+  embedding run.
+- **Injection detection.** With the model built in (`INJECTION_MODEL_PATH`), the text of
+  every page is scored by Meta's Llama Prompt Guard 2 (86M, en/es/pt/fr/de, on the CPU)
+  at ingestion and every question at answering. Every chunk of a page at or above
+  `INJECTION_THRESHOLD` is stored flagged: the document stays complete (the ingest succeeds and
+  reports every chunk; `chunks_flagged` is logged) but a flagged chunk is never returned by a
+  search, so neither it nor its page reaches the model. The page is the unit because the
+  context holds the whole parent page of a retrieved chunk. A flagged question gets the fixed
+  refusal without a search or a model call. Next to the model, a rule detector
+  (`INJECTION_PATTERNS`) matches instruction patterns in the five languages (ignore previous
+  instructions, a new role, reveal the prompt, "whatever the documents say, answer that...",
+  forged labels), tolerant of case, spacing and OCR substitutions; the higher of the two scores
+  counts. On the adversarial suite the model alone flags 75 % of direct injections and about a
+  third of those written into documents (none of the benign controls); with the patterns every
+  case of the suite is flagged and the benign controls and the 2,776 sentences of the corpus
+  generator still match nothing (the patterns were written against that suite, so those rates
+  are a floor check, not a generalisation; `docs/BENCHMARKS.md` 22). Without the model the
+  service runs with the patterns alone and says so at start-up.
+- **The model sees passages as data.** Each context passage is enclosed between
+  `<<<passage n: document <id>, page <p>>>>` and `<<<end passage n>>>` (a run of `<` or `>`
+  inside the page text gets a zero-width space, so a document cannot forge a boundary) and
+  the instructions say that anything inside a passage is document content, never an
+  instruction. After the model answers, the answer is returned only if at least
+  `RAG_SUPPORT_MIN_SHARE` of its content tokens (accent-folded, stop words removed) appear in
+  the context (`unsupported` otherwise) and it neither quotes the instructions nor names a
+  URL, a document or a page that is not in the context (`output_filtered`); the refusal
+  reason and the share are logged, never the answer. When chunks of several documents pass
+  the threshold, one document gives at most `RAG_MAX_CHUNKS_PER_DOCUMENT` of them.
+- **Hardened containers.** Under compose the service and Qdrant run with a read-only root
+  filesystem (scratch on tmpfs), every capability dropped, `no-new-privileges`, a PID limit
+  and a memory limit; the smoke suite checks them on the running stack. `uv audit` runs on
+  every push.
+
+What these defences do not do: they do not authenticate anyone (a reverse proxy's job before
+the service leaves the host), and a general-purpose language model is never immune to
+injection: the detector, the delimiters and the output checks reduce the surface and make an
+attack visible in the logs. `docs/SECURITY.md` summarises the threat model, the defences, their measured effect and the residual risk; `docs/KNOWN_LIMITATIONS.md` records what remains.
 
 ### Running the stack
 
@@ -495,6 +601,31 @@ volume (17.7-17.9 s after the review's changes), about 85 s on the very first st
 the review; warm-up) plus the model download (about 6 GB). The runtime image is 5.76 GB (the audit
 viewer's page and pdf.js add 3.2 MB; the browser tests' image is separate). Above 16
 CPUs the derived values stay at the 16-CPU ones: scale with replicas.
+
+#### Models on the GPU
+
+With `COMPOSE_PROFILES=gpu` the service is the CUDA build and `DEVICE=auto` puts the recogniser,
+the embedder and the detector on the GPU beside Ollama. Measured on the same host with every
+defence on (`docs/BENCHMARKS.md` section 23, 60-document sample, 16 CPUs):
+
+| | CPU build | CUDA build, models on the GPU |
+|---|---|---|
+| `/api/ingest`: docs/min sequential / 12 clients | 9.7 / 35.3 | 20.0 / 132.9 |
+| `/api/extract`: docs/min sequential / 12 clients | 15.4 / 86.0 | 19.3 / 127.9 |
+| Detector per page / per question | 1,541 / 128 ms | 94 / 19 ms |
+| Embedder per page / per query | 551 / 50 ms | 16 / 5.6 ms |
+| Recogniser per page (fp32 on both) | 563 ms | 102 ms |
+| Question p50 / p95 under 12-client ingestion (Gemma on the GPU) | 1.0 / 2.0 s | 0.9 / 1.6 s (0.6 / 1.1 s alone) |
+| VRAM: the three models in service / with Gemma, worst case | none | 2.7-2.9 GB / 9.4 of 12.3 GB |
+| Image / service RAM / start to ready | 7.89 GB / 1.2 GB / 8.0-9.8 s | 17.2 GB / 2.2 GB / 9.7-12.0 s |
+
+OCR, which stays on the CPUs, is then 94 % of the ingestion time and the GPU averages 7-16 %
+busy, which is why the pool sizes no longer matter there and turning the detector or the
+patterns off moves throughput by 0-5 %. The worst case leaves 2.9 GB of the 12 GB free with a desktop on
+the GPU. The results equal the CPU build's (the recogniser's spans on all 1,030 corpus pages,
+extraction and ingestion bodies on the sample, the detector's flags; e5 vectors within a cosine
+of 0.99997). `DEVICE=cpu` makes the CUDA build behave like the
+CPU one.
 
 #### Storage and failure modes
 
