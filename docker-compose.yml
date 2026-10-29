@@ -47,7 +47,8 @@ services:
     image: ${APP_IMAGE:-docintel}
     # Every setting the service reads (tests/deploy/test_compose_wiring.py keeps this list equal
     # to app/settings.py), so nothing else from .env (another token, say) reaches the container.
-    # The model paths and revision come from the image; QDRANT_URL and the key files are fixed.
+    # The model paths and revision and PDFJS_DIR come from the image; QDRANT_URL and the key
+    # files are fixed.
     environment:
       TORCH_THREADS: ${TORCH_THREADS:-}
       NER_POOL_SIZE: ${NER_POOL_SIZE:-}
@@ -91,6 +92,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-}
       LOG_FORMAT: ${LOG_FORMAT:-}
       LOG_EXCEPTION_MESSAGES: ${LOG_EXCEPTION_MESSAGES:-}
+      AUDIT_VIEWER_ENABLED: ${AUDIT_VIEWER_ENABLED:-}
       # Not a setting: read by the start command below.
       OLLAMA_URL: *ollama-url
     # The keys (from .env or the shell) as files under /run/secrets. Compose refuses to create a

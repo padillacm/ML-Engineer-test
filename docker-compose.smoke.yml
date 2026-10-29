@@ -8,8 +8,9 @@
 # until the app is healthy and runs tests/deploy (marker deployed_service) against
 # http://app:8000 over the internal network. The tests ingest the sample PDFs into the stack's
 # store. `hygiene` runs the runtime image without a network and fails if it contains test or
-# development code, uv, a .env file, runs as root, can download models or lets the service change
-# its own code.
+# development code, uv, a .env file, Playwright or a browser, runs as root, can download models,
+# lets the service change its own code or its pdf.js files, or carries pdf.js files other than
+# those pinned in deploy/pdfjs.lock.
 
 services:
   smoke:
@@ -34,6 +35,9 @@ services:
     image: ${APP_IMAGE:-docintel}
     network_mode: none
     restart: "no"
+    # The pdf.js pin, read-only: the image's files are checked against the repository's lock.
+    volumes:
+      - ./deploy/pdfjs.lock:/run/pdfjs.lock:ro
     command:
       - sh
       - -c
@@ -56,5 +60,21 @@ services:
         check "MALLOC_ARENA_MAX=2" '[ "$$MALLOC_ARENA_MAX" = 2 ]'
         check "service code is read-only" '! touch /app/app/main.py'
         check "models are read-only" '! touch /models/multilingual-e5-base/config.json'
+        check "pdf.js: at PDFJS_DIR, each file with its hash in deploy/pdfjs.lock, no other file" \
+          '[ "$$PDFJS_DIR" = /app/vendor/pdfjs ] && [ "$$(ls -A /app/vendor/pdfjs | wc -l)" = 9 ] && (
+            . /run/pdfjs.lock && cd /app/vendor/pdfjs && printf "%s  %s\n" \
+              "$$PDFJS_LIB_SHA256" pdf.min.mjs \
+              "$$PDFJS_WORKER_SHA256" pdf.worker.min.mjs \
+              "$$PDFJS_JBIG2_FALLBACK_SHA256" jbig2_nowasm_fallback.js \
+              "$$PDFJS_OPENJPEG_FALLBACK_SHA256" openjpeg_nowasm_fallback.js \
+              "$$PDFJS_LICENSE_SHA256" LICENSE \
+              "$$PDFJS_LICENSE_JBIG2_SHA256" LICENSE_JBIG2 \
+              "$$PDFJS_LICENSE_OPENJPEG_SHA256" LICENSE_OPENJPEG \
+              "$$PDFJS_LICENSE_PDFJS_JBIG2_SHA256" LICENSE_PDFJS_JBIG2 \
+              "$$PDFJS_LICENSE_PDFJS_OPENJPEG_SHA256" LICENSE_PDFJS_OPENJPEG | sha256sum -c - )'
+        check "pdf.js: owned by root, not writable by the service" \
+          '[ -z "$$(find /app/vendor ! -user 0)" ] && ! touch /app/vendor/pdfjs/pdf.min.mjs && ! touch /app/vendor/pdfjs/new.mjs'
+        check "no Playwright or browser" \
+          '! python -c "import playwright" && [ ! -e /ms-playwright ] && [ -z "$$(find / -xdev \( -name chrome -o -name headless_shell -o -name "chromium*" \) -print -quit 2>/dev/null)" ]'
         check "the service imports" 'python -c "import app.main"'
         exit $$failed

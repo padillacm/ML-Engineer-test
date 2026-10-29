@@ -50,6 +50,13 @@ dev = [
     "pymupdf>=1.28,<2",
 ]
 
+[dependency-groups]
+# Browser end-to-end tests of the audit viewer (tests/e2e), installed only by the Dockerfile's
+# `e2e` stage (`uv sync --group e2e`); not a default group, so neither a host `uv sync` nor the
+# test and runtime images install it. The Playwright version pins the Chromium build it
+# installs. 1.64.0 (2026-10-13): the newest release at least two weeks old.
+e2e = ["playwright==1.64.0"]
+
 # torch from the PyTorch CPU wheel index on every platform, so neither the Windows host nor the
 # Linux image pulls CUDA (nvidia-*, triton). `explicit` keeps every other package on PyPI.
 [[tool.uv.index]]
@@ -77,6 +84,7 @@ markers = [
     "qdrant_server: needs a Qdrant server (skipped when QDRANT_URL is unset)",
     "llm_server: needs an OpenAI-compatible LLM server (skipped when LLM_BASE_URL is unset)",
     "deployed_service: smoke test of a running stack over HTTP (skipped when SERVICE_URL is unset)",
+    "e2e: browser test of the audit viewer in the e2e image (skipped without Playwright or VIEWER_URL)",
 ]
 # pytest resets the warning filters for every test, so the adapter's process-wide filter for
 # this one transformers message (see app/adapters/ner/recognizer.py) does not survive between
@@ -139,12 +147,19 @@ module = [
     "app.bootstrap",
     "app.settings",
     "app.observability",
+    "scripts.*",
 ]
 strict = true
 
 [[tool.mypy.overrides]]
 # pypdfium2 ships no py.typed marker; the adapter annotates the values it takes from it.
 module = ["pypdfium2", "pypdfium2.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Playwright is installed only in the e2e image (dependency group `e2e`); on the host its
+# imports in tests/e2e are unresolved.
+module = ["playwright", "playwright.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

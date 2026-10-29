@@ -5,9 +5,14 @@
 #           (intfloat/multilingual-e5-base), each at a pinned revision with sha256-checked files
 #   uv    - the uv binaries only (pinned by digest); copied into `test`, mounted while `runtime`
 #           installs, so the runtime image has no uv
+#   pdfjs - downloads the audit viewer's pdf.js (npm pdfjs-dist, pinned with its sha256 in
+#           deploy/pdfjs.lock) and keeps only the files the lock lists
 #   base  - Python 3.12 on Debian 13 (trixie) + Tesseract 5 with eng/spa/por/fra/deu
 #           + both models at /models (read-only; Hugging Face offline mode)
 #   test    - project + dev dependencies + uv; runs the full pytest suite (incl. `tesseract` tests)
+#   chromium - downloads the Chrome Headless Shell that Playwright pins, checked against its sha256
+#   e2e     - `test` + the `e2e` dependency group (Playwright) + that headless Chromium, for
+#             the browser tests of the audit viewer; the only stage with a browser
 #   runtime - the service: runtime dependencies and `app/` only (no tests, no dev tools, no uv),
 #             non-root, tini as PID 1, Uvicorn on port 8000 with a readiness healthcheck. Last stage, so a
 #             plain `docker build .` builds it; docker-compose.yml runs it with Qdrant.
@@ -195,6 +200,19 @@ RUN chmod -R a=rX /models
 FROM ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 AS uv
 
 
+# pdf.js for the audit viewer (/audit), fetched at build time like the models: the stage runs
+# scripts/fetch_pdfjs.py, the same script as a host run, against the one pin in
+# deploy/pdfjs.lock. It downloads the npm tarball, fails the build unless the tarball and each
+# kept file match their sha256, and writes only the files the lock lists (library, worker, the two
+# JavaScript image decoders used with WebAssembly off, licences; no .wasm).
+# To bump the version: see deploy/pdfjs.lock.
+FROM ${PYTHON_IMAGE} AS pdfjs
+
+COPY deploy/pdfjs.lock scripts/fetch_pdfjs.py /build/
+RUN python -I /build/fetch_pdfjs.py --lock /build/pdfjs.lock --dest /pdfjs \
+    && chmod -R a=rX /pdfjs
+
+
 FROM ${PYTHON_IMAGE} AS base
 
 ARG E5_MODEL_REVISION
@@ -269,6 +287,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --extra dev \
     && chown app:app /app
 
+# pdf.js, read-only and owned by root as in `runtime` (COPY keeps the stage's modes). Late in the
+# stage, so a new pin rebuilds only this layer. PDFJS_DIR names it (the service's default for
+# this layout is the same path).
+COPY --from=pdfjs /pdfjs /app/vendor/pdfjs
+ENV PDFJS_DIR=/app/vendor/pdfjs
+
 USER app
 
 # tini as PID 1 so subprocesses (e.g. tesseract) orphaned by a killed worker are reaped and
@@ -278,6 +302,104 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 # Plain `pytest -q`: the coverage gate is enforced by the pre-push hook on the host.
 # For a coverage report here: docker run --rm docintel-test pytest -q --cov
 CMD ["pytest", "-q"]
+
+
+# The Chrome Headless Shell of the `e2e` stage, fetched and checked like the models: the build of
+# Chrome for Testing that Playwright 1.64.0 pins (browsers.json of its driver: chromium-headless-
+# shell revision 1248, browser version 156.0.8078.4), from the URL Playwright itself downloads it
+# from (its registry's `cftUrl`), checked against a pinned sha256 and unpacked into the layout
+# Playwright looks for: $PLAYWRIGHT_BROWSERS_PATH/chromium_headless_shell-<revision>/
+# chrome-headless-shell-linux64/chrome-headless-shell, with the INSTALLATION_COMPLETE marker that
+# `playwright install` writes. (`playwright install` checks no hash.) The sha256 was taken on
+# 2026-10-29; the archive's executable has the same sha256 as the one `playwright install`
+# had written (docs/BENCHMARKS.md section 20.7).
+# To bump Playwright: take "revision" and "browserVersion" of chromium-headless-shell from
+# playwright/driver/package/browsers.json of the new version, download the archive, put its
+# sha256 here, rebuild and rerun the e2e suite.
+FROM ${PYTHON_IMAGE} AS chromium
+
+ARG CHROMIUM_HEADLESS_SHELL_VERSION=156.0.8078.4
+ARG CHROMIUM_HEADLESS_SHELL_REVISION=1248
+ARG CHROMIUM_HEADLESS_SHELL_SHA256=c3e50596aef52c58f8fda3c6b3411c33d34c88b177b3ed1c2243359fd3b8ba20
+
+RUN python -I - <<'PY'
+import hashlib
+import io
+import os
+import pathlib
+import stat
+import urllib.request
+import zipfile
+
+version = os.environ["CHROMIUM_HEADLESS_SHELL_VERSION"]
+revision = os.environ["CHROMIUM_HEADLESS_SHELL_REVISION"]
+expected = os.environ["CHROMIUM_HEADLESS_SHELL_SHA256"]
+url = f"https://cdn.playwright.dev/builds/cft/{version}/linux64/chrome-headless-shell-linux64.zip"
+top = "chrome-headless-shell-linux64/"
+
+with urllib.request.urlopen(url, timeout=60) as response:
+    data = response.read(512 * 1024 * 1024)
+actual = hashlib.sha256(data).hexdigest()
+if actual != expected:
+    raise SystemExit(f"chrome-headless-shell: sha256 {actual} != pinned {expected}")
+
+dest = pathlib.Path("/ms-playwright") / f"chromium_headless_shell-{revision}"
+with zipfile.ZipFile(io.BytesIO(data)) as archive:
+    for member in archive.infolist():
+        name = member.filename
+        mode = member.external_attr >> 16
+        parts = pathlib.PurePosixPath(name).parts
+        if not name.startswith(top) or name.startswith("/") or ".." in parts:
+            raise SystemExit(f"chrome-headless-shell: unexpected member {name!r}")
+        if stat.S_ISLNK(mode):
+            raise SystemExit(f"chrome-headless-shell: symbolic link {name!r}")
+        target = dest.joinpath(*parts)
+        if member.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(archive.read(member))
+        target.chmod(0o755 if mode & 0o111 else 0o644)
+executable = dest / top / "chrome-headless-shell"
+if not os.access(executable, os.X_OK):
+    raise SystemExit("chrome-headless-shell: the executable is missing")
+(dest / "INSTALLATION_COMPLETE").touch()
+print(f"chrome-headless-shell {version} (revision {revision}): {len(data)} bytes, sha256 ok")
+PY
+
+
+# Browser end-to-end tests of the audit viewer (tests/e2e, docker-compose.e2e.yml): the test
+# image plus the `e2e` dependency group (Playwright for Python, pinned in pyproject.toml and
+# uv.lock) and the Chrome Headless Shell of the `chromium` stage (the build Playwright's headless
+# launch uses; the full browser is not needed and adds 403 MB, docs/BENCHMARKS.md section 20.5).
+# `playwright install-deps` installs only the system libraries it needs, through apt from the
+# same Debian sources (signed by the Debian archive keyring) the `base` stage takes Tesseract
+# from; those package versions are not pinned (KNOWN_LIMITATIONS V6). One launch of the browser
+# as root checks that it starts and records Playwright's DEPENDENCIES_VALIDATED marker.
+# Browsers live in /ms-playwright, readable by the app user; /e2e-artifacts is the tests'
+# output directory, writable by it. Neither `test` nor `runtime` contains Playwright or a browser.
+FROM test AS e2e
+
+USER root
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    E2E_ARTIFACTS=/e2e-artifacts
+
+COPY --from=chromium /ms-playwright /ms-playwright
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --extra dev --group e2e \
+    && playwright install-deps chromium-headless-shell \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -I -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); p.chromium.launch(headless=True).close(); p.stop()" \
+    && test -f /ms-playwright/chromium_headless_shell-1248/DEPENDENCIES_VALIDATED \
+    && chmod -R a+rX,go-w /ms-playwright \
+    && install -d -o app -g app /e2e-artifacts
+
+USER app
+
+# Needs the stack: VIEWER_URL is the page's address (docker-compose.e2e.yml sets it).
+CMD ["pytest", "-q", "-rs", "-p", "no:cacheprovider", "-m", "e2e", "tests/e2e"]
 
 
 FROM base AS runtime
@@ -297,6 +419,11 @@ RUN --mount=type=cache,target=/root/.cache/uv     --mount=from=uv,source=/uv,tar
 # service cannot modify them.
 COPY app/ ./app/
 RUN --mount=type=cache,target=/root/.cache/uv     --mount=from=uv,source=/uv,target=/usr/local/bin/uv     uv sync --frozen --no-dev --compile-bytecode
+
+# The audit viewer's pdf.js (stage `pdfjs`): read-only, owned by root. Late, so a new pin
+# rebuilds only this layer.
+COPY --from=pdfjs /pdfjs /app/vendor/pdfjs
+ENV PDFJS_DIR=/app/vendor/pdfjs
 
 USER app
 

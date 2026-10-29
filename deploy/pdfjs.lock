@@ -1,0 +1,33 @@
+# pdf.js (npm package pdfjs-dist, Apache-2.0), the audit viewer's PDF renderer: the one pin read
+# by the Dockerfile's `pdfjs` stage and scripts/fetch_pdfjs.py (both run that script), by the
+# image hygiene check (docker-compose.smoke.yml) and by tests/viewer. One NAME=value per line,
+# valid sh, no spaces or quotes.
+#
+# 6.4.299 (published 2026-10-03): the newest stable release at least two weeks old (2026-10-29),
+# past CVE-2024-4367 (fixed in 4.2.67) and CVE-2026-16633 (5.6.83 up to 6.2.108, fixed there),
+# the two script-execution advisories of the GitHub advisory database that cover 4.x and later.
+# PDFJS_TARBALL_SHA256 is the sha256 of the npm tarball; the registry's sha512 "integrity" of
+# the same file was checked against it when it was pinned.
+#
+# Kept from the tarball, each with its own sha256 below: the library and its worker
+# (package/build/pdf.min.mjs, pdf.worker.min.mjs) and LICENSE; the JavaScript decoders pdf.js 6
+# imports for CCITT/JBIG2 and JPEG 2000 images when WebAssembly is off (package/wasm/
+# jbig2_nowasm_fallback.js, openjpeg_nowasm_fallback.js; no .wasm file is kept) and the four
+# licences of those decoders (package/wasm/LICENSE_*), which the generated files do not carry.
+#
+# To bump: take "dist.tarball" of the new version from https://registry.npmjs.org/pdfjs-dist,
+# download it, check its sha512 against "dist.integrity", put its sha256 here, then the sha256 of
+# each kept file inside it. Check https://github.com/advisories?query=pdfjs-dist first, then
+# rebuild and rerun the suites.
+PDFJS_VERSION=6.4.299
+PDFJS_TARBALL_URL=https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-6.4.299.tgz
+PDFJS_TARBALL_SHA256=86269b40170eb41740ea05ad2102d71d33de4f122b34eb2f478be0ea7779c415
+PDFJS_LIB_SHA256=57456c8e0c81e46be31174b499ef77f2b9f5ee46d04412ba627320a36755d4c2
+PDFJS_WORKER_SHA256=9536359f1b8367850d485731ca1d5e45c159a7b7a0912325e539937aa21ceb18
+PDFJS_LICENSE_SHA256=0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594
+PDFJS_JBIG2_FALLBACK_SHA256=68686ced624a48c42f84cdaa482ec44b72b0de4dc84a0df903af1fb7b45b5d9a
+PDFJS_OPENJPEG_FALLBACK_SHA256=9047b34b6bc142d85e4b0aa1b08b0b9baad4c6f8b7ac87641b9e8f90eb6fd23e
+PDFJS_LICENSE_JBIG2_SHA256=9e66b7f1b934a28b37f3bc4dac97915de1674271e79a0a88182a18ed9731b4d1
+PDFJS_LICENSE_OPENJPEG_SHA256=a6af136f3e15038a666b61f376612a07d9a4e48cb7c01adbf3e33b3f14ab49b6
+PDFJS_LICENSE_PDFJS_JBIG2_SHA256=aad3cce09842e00e9e11ad5e8fef8cc02fbc3a3768fe2f007443b9cee37aaee5
+PDFJS_LICENSE_PDFJS_OPENJPEG_SHA256=717fc62da03292dbb4dd0c8280bd4ce7bb8550dcf31d772bc93455fb50313425

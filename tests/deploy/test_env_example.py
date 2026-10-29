@@ -61,6 +61,7 @@ def test_retired_variables_are_not_listed() -> None:
 
 def test_the_compose_files_are_found() -> None:
     assert [path.name for path in COMPOSE_FILES] == [
+        "docker-compose.e2e.yml",
         "docker-compose.smoke.yml",
         "docker-compose.test.yml",
         "docker-compose.yml",

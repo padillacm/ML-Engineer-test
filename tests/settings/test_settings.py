@@ -87,6 +87,8 @@ AGREED_DEFAULTS: dict[str, object] = {
     "llm_model": None,
     "llm_api_key": None,
     "llm_api_key_file": None,
+    "audit_viewer_enabled": True,
+    "pdfjs_dir": None,
 }
 
 
@@ -793,3 +795,20 @@ def test_both_key_files_are_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert settings.llm_api_key is not None
     assert settings.llm_api_key.get_secret_value() == "llm-key-0123456789"
     assert settings.qdrant_api_key is None
+
+
+@pytest.mark.usefixtures("required_env")
+def test_the_audit_viewer_settings_are_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUDIT_VIEWER_ENABLED", "false")
+    monkeypatch.setenv("PDFJS_DIR", "/srv/pdfjs")
+
+    settings = load_settings()
+
+    assert (settings.audit_viewer_enabled, settings.pdfjs_dir) == (False, "/srv/pdfjs")
+
+
+@pytest.mark.usefixtures("required_env")
+def test_an_invalid_audit_viewer_flag_names_the_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUDIT_VIEWER_ENABLED", "perhaps")
+
+    assert "AUDIT_VIEWER_ENABLED" in _error()

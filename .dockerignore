@@ -21,6 +21,8 @@ openspec
 .claude
 .idea
 .vscode
+# The host's copy of pdf.js (scripts/fetch_pdfjs.py); the images get theirs from the `pdfjs` stage.
+vendor
 
 # Secrets, in any directory (the example holds placeholders only; the test image's suite checks
 # it). A pattern without **/ matches only at the root of the build context.

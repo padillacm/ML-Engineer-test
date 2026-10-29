@@ -1,0 +1,570 @@
+/* Audit viewer. Box colours (Okabe-Ito blue and a darkened vermillion) sit on the rendered
+   white paper in both colour schemes; each has at least 5:1 contrast with white, and matched
+   and unmatched boxes also differ by line style and label. */
+
+:root {
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --text: #1b1d21;
+  --muted: #545a63;
+  --border: #c9cdd3;
+  --accent: #0b5cad;
+  --focus: #1b1d21;
+  --error-bg: #fdecea;
+  --error-text: #8a1c12;
+  --warning: #8a5a00;
+  --matched: #0072b2;
+  --unmatched: #b04a00;
+  --selected: #000000;
+  --paper-shadow: 0 1px 3px rgb(0 0 0 / 25%);
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171a;
+    --surface: #1f2226;
+    --text: #e8eaed;
+    --muted: #a9b0b9;
+    --border: #3b4048;
+    --accent: #7cb8f2;
+    --focus: #f2f4f7;
+    --error-bg: #3a1714;
+    --error-text: #ffb4a8;
+    --warning: #f0c060;
+    --paper-shadow: 0 1px 4px rgb(0 0 0 / 70%);
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0 16px 16px;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+code,
+pre {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.9em;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* Read by screen readers, not shown (the names' announcement region). */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.masthead h1 {
+  margin: 12px 0 0;
+  font-size: 1.4rem;
+}
+
+.lede,
+.hint {
+  margin: 4px 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.panel {
+  margin: 12px 0;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+/* ---------- request form ---------- */
+
+.request {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 8px 16px;
+  align-items: start;
+}
+
+.names-field,
+.preview {
+  grid-column: 1 / -1;
+}
+
+.field label,
+.toolbar label {
+  display: block;
+  font-weight: 600;
+}
+
+.optional {
+  font-weight: 400;
+  color: var(--muted);
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+input[type="file"],
+select,
+textarea {
+  max-width: 100%;
+}
+
+textarea {
+  width: 100%;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  resize: vertical;
+}
+
+textarea[aria-invalid="true"] {
+  border-color: var(--error-text);
+}
+
+select {
+  padding: 4px 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+button {
+  padding: 6px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+#extract {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--surface);
+  font-weight: 600;
+}
+
+.problems {
+  margin: 4px 0;
+  padding-left: 1.2rem;
+  color: var(--error-text);
+  font-size: 0.9rem;
+}
+
+.problems:empty {
+  display: none;
+}
+
+.preview pre {
+  max-height: 12rem;
+  margin: 6px 0 0;
+  padding: 6px;
+  overflow: auto;
+  background: var(--bg);
+  border-radius: 4px;
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+  align-self: end;
+}
+
+/* ---------- request outcome ---------- */
+
+.outcome p {
+  margin: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.elapsed {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.page-warnings {
+  margin: 6px 0 0;
+  padding-left: 1.2rem;
+  color: var(--warning);
+  font-size: 0.9rem;
+}
+
+#error {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--error-bg);
+  color: var(--error-text);
+  border-radius: 4px;
+}
+
+body[data-state="loading"] #status::before {
+  content: "";
+  display: inline-block;
+  width: 0.8em;
+  height: 0.8em;
+  margin-right: 6px;
+  border: 2px solid var(--muted);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body[data-state="loading"] #status::before {
+    animation: none;
+  }
+}
+
+/* ---------- toolbar ---------- */
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.toolbar label {
+  display: inline;
+}
+
+.toolbar .check {
+  font-weight: 400;
+}
+
+.legend {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.swatch {
+  display: inline-block;
+  width: 1.1em;
+  height: 0.8em;
+  margin: 0 4px 0 8px;
+  vertical-align: -1px;
+  background: #ffffff;
+}
+
+.swatch-matched {
+  border: 2px solid var(--matched);
+}
+
+.swatch-unmatched {
+  border: 2px dashed var(--unmatched);
+}
+
+/* ---------- viewer ---------- */
+
+.viewer {
+  display: grid;
+  grid-template-columns: minmax(15rem, 22rem) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.side {
+  position: sticky;
+  top: 8px;
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.side h2 {
+  margin: 0 0 6px;
+  font-size: 1.05rem;
+}
+
+#name-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.list-page {
+  margin: 10px 0 4px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.list-name {
+  margin: 2px 0;
+}
+
+.list-name button {
+  display: block;
+  width: 100%;
+  padding: 4px 8px;
+  text-align: left;
+  border-left: 4px solid var(--matched);
+}
+
+.list-name[data-matched="false"] button {
+  border-left-style: dashed;
+  border-left-color: var(--unmatched);
+}
+
+.list-name.selected button {
+  border-color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--text);
+}
+
+.item-name {
+  display: block;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.item-match {
+  display: block;
+  color: var(--muted);
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.item-warning {
+  display: block;
+  padding: 2px 8px;
+  color: var(--warning);
+  font-size: 0.85rem;
+}
+
+/* Kept in view at the bottom of the side panel while its list scrolls. */
+.details {
+  position: sticky;
+  bottom: -12px;
+  margin-top: 12px;
+  padding: 8px 0 4px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+
+.details h3 {
+  margin: 0 0 4px;
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.details dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.details dt {
+  color: var(--muted);
+}
+
+.details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.pages {
+  display: flex;
+  flex-direction: column;
+  align-items: safe center;
+  gap: 20px;
+  min-width: 0;
+  padding: 0 4px 24px;
+  overflow-x: auto;
+}
+
+.page-frame {
+  margin: 0;
+  max-width: none;
+}
+
+.page-frame figcaption {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.page-warning {
+  display: block;
+  color: var(--warning);
+}
+
+/* A page and its layers: canvas and overlay share the page's top-left origin. */
+.page {
+  position: relative;
+  background: #ffffff;
+  box-shadow: var(--paper-shadow);
+}
+
+.page-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.page-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* Boxes: outlines drawn just outside the box, so the name inside stays visible. */
+.box {
+  position: absolute;
+  outline: 2px solid var(--matched);
+  outline-offset: 1px;
+  cursor: pointer;
+}
+
+.box[data-matched="false"] {
+  outline: 2px dashed var(--unmatched);
+}
+
+.box-label {
+  position: absolute;
+  bottom: 100%;
+  left: -3px;
+  margin-bottom: 3px;
+  padding: 0 3px;
+  background: var(--matched);
+  color: #ffffff;
+  font-size: 10px;
+  line-height: 13px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* Labels off: shown only on the box under the pointer, focused or selected. */
+.viewer[data-labels="off"] .box:not(:hover, :focus, .selected) .box-label {
+  display: none;
+}
+
+.box[data-matched="false"] .box-label {
+  background: var(--unmatched);
+}
+
+.box:hover,
+.box.selected {
+  background: rgb(255 214 0 / 22%);
+}
+
+.box.selected {
+  outline-width: 3px;
+  outline-color: var(--selected);
+  z-index: 1;
+}
+
+.box.selected .box-label {
+  background: var(--selected);
+}
+
+.box:focus-visible {
+  outline-width: 3px;
+  outline-color: var(--selected);
+  box-shadow: 0 0 0 5px #ffffff;
+  z-index: 2;
+}
+
+/* ---------- narrow screens ---------- */
+
+/* One column: the list (scrolling on its own), the pages, then the details of the selected
+   or focused name, kept at the bottom of the viewport while the pages scroll. */
+@media (max-width: 48rem) {
+  .viewer {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .side {
+    display: contents;
+  }
+
+  .side h2 {
+    margin: 4px 0 0;
+  }
+
+  #name-list {
+    max-height: 40vh;
+    overflow: auto;
+    padding: 0 8px 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+
+  .pages {
+    order: 1;
+    align-items: flex-start;
+  }
+
+  .details {
+    order: 2;
+    position: sticky;
+    bottom: 0;
+    z-index: 3;
+    max-height: 35vh;
+    margin: 0;
+    padding: 8px 12px;
+    overflow: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px 6px 0 0;
+  }
+
+  .details:not([data-box-id]) {
+    display: none;
+  }
+
+  .box-label {
+    font-size: 8px;
+    line-height: 10px;
+  }
+}

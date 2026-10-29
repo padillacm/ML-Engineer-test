@@ -17,6 +17,9 @@ htmlcov/
 # Benchmark scripts: kept locally, not part of the submission (see docs/BENCHMARKS.md)
 benchmarks/
 
+# pdf.js for a host run of the audit viewer (scripts/fetch_pdfjs.py; pinned in deploy/pdfjs.lock)
+/vendor/
+
 # Env / secrets (the example holds placeholders only)
 .env
 .env.*

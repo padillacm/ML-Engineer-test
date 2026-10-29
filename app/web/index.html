@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Audit viewer · Document Intelligence Service</title>
+<link rel="icon" href="/audit/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/audit/static/viewer.css">
+<script type="module" src="/audit/static/app.mjs"></script>
+</head>
+<body data-state="idle">
+<header class="masthead">
+  <h1>Audit viewer</h1>
+  <p class="lede">Draws the boxes returned by <code>POST /api/extract</code> over the PDF rendered in this browser.</p>
+</header>
+
+<form id="extract-form" class="panel request" novalidate>
+  <div class="field">
+    <label for="pdf-file">PDF file</label>
+    <input id="pdf-file" type="file" accept="application/pdf,.pdf">
+  </div>
+  <div class="field names-field">
+    <label for="names">Names to match <span class="optional">(optional)</span></label>
+    <textarea id="names" rows="4" spellcheck="false" aria-describedby="names-hint names-problems" placeholder="Maria Gonzalez&#10;Smith, John"></textarea>
+    <p id="names-hint" class="hint">One per line: “First Last” (the last word is the last name) or “Last, First”. Or paste the JSON array the API takes.</p>
+    <ul id="names-problems" class="problems"></ul>
+    <p id="names-announce" class="visually-hidden" aria-live="polite"></p>
+  </div>
+  <details class="field preview">
+    <summary>JSON sent as <code>names</code></summary>
+    <pre id="names-preview">[]</pre>
+  </details>
+  <div class="field">
+    <label for="language">Language</label>
+    <select id="language">
+      <option value="auto" selected>Auto-detect</option>
+      <option value="en">English (en)</option>
+      <option value="es">Spanish (es)</option>
+      <option value="pt">Portuguese (pt)</option>
+      <option value="fr">French (fr)</option>
+      <option value="de">German (de)</option>
+    </select>
+  </div>
+  <div class="actions">
+    <button id="extract" type="submit" disabled>Extract</button>
+    <button id="cancel" type="button" hidden>Cancel</button>
+  </div>
+</form>
+
+<section class="panel outcome" aria-label="Request">
+  <p><span id="status" role="status" aria-live="polite">Choose a PDF.</span> <span id="elapsed" class="elapsed"></span></p>
+  <p class="request-id">Request id: <code id="request-id">–</code></p>
+  <p id="error" role="alert" hidden></p>
+  <ul id="page-warnings" class="page-warnings" aria-label="Page audit warnings" hidden></ul>
+</section>
+
+<div class="toolbar panel" role="toolbar" aria-label="View">
+  <label for="zoom">Zoom</label>
+  <select id="zoom">
+    <option value="fit" selected>Fit width</option>
+    <option value="1">100 %</option>
+    <option value="1.5">150 %</option>
+    <option value="2">200 %</option>
+  </select>
+  <label for="filter">Show</label>
+  <select id="filter">
+    <option value="all" selected>All names</option>
+    <option value="matched">Matched only</option>
+    <option value="unmatched">Unmatched only</option>
+  </select>
+  <label class="check"><input id="labels" type="checkbox" checked> Box labels</label>
+  <button id="download-json" type="button" disabled>Download JSON</button>
+  <p class="legend"><span class="swatch swatch-matched" aria-hidden="true"></span>matched (solid) <span class="swatch swatch-unmatched" aria-hidden="true"></span>no match (dashed)</p>
+</div>
+
+<main id="viewer" class="viewer" data-filter="all" data-labels="on">
+  <aside class="side" aria-label="Names">
+    <h2>Names by page</h2>
+    <p id="list-empty" class="hint">No extraction yet.</p>
+    <ol id="name-list"></ol>
+    <section id="details" class="details" aria-label="Selected name">
+      <p class="hint">Select, hover or focus a name to see its box.</p>
+    </section>
+  </aside>
+  <section id="pages" class="pages" aria-label="Pages"></section>
+</main>
+</body>
+</html>

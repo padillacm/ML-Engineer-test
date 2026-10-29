@@ -174,6 +174,12 @@ class Settings(BaseSettings):
         float, Field(gt=0, le=MAX_READINESS_TIMEOUT_S, allow_inf_nan=False)
     ] = 2.0
 
+    # Audit viewer (``/audit``): off, its routes are not registered (404). ``pdfjs_dir`` is the
+    # directory of the pinned pdf.js files; ``None`` means ``vendor/pdfjs`` at the project root,
+    # where ``scripts/fetch_pdfjs.py`` puts them (the images set ``/app/vendor/pdfjs``).
+    audit_viewer_enabled: bool = True
+    pdfjs_dir: NonBlank | None = None
+
     # Logging
     log_level: LogLevel = "INFO"
     log_format: LogFormat = "json"

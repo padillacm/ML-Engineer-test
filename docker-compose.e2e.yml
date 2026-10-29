@@ -1,0 +1,69 @@
+# Browser end-to-end tests of the audit viewer against the running stack. Use together with
+# docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.e2e.yml run --rm e2e
+#   docker volume rm docintel_e2e_artifacts
+#
+# Do not use `down -v` here to clean up: on the default project it also deletes the stack's
+# `qdrant_data` volume (the indexed documents), and without `--profile e2e` it leaves
+# `e2e_artifacts` behind. Run the suite under its own project (`-p <name>`) when the stack's
+# data must stay untouched; then `docker compose -p <name> -f docker-compose.yml
+# -f docker-compose.e2e.yml --profile e2e down -v` removes everything of that project.
+#
+# `e2e` builds the `e2e` image stage (the test image plus Playwright and one pinned headless
+# Chromium), starts the stack if it is not running, waits until the app is healthy and runs
+# tests/e2e (marker e2e) in headless Chromium against http://docintel-app:8000/audit over the
+# internal network, which has no route out: the browser can reach nothing but the stack. The
+# tests send the sample PDFs and synthetic PDFs to /api/extract (nothing is ingested).
+#
+# Artefacts (screenshots, the synthetic frame PDF, the responses, junit.xml) are written to
+# /e2e-artifacts, the named volume `e2e_artifacts`. To keep them on the
+# host, mount a folder there instead (on Linux it must be writable by uid 10001):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.e2e.yml run --rm \
+#     -v "$PWD/e2e-artifacts:/e2e-artifacts" e2e
+#
+# The image is named after the test image: ${TEST_IMAGE}-e2e (default docintel-test-e2e).
+
+services:
+  # Chromium sends every request for the host `app` over HTTPS: `app` is a top-level domain on
+  # its HSTS preload list, so http://app:8000 fails with ERR_SSL_PROTOCOL_ERROR. The browser
+  # reaches the service under another name on the same network.
+  app:
+    networks:
+      backend:
+        aliases:
+          - docintel-app
+
+  e2e:
+    profiles: [e2e]
+    build:
+      context: .
+      target: e2e
+    image: ${TEST_IMAGE:-docintel-test}-e2e
+    environment:
+      VIEWER_URL: http://docintel-app:8000/audit
+      E2E_ARTIFACTS: /e2e-artifacts
+    networks:
+      - backend
+    depends_on:
+      app:
+        condition: service_healthy
+    volumes:
+      - e2e_artifacts:/e2e-artifacts
+    # Chromium keeps rendering buffers in /dev/shm; Docker's default is 64 MB.
+    shm_size: 1gb
+    command:
+      - pytest
+      - -q
+      - -rs
+      - -p
+      - no:cacheprovider
+      - -m
+      - e2e
+      - --junitxml=/e2e-artifacts/junit.xml
+      - tests/e2e
+    restart: "no"
+
+volumes:
+  e2e_artifacts:

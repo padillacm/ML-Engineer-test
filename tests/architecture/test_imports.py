@@ -5,6 +5,7 @@ architecture-boundaries).
 The scan is static: dynamic imports (``importlib``, ``__import__``) are not detected.
 """
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,24 @@ def test_api_guard_reports_an_adapter_or_vendor_import(tmp_path: Path) -> None:
         ("router.py", 4, "torch"),
         ("router.py", 5, "app.bootstrap"),
     ]
+
+
+def test_the_viewer_imports_only_the_framework_and_the_http_layer() -> None:
+    """The audit viewer serves files: no use case, adapter, settings or composition root
+    (design D5); the page calls ``/api/extract`` like any client."""
+    viewer = API / "viewer.py"
+    imports = [imp for imp in collect_imports(API, "app.api") if imp.file == viewer]
+    assert imports, "app/api/viewer.py has no imports to check"
+
+    offenders = [
+        imp
+        for imp in imports
+        if not (
+            is_under(imp.module, ("fastapi", "starlette"))
+            or imp.module.split(".", maxsplit=1)[0] in sys.stdlib_module_names
+        )
+    ]
+    assert not offenders, f"app/api/viewer.py has forbidden imports:\n{_report(offenders)}"
 
 
 def test_only_the_composition_root_imports_adapters() -> None:

@@ -6,6 +6,12 @@ settings, configures logging and builds the container (models, clients) once, in
 and closes what it built on shutdown. Tests pass ``settings`` and a ``container`` of fakes,
 which the application uses as given and does not close.
 
+With ``AUDIT_VIEWER_ENABLED`` on, the lifespan also includes the audit viewer's routes
+(``app.api.viewer``: ``/audit``, its files and pdf.js), once the settings are known; off, they
+do not exist and answer 404 like any unknown path. They pass through the same middleware as
+the API (request id, access line, body limit); only their responses carry the viewer's
+Content-Security-Policy.
+
 Middleware, outermost first: request context (request id, access line, unexpected errors),
 then the body-size limit, chosen by path (``body_limit``): ``MAX_UPLOAD_MB`` plus the form
 allowance (``FORM_ALLOWANCE_BYTES``) for the upload routes, ``JSON_BODY_LIMIT_BYTES`` for
@@ -28,6 +34,7 @@ from app.api.health import PROBE_ROUTES
 from app.api.health import router as health_router
 from app.api.middleware import BodyLimitMiddleware, RequestContextMiddleware, route_path
 from app.api.rag import router as rag_router
+from app.api.viewer import pdfjs_directory, viewer_router
 from app.bootstrap import Container, build_container, resolve_concurrency
 from app.observability import configure_logging
 from app.settings import Settings, load_settings
@@ -83,6 +90,8 @@ def create_app(settings: Settings | None = None, container: Container | None = N
             active.busy_wait_s,
             max_questions=active.max_concurrent_questions,
         )
+        if active.audit_viewer_enabled:
+            include_viewer(app, active)
         _logger.info(
             "service started (language model %s)",
             "configured" if services.llm_configured else "not configured",
@@ -106,6 +115,15 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     app.include_router(extract_router)
     app.include_router(rag_router)
     return app
+
+
+def include_viewer(app: FastAPI, settings: Settings) -> None:
+    """Include the audit viewer's routes, once: a second start of the same application (the
+    lifespan runs again) finds them already there (``app.state.viewer_included``)."""
+    if getattr(app.state, "viewer_included", False):
+        return
+    app.include_router(viewer_router(pdfjs_directory(settings.pdfjs_dir)))
+    app.state.viewer_included = True
 
 
 def body_limit(app: FastAPI, scope: Scope) -> int | None:
