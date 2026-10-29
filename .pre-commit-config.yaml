@@ -3,9 +3,10 @@
 #   uv run pre-commit install        # commit-time hooks and the pre-push test run
 #   uv run pre-commit run --all-files
 #   uv run pre-commit run --hook-stage pre-push --all-files   # tests with the coverage gate
-# The dependency audit queries the OSV database (network), so it is a manual-stage hook that
-# never blocks a commit or push:
-#   uv run pre-commit run --hook-stage manual uv-audit --all-files
+# The dependency audit queries the OSV database (network), so it runs with the pre-push hooks
+# (a push has the network), never at commit time; a known vulnerability in uv.lock without an
+# accepted exception fails the push. On its own:
+#   uv run pre-commit run --hook-stage pre-push uv-audit --all-files
 default_install_hook_types: [pre-commit, pre-push]
 default_stages: [pre-commit]
 exclude: ^(\.claude/|benchmarks/|uv\.lock$)
@@ -91,6 +92,6 @@ repos:
         name: uv audit (known vulnerabilities in uv.lock)
         language: system
         entry: uv audit --locked
-        stages: [manual]
+        stages: [pre-push]
         pass_filenames: false
         always_run: true
