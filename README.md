@@ -171,12 +171,15 @@ app/domain/       pure logic: geometry, name matching, chunking, uploads, errors
 app/application/  ports (typing.Protocol) and the use cases that depend on them
 app/adapters/     real OCR / NER / embedding / vector-store / LLM implementations
 app/api/          HTTP edge: thin routers, error mapping, middleware, form parsing (no adapters)
+app/web/          the audit viewer page (HTML, ES modules, one stylesheet; served by app/api/viewer.py)
 app/bootstrap.py  composition root: builds every adapter and use case once from the settings
 app/main.py       create_app(): routers, handlers, middleware, lifespan; `app` is the Uvicorn target
 app/settings.py   every tunable, read from the environment (and .env)
 app/observability.py   JSON/text logs on stdout with the request id
 app/models/schemas.py  the fixed API contract
-tests/            unit and HTTP tests, in-memory fakes (tests/fakes), architecture guard
+tests/            unit and HTTP tests, in-memory fakes (tests/fakes), architecture guard;
+                  tests/e2e: browser tests of the audit viewer (run in the e2e image only)
+deploy/pdfjs.lock, scripts/fetch_pdfjs.py   the pdf.js pin of the audit viewer and its fetcher
 docs/BENCHMARKS.md, benchmarks/   measurements behind the defaults and how to reproduce them
 openspec/         specs and change proposals the implementation follows
 ```
@@ -206,6 +209,7 @@ Required variables are marked **R**; every default is the benchmarked value (`do
 | Vector store | `QDRANT_URL` or `QDRANT_LOCATION` **R** (exactly one; `:memory:` is the embedded, non-persistent mode), `QDRANT_API_KEY` or `QDRANT_API_KEY_FILE` (a file holding the key, as for the language model), `QDRANT_COLLECTION_PREFIX` (chunks), `QDRANT_TIMEOUT_S` (10), `QDRANT_ATTEMPTS` (3), `QDRANT_DEADLINE_S` (20) |
 | Language model | `LLM_BASE_URL` (unset: no model), `LLM_MODEL` (required with a base URL), `LLM_API_KEY`, `LLM_API_KEY_FILE` (unset; a file holding the key, read once at start-up, an empty file meaning no key; not together with `LLM_API_KEY`; compose sets it to its secret), `LLM_CONNECT_TIMEOUT_S` (5), `LLM_READ_TIMEOUT_S` (60), `LLM_TOTAL_TIMEOUT_S` (90), `LLM_ATTEMPTS` (3), `LLM_MAX_TOKENS` (512), `LLM_REASONING_EFFORT` (unset: not sent), `LLM_MAX_TOKENS_FIELD` (`max_tokens`), `LLM_SEND_TEMPERATURE` (true) |
 | Limits | `MAX_UPLOAD_MB` (20), `MAX_NAMES` (1000), `MAX_CONCURRENT_JOBS` (derived*), `MAX_CONCURRENT_QUESTIONS` (16), `BUSY_WAIT_S` (10, at most 300), `READINESS_TIMEOUT_S` (2, at most 30) |
+| Audit viewer | `AUDIT_VIEWER_ENABLED` (true: the page at `/audit` and its files; false: they answer 404, the API is unaffected), `PDFJS_DIR` (unset: `vendor/pdfjs` at the project root, where `uv run python scripts/fetch_pdfjs.py` puts the pinned pdf.js files; the images set `/app/vendor/pdfjs`) |
 | Logging | `LOG_LEVEL` (INFO), `LOG_FORMAT` (json, or text), `LOG_EXCEPTION_MESSAGES` (false; local debugging only: logs exception messages, which may contain document text) |
 
 \* Derived at start-up when unset, from the CPUs available to the process (affinity and a
@@ -249,7 +253,8 @@ If Qdrant is down the service starts too (readiness reports it) and recovers whe
 back. The test image already contains Tesseract and both models; to run the service from the
 runtime image with Qdrant and, optionally, a local model, see "Running the stack" below.
 
-Endpoints (interactive documentation at `/docs`, schema at `/openapi.json`):
+Endpoints (interactive documentation at `/docs`, schema at `/openapi.json`, the audit viewer at
+`/audit`: see "Audit viewer" below):
 
 ```bash
 # Liveness (never touches a dependency) and readiness (200, or 503 naming the failing check)
@@ -487,7 +492,8 @@ With the `gpu` profile, 16 concurrent questions give 128-136 questions/min at p9
 VRAM (device total, including about 1.2 GB taken by the desktop). Start (`up -d --wait`): 13.4-13.6 s
 without the profile, 15.8-19.4 s with it once the model and its compiled GPU kernels are in the
 volume (17.7-17.9 s after the review's changes), about 85 s on the very first start (79.5 s after
-the review; warm-up) plus the model download (about 6 GB). The runtime image is 5.76 GB. Above 16
+the review; warm-up) plus the model download (about 6 GB). The runtime image is 5.76 GB (the audit
+viewer's page and pdf.js add 3.2 MB; the browser tests' image is separate). Above 16
 CPUs the derived values stay at the 16-CPU ones: scale with replicas.
 
 #### Storage and failure modes
@@ -532,10 +538,128 @@ starts the stack if needed, waits until the service is healthy and runs `tests/d
 `deployed_service`) against it: health and readiness, extraction on `sample_pdfs/`, ingestion twice,
 an answerable question (answered with a model, 503 `llm_unavailable` without one), an off-topic
 question, an invalid upload and the request id. It ingests the sample PDFs into the stack's store.
-`hygiene` checks that the runtime image has no tests, development packages, uv or `.env` files, runs as uid 10001
-under tini, is offline for Hugging Face and cannot modify its own code or models. On the host the
+`hygiene` checks that the runtime image has no tests, development packages, uv, `.env` files, Playwright or browser,
+runs as uid 10001 under tini, is offline for Hugging Face, carries exactly the pdf.js files pinned in
+`deploy/pdfjs.lock` (each with its hash) and cannot modify its own code, models or pdf.js files. On the host the
 smoke tests are skipped unless `SERVICE_URL` is set
 (`SERVICE_URL=http://127.0.0.1:8000 uv run pytest -m deployed_service tests/deploy`).
+
+### Audit viewer
+
+`/audit` is a page for checking every box of a real `/api/extract` response by eye. It sends the
+chosen PDF to `POST /api/extract` like any client, renders the same file in the browser with pdf.js
+(an independent renderer, not the service's PDFium) and draws each returned box at its points x the
+zoom scale over the page as displayed (`/Rotate` applied, relative to the crop box, top-left origin,
+no correction in the browser). A box in image pixels, measured from the wrong origin or on a wrong
+frame visibly misses its name.
+
+With the stack running (`docker compose up -d --wait`; the images carry pdf.js), open
+`http://127.0.0.1:8000/audit`. On the host, fetch the pinned pdf.js files once with
+`uv run python scripts/fetch_pdfjs.py` (into `vendor/pdfjs`, git-ignored), start the service as in
+"Running the service" and open the same address. Without the files the page says so and the pdf.js
+URLs answer 503.
+
+- **Inputs:** a PDF; optionally the names to match, one per line as "First Last" (the last word is
+  the last name) or "Last, First", or the JSON array the API takes (the page shows the JSON it sends
+  as `names`, and a line it cannot read blocks the request); the language (auto-detect, en, es, pt,
+  fr, de). While a request runs, these inputs are locked and **Cancel** aborts it (the page returns
+  to idle and says so); the result line names the file it belongs to, with the duration, the request
+  id (`X-Request-ID`) and any error with its `code` and message. Only the start, the end, an error or
+  a cancel are announced to screen readers (the running time is shown but not announced), and a
+  problem in the names is announced once typing pauses.
+- **Boxes:** a name that appears as `extracted_name` in `fuzzy_matches` has a **solid** box labelled
+  "matched", every other name a **dashed** box labelled "no match" (line style and label, not colour
+  alone). Hovering or focusing a box (Tab moves through the boxes in page order) shows the name, its
+  0-based page, the box in points and the best matched name with its score; the box's accessible
+  label says the same.
+- **Side list and controls:** the names grouped by page; selecting one scrolls to its box,
+  highlights it and shows its details. "Show" filters all, matched only or unmatched only; zoom is
+  fit width, 100 %, 150 % or 200 %; "Box labels" hides the labels and keeps the boxes; "Download
+  JSON" saves the raw response, byte for byte, as `extract-<request id>.json`.
+- **Audit warnings:** the response has no page sizes, so each box is checked against the page size
+  pdf.js reports; a box outside the page by more than 1 pt is marked with an audit warning in the
+  list, its details and the status line (KNOWN_LIMITATIONS V3). A page whose frame the two renderers
+  read differently gets a page audit warning (under the status, in its caption, its boxes' details
+  and labels): a `/UserUnit` other than 1, which PDFium ignores, so the service's boxes are in user
+  units and the page is drawn in that frame (V4), and a `/Rotate` that pdf.js reports as something
+  other than a number multiple of 90 (V5).
+- **Long documents:** pages are rendered only near the viewport and released when far from it, while
+  the list and every box exist as soon as the response arrives; a 50-page PDF stays responsive
+  (`docs/BENCHMARKS.md` 20.4).
+- **Privacy and safety:** the PDF is read in the browser and sent only to `/api/extract` of the same
+  origin; the page stores nothing and loads nothing from another host (no CDN). It runs under a
+  strict Content-Security-Policy (scripts, styles, images, workers and connections only from the
+  service, no inline script or style, no framing), writes every value of the response as text, never as HTML
+  (names come from OCR of untrusted documents), and runs pdf.js with WebAssembly off and no eval.
+- **Access:** the page is unauthenticated like the API and published with it on `127.0.0.1` by
+  default. `AUDIT_VIEWER_ENABLED=false` removes it: `/audit` and its files answer 404 and the API is
+  unaffected.
+- **Serving:** the page is at `/audit` (also `/audit/`), its files at `/audit/static/<name>` (only
+  names listed in `app/web` with an allowed extension) and pdf.js at `/audit/vendor/pdfjs/<name>`;
+  every route answers GET and HEAD, any other path under `/audit/` is a 404 (never a redirect). The
+  page is `no-store`; its files are `no-cache` and pdf.js is cached for one day, each with an `ETag`
+  answered by 304 when unchanged.
+
+#### pdf.js
+
+The viewer uses pdf.js **6.4.299** (npm `pdfjs-dist`): the newest stable release at least two weeks
+old when pinned, past CVE-2024-4367 and CVE-2026-16633. The pin lives in one file,
+`deploy/pdfjs.lock`: the version, the tarball URL and its sha256, and the sha256 of each of the nine
+files kept (the library, its worker, the two JavaScript image decoders pdf.js imports for JBIG2/CCITT
+and JPEG 2000 with WebAssembly off, and five licences). `scripts/fetch_pdfjs.py` reads it, refuses any
+mismatch and writes nothing unless every check passes; the Dockerfile's `pdfjs` stage runs the same
+script, and the test and runtime images copy the files read-only to `/app/vendor/pdfjs`
+(`PDFJS_DIR`), so nothing is fetched at run time. Browsers cache them for one day (their URL has no
+version), then revalidate them by `ETag`.
+To bump the version, follow the comment at the top of `deploy/pdfjs.lock` (tarball from
+the npm registry, its sha512 checked, the new hashes, the advisory database), then rebuild and rerun
+the suites. Licences: pdf.js Apache-2.0; the JBIG2 decoder comes from PDFium (BSD-3-Clause) and the
+JPEG 2000 decoder from OpenJPEG (BSD-2-Clause). The five licence files are kept next to the code and
+served at `/audit/vendor/pdfjs/LICENSE*`.
+
+#### Browser tests of the viewer (e2e)
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.e2e.yml run --rm e2e
+```
+
+`e2e` builds the `e2e` image stage, starts the stack if it is not running, waits until the service
+is healthy and runs `tests/e2e` (marker `e2e`) in headless Chromium on the stack's internal network,
+which has no route out. The suite (48 tests, about 50 s once the stack is up) sends the sample PDFs
+and a synthetic PDF with `/Rotate` 90/180/270 pages, offset crop boxes, mixed page sizes, a
+`/UserUnit 2` page and JPEG 2000 and CCITT G4 scans to `/api/extract` (nothing is ingested) and
+checks every box's position against the response within 1 px at several zooms, every rendered
+canvas against its page, the rendered ink inside each box (thresholds calibrated on the 60-document
+sample, `docs/BENCHMARKS.md` 20.3), the page audit warnings, selection, filter, zoom, keyboard,
+labels, what is announced to screen readers, locked inputs and Cancel during a slow request, a
+60-page document (canned response: lazy rendering, no growth over repeated extractions), error
+display and odd error bodies, markup in names shown as text, revalidation with 304, no CSP violation
+and no request other than the page, its files and `/api/extract`. The browser opens `http://docintel-app:8000/audit`, not `http://app:8000`: Chromium
+sends every request for the host `app` over HTTPS (`app` is a top-level domain on its HSTS preload
+list), so `docker-compose.e2e.yml` gives the service the network alias `docintel-app`
+(KNOWN_LIMITATIONS V2).
+
+Artefacts (screenshots, the synthetic frame PDF, the responses, `junit.xml`) go to the named volume
+`e2e_artifacts`. To keep them on the host, mount a folder there instead (as written for a Linux or
+macOS shell and for PowerShell; on Linux the folder must be writable by uid 10001):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.e2e.yml run --rm -v "$PWD/e2e-artifacts:/e2e-artifacts" e2e
+```
+
+`docker compose -f docker-compose.yml -f docker-compose.e2e.yml --profile e2e down` stops the stack;
+with `-v` it also deletes the artefacts volume and the stack's indexed documents
+(`docintel_qdrant_data`); a plain `down -v` without `--profile e2e` keeps the artefacts volume
+(`docker volume rm docintel_e2e_artifacts` removes it alone).
+
+The image (`${TEST_IMAGE}-e2e`, default `docintel-test-e2e`) is test-only: the test image plus
+Playwright 1.64.0 (dependency group `e2e`) and the Chrome Headless Shell that Playwright pins
+(156.0.8078.4), fetched by the Dockerfile's `chromium` stage and checked against its sha256, with the
+system libraries `playwright install-deps` adds through apt (not version-pinned, KNOWN_LIMITATIONS
+V6); 6.80 GB, 1.05 GB over the test image. Neither the test nor the runtime image contains Playwright or a browser
+(`hygiene` checks it), and the runtime image is unchanged by it. On the host the browser tests are
+skipped (no Playwright); their helper tests (`tests/e2e/test_fixtures.py`) run with the rest of the
+suite.
 
 ## Use of AI tools
 

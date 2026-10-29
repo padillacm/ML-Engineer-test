@@ -27,6 +27,8 @@ Environment recorded in the sources (details per section): Windows 11 (10.0.2263
 17. Deployed stack (`add-deployment` task 6.1): image sizes, extract and ingest throughput with CPU limits, sizing, questions, cold start, parity, smoke suite
 18. Embedder pool and concurrency derived from the CPUs (`add-deployment` task 6.2): identical vectors, pool size, questions during ingestion, ingestion through HTTP under CPU quotas, the rule, FIFO hand-off of the NER and embedder slots
 19. Deployed stack after task 6.2 and the FIFO hand-off (`add-deployment` task 6.3): derived defaults at 16, 8 and 4 CPUs, questions during ingestion, cold start with `start_interval`, parity, smoke suite
+20. Audit viewer in headless Chromium (`add-audit-viewer` tasks 5.1-6.2): browser suite, frame tests, ink-check calibration on the 60-document sample with every failure classified, pdf.js against PDFium, viewer performance for 1, 10 and 50 pages, image sizes
+21. Low-confidence OCR names (`add-audit-viewer` task 9): word filter before recognition against rules on candidate names on the 600-document corpus, the adopted rule end to end
 
 ---
 
@@ -777,6 +779,9 @@ Sensitivity (scenario A)
 | Drain after an early 413 | up to 1 MiB over the route limit, at most 5 s | `add-http-api` 10.4 (`tests/api/test_uvicorn_edge.py`) | 900 KiB over: the client reads the 413 (reset without the drain); 5 s is nginx's `lingering_timeout`; far-over bodies are closed after about 1 MiB |
 | Body limits | uploads `MAX_UPLOAD_MB` + 1 MiB + 64 KiB; other routes 64 KiB | `add-http-api` 10.6 and review finding 2 | 1 MiB is the multipart parser's per-field limit (no accepted `names` field is cut); a 2,000-character question fully escaped is about 24 KB |
 | `MAX_UPLOAD_MB`, `MAX_PAGES`, `MAX_NAMES`, name length | 20 MB, 50 pages, 1,000 names, 100 characters | product limits agreed in the `add-http-api` proposal, not optimised; 15.3 checks the worst case | 24 concurrent 50-page jobs (11.6-15.7 MB files): all 200, server peak 2.6-2.9 GB, no OCR timeout |
+| Ink check of the audit viewer's browser tests (`tests/e2e/ink.py`) | a box passes when at least **16 %** of its pixels are ink and the ink share inside is at least **2.1** times that of a ring of equal area around it; ink = 40 grey levels below the median of the box's neighbourhood, table rules excluded | 20.3 (calibration on the 60-document sample, wrong-frame controls) | 763 / 770 boxes matching a truth mention pass (99.1 %), 793 / 805 of all boxes (98.5 %); boxes moved by a wrong frame pass 0.9 % (pixels read as points), 20.3 % (y-flip), 31.4 % (one line down) |
+| Minimum confidence of a name (Dconf) | a candidate name whose every word has a Tesseract confidence below **20** is not reported; the recogniser's text is unchanged | 21 (A: word filter before recognition; B: rules on names; C: end to end) | precision +0.2 [+0.1, +0.3], recall -0.0 [-0.1, +0.0], persons +0.0 on the 600 documents; 14 spurious names and 3 true positives removed, none added; a word filter before recognition costs recall from T = 10 (-0.8 [-1.1, -0.4]) |
+| Browser of the `e2e` image | Playwright 1.64.0's Chrome Headless Shell only (`playwright install --with-deps --only-shell chromium`) | 20.5 | the full Chromium is never launched by the headless tests; leaving it out saves 403 MB (`/ms-playwright` 681 -> 278 MB; image 7.41 -> 6.80 GB) |
 
 ---
 
@@ -1750,3 +1755,197 @@ The app is marked healthy 0.22-0.27 s earlier in every pair; `up -d --wait` itse
 **Start times with the real Ollama** (`up -d --wait`, project `fx8g`): first start on the new volume (model present, no compiled kernels) 79.5 s, of which the warm-up prompt 63.6 s (85.5 s in 19.4); after `down` without `-v`, twice: 17.9 and 17.7 s, warm-up 3.1 and 2.7 s (15.8-19.4 s in 19.4). Without the profile: 9.9 s for one run on the fake stack's copy (13.4-13.6 s in 19.4; one run, not a comparison).
 
 **Smoke suite** from the copy: without the profile **12 passed, 2 skipped** (answerable questions: no model); with `COMPOSE_PROFILES=gpu` and the real model **12 passed, 2 skipped** (the "without a model" variants), and a direct question answered `The research department produced 23 peer-reviewed publications in fiscal year 2024.`
+
+---
+
+## 20. Audit viewer in headless Chromium (`add-audit-viewer` tasks 5.1-6.2, design D3, D4, D7, D8)
+
+Tests: `tests/e2e/` (browser suite, marker `e2e`, run by `docker-compose.e2e.yml`; the helpers `frames.py`, `ink.py` and `viewer.py`, and `test_fixtures.py`, which checks the helpers without a browser on the host and in the test image). Scripts: `benchmarks/viewer_e2e/` (local, not committed: `calib.py` and `perf.py` run in the `e2e` image on the stack's network, `analyze.py`, `render_diff.py` and `perf_table.py` on the host, `confcheck/conf.py` in the test image, `run.sh` the driver). Raw outputs (every page canvas pdf.js rendered, per-box records, crops of the failures, per-run timings, the suite's screenshots and responses) are in `benchmarks/viewer_e2e/out/` (local).
+
+### 20.1 Method and environment
+
+**Stack.** A copy of the repository without `.env` (`benchmarks/viewer_e2e/stack/`), project `v7e`, `BACKEND_NETWORK_PREFIX=10.213.71`; images built from that tree on 2026-10-29: `docintel:v7e` (runtime), `docintel-test:v7e` (test) and `docintel-test:v7e-e2e` (the `e2e` stage). No language model, no `.env`, every setting at its default. Host as in sections 17-19 (Windows 11, Docker Desktop 29.9.2 with Compose 5.6.1, Ryzen 7 7700X, WSL2 VM with 16 CPUs); nothing else ran during the timing runs.
+
+**Browser.** Playwright 1.64.0 (sync API) with Chrome Headless Shell 156.0.8078.4 (`chromium-headless-shell` build 1248), `--disable-dev-shm-usage`, `shm_size: 1gb`, viewport 1280 x 900, `deviceScaleFactor` 1 (2 for one test), pdf.js 6.4.299 from the image. The browser container is only on the internal `backend` network, so it can reach nothing but the stack. Chromium cannot open `http://app:8000`: `app` is a top-level domain on its HSTS preload list, so the request goes out as HTTPS and fails with `ERR_SSL_PROTOCOL_ERROR`; `docker-compose.e2e.yml` gives the app the network alias `docintel-app` and the page is opened at `http://docintel-app:8000/audit` (KNOWN_LIMITATIONS V2).
+
+**What a test reads.** The response JSON is captured from the network (`page.expect_response`), and every expected position is computed from it, not from the box elements' data attributes: a box element's rectangle relative to its page element must equal `(x, y, width, height) x data-scale` within 1 CSS pixel, its page index must be the response's `page_number`, and the overlay must sit at the page's 0,0; at zoom 2 the scale must be exactly 2, at `fit` it must make the widest page fill the pages column. The ink check (20.3) reads the page's `canvas.page-canvas` through `toDataURL`, converted to grey, and maps points to canvas pixels by the canvas size over the page's CSS size times the scale, so the device pixel ratio is accounted for. Every session records CSP violations (a `securitypolicyviolation` listener added by `add_init_script` before any page script), console errors, page errors, dialogs and every request (method and URL) of its browser context; `Session.check()` fails on any CSP violation, dialog or page error, any console error (only Chromium's `Failed to load resource` line is allowed, and only in tests that expect an HTTP error or a network failure), and any request other than `GET /audit`, `GET /audit/static/<file>`, `GET /audit/vendor/pdfjs/<file>` and `POST /api/extract` on the app's origin without a query (in-memory `blob:` and `data:` URLs aside).
+
+### 20.2 Browser suite (task 5.1) and frame tests (task 5.2)
+
+`docker compose -p v7e -f docker-compose.yml -f docker-compose.e2e.yml run --rm e2e` from the copy, image rebuilt from the final tree (tests not mounted): **35 passed** (the 8 helper tests are deselected by `-m e2e`; they run in the test image's suite and on the host), 25-27 s per run, two runs with the same result. `test_fixtures.py`: 8 passed on the host.
+
+| module | tests | what they check |
+|---|---|---|
+| `test_frames.py` | 11 | frame PDF through the real service: every expected name found once with its box on its glyphs (IoU >= 0.5 with the box the fixture drew) and no name from outside a crop box; pdf.js page sizes equal the displayed sizes; matched / unmatched marks; position at `fit` and `2`; ink check at zoom 2; no out-of-page warning; at `deviceScaleFactor` 2 position at `fit` and `1.5` and ink at `1.5` (canvas twice the CSS size); the three sample PDFs: position at `fit` and `2` and ink |
+| `test_behaviour.py` | 12 | response drawn with its request id and status; a name on page 3 selected in the list: box and item highlighted (`selected`, `aria-current`), details shown, box inside the viewport; filter `matched` / `unmatched` / `all`: visible boxes, list items and page headings; zoom `1`, `1.5`, `2`, `fit` keeps every box aligned; Tab from the last list button visits every box in page order, each focus shows its details, every `aria-label` names the name, page, match and score (or "no match") and the box in points; hover shows the details; the download equals the response body byte for byte and is named after the request id |
+| `test_errors_and_safety.py` | 12 | a text file: 415 `not_a_pdf` shown with `data-code`, message and request id, no page drawn; 20.5 MiB: 413 `too_large`; a blank name the API rejects: `invalid_names`; three invalid names texts (broken JSON, an object, a single word) block the button and even a forced form submit sends nothing; 503 with a JSON body (route interception): code, message, request id and `HTTP 503`; 502 with an HTML body: `HTTP 502`, no code, its markup not rendered, download disabled; a network failure: "Network error"; a canned response whose names and match contain `<img onerror>`, `<script>` and `<svg onload>`: shown as literal text in the list, details and `aria-label`, no `img`, `svg`, `b` or `script` element created in the body, no dialog, no script run; a full audit with `scrollAllPages()` makes only the allowed requests and the page carries its CSP; control: an inline script injected into the page is refused and the listener records the `script-src` violation |
+
+**Frame PDF** (`tests/e2e/frames.py`, built in the test with Pillow and pypdfium2, 390 KB, seven image-only pages at 150 DPI, the Aileron font at 20 pt). Each page is drawn upright, its pixels are turned into the page's user space and `/Rotate` turns them back, as a scanner that flags a sideways page produces it; the crop-box pages carry an image of the whole media box with a further name in the cropped-off margin. (The page agent's `benchmarks/viewer_dev/make_frames.py` had set `/Rotate` on upright content, so the displayed text was sideways or upside down and the service found no names on 180 / 270: that is KNOWN_LIMITATIONS O3, OCR without orientation detection, not a frame error.) Names list: the first name of every page plus a decoy, so each page has one matched and one unmatched box.
+
+| page | frame | displayed size (pt) | names found | IoU with the drawn glyph box | ink: inside / ratio (zoom 2) |
+|---|---|---|---|---|---|
+| 0 | A4, `/Rotate 0` | 595.2 x 841.9 | Maria Gonzalez, John Smith | 0.96, 0.93 | 0.37 / 97, 0.35 / 68 |
+| 1 | A4 scanned sideways, `/Rotate 90` (media box 841.9 x 595.2) | 595.2 x 841.9 | Hans Weber, Laura Chen | 0.96, 0.92 | 0.36 / 64, 0.33 / 39 |
+| 2 | Letter upside down, `/Rotate 180` | 612 x 792 | Pedro Alvarez, Emma Brown | 0.96, 0.95 | 0.35 / 86, 0.38 / 223 |
+| 3 | A4 scanned sideways, `/Rotate 270` | 595.2 x 841.9 | Lucas Martin, Sofia Rossi | 0.94, 0.95 | 0.38 / 77, 0.37 / 59 |
+| 4 | Letter, crop box `[44.2 51.8 656.2 843.8]` in a 684 x 915.8 media box | 612 x 792 | David Miller, Anna Kowalski (not "Oliver Grant", outside the crop box) | 0.96, 0.94 | 0.38 / 61, 0.36 / 79 |
+| 5 | A5 landscape | 595.2 x 420 | Peter Novak, Julia Fischer | 0.97, 0.99 | 0.37 / 77, 0.32 / 77 |
+| 6 | A4 sideways with a crop box, `/Rotate 90`, crop `[72 44.2 913.9 639.4]` | 595.2 x 841.9 | Carlos Diaz, Nora Jensen (not "Victor Hale") | 0.94, 0.94 | 0.35 / 18, 0.38 / 25 |
+
+All 14 expected names found, nothing else; every box within 1 px of points x scale at `fit`, `1`, `1.5` and `2` and at `deviceScaleFactor` 2; every box passes the ink check (lowest inside share 0.32, lowest ratio 18; at `deviceScaleFactor` 2 and zoom 1.5: 0.33 and 50); pdf.js reports the displayed sizes the fixture recorded, which are also PDFium's `get_size()` (`test_fixtures.py`). Sample PDFs: memo 8, minutes 23, report 24 boxes, all at position and passing (inside >= 0.39, ratio >= 11).
+
+### 20.3 Ink check: calibration on the 60-document sample (task 6.1)
+
+**Run.** The 60 documents of the seed-0 calibration sample (102 pages; 25 clean, 20 medium, 15 hard) through the viewer, one fresh browser context each, no names and no language hint: `POST /api/extract` 2.4-5.3 s per document (median 4.0 s). The position check at `fit` and `2` found **0** errors in 805 boxes, every session passed `check()`. At zoom 2 every page's canvas was saved (2 canvas pixels per point) and measured offline with `tests/e2e/ink.py`, so every variant below is measured on the same pixels. Each response box is labelled by the corpus truth: **truth-matched** when its IoU with a truth mention box (or the mention's box with its title) is at least 0.5, the corpus's criterion (770 boxes), else unmatched (35). Wrong-frame controls, on each truth-matched box: `pixels` (the box read as 200-DPI pixels taken for points, x 2.78), `yflip` (bottom-left origin taken for top-left), `down` (1.5 box heights lower, about one line), `right` (one box width plus 3 pt to the right, the next word).
+
+**The metric** (design D7 item 2): share of ink pixels inside the box and in a ring of the same area around it (margin `m` with `(w + 2m)(h + 2m) = 2wh`, clamped to the page); a box passes when `inside >= T_in` and `inside / ring >= R`. Three definitions of "ink" were measured:
+
+| ink definition | T_in, R by the rule below | truth-matched passing | `pixels` | `yflip` | `down` | `right` |
+|---|---|---|---|---|---|---|
+| darker than the midpoint between the page's median and its 0.1th percentile | 0.00, 1.5 | 99.4 % | 86.8 % | 56.2 % | 53.6 % | 76.2 % |
+| 40 grey levels below the median of the box's neighbourhood (box, ring and one box height) | 0.16, 1.4 | 99.5 % | 1.6 % | 24.2 % | 36.5 % | 57.8 % |
+| the same, without table rules (**adopted**) | **0.16, 2.1** | **99.1 %** | **0.9 %** | **20.3 %** | **31.4 %** | 56.5 % |
+
+The page-wide level failed on degraded scans: black table rules, dark scan edges and salt-and-pepper noise set the page's darkest levels, so faint grey text (Courier lists on `hard` pages, 8-pt grey footers) did not count as ink and the inside share of correct boxes went down to 0.000; with that level no inside threshold separates anything. The local level fixed the inside share (truth-matched minimum 0.14), but on forms and tables the cell rules fell into the ring. Rules are now dark runs longer than the box plus one margin along a row, or longer than twice its height along a column, found after spreading the mask over 2 rows (the corpus pages are skewed by up to 2 degrees, so a rule's run in a single row is short) and bridging one-pixel gaps; with rules excluded the truth-matched ratio's 1st percentile rose from 1.54 to 2.16.
+
+**Threshold rule.** The largest `T_in` (to 0.01) that keeps 99.5 % of the truth-matched boxes on the inside share alone (0.5th percentile 0.170 -> **0.16**), then the largest `R` (to 0.1) that keeps at least 99 % of them passing both (**2.1**). A grid of `T_in` 0.00-0.20 gives the same `R` at every value; 0.16 rejects most of the `pixels` control (2.6 % pass at `T_in` 0.02, 0.9 % at 0.16).
+
+| population | n | inside p0.5 / p50 | ring p50 / p95 | ratio p1 / p50 | passing at 0.16 / 2.1 |
+|---|---|---|---|---|---|
+| response boxes, truth-matched | 770 | 0.170 / 0.407 | 0.006 / 0.046 | 2.16 / 66 | 763 (99.1 %) |
+| response boxes, unmatched | 35 | 0.090 / 0.377 | 0.015 / 0.104 | 1.01 / 25 | 30 (85.7 %) |
+| all response boxes | 805 | | | | **793 (98.5 %)**; clean 326 / 327, medium 335 / 338, hard 132 / 140 |
+| corpus truth boxes (font-metric, 1.37 x the ink height) | 844 | 0.130 / 0.307 | 0.013 / 0.127 | 1.20 / 26 | 796 (94.3 %) |
+| controls `pixels` / `yflip` / `down` / `right` | 770 each | | | | 7 (0.9 %) / 156 (20.3 %) / 242 (31.4 %) / 435 (56.5 %) |
+
+The check catches a wrong unit or origin on almost every box of a page, and therefore every page of a wrong frame; it cannot tell a box from one moved onto a neighbouring word or line of the same text, which the position check and the frame tests with known glyph boxes cover (KNOWN_LIMITATIONS V1).
+
+**Every failing box** (12 of 805), each inspected on its crop (`out/calib/fails_00.png`):
+
+| class | n | boxes (document, page, name, IoU with truth, inside / ratio) |
+|---|---|---|
+| false-positive name, no name under the box | 3 | `en_040_kyc` p1 "VACANA WAV AN A" (0.00; 0.11 / 1.6) and `pt_089_minutes` p1 "LAY NAL" (0.00; 0.10 / 1.5): two signature scribbles read as letters and tagged as a person, the box spanning both signatures; `pt_070_minutes` p0 "Co Jrrao" (0.00; 0.09 / 10.0): noise in an empty shaded table header read as words |
+| OCR box too wide or too tall | 3 | `es_021_memo` p1 "karina Ávila" (0.22; 0.15 / 1.0): a noise word "a" (Tesseract confidence 13) in the empty cell to the left joined the name, so the box spans the blank cell; `pt_098_kyc` p0 "Pereirada Costa" (0.40; 0.16 / 1.0): box reaching the row below, "Luiza" left out; `pt_098_kyc` p0 "Ale andra Garcia" (0.55; 0.17 / 1.0): box reaching the line above |
+| correct box, neighbouring lines or accents in the ring of a dense `hard`/`medium` page | 6 | `en_045_kyc` p0 "Fernandes, Pedro Lucas" (0.73; 0.16 / 1.6), p1 "William McAllister" (0.68; 0.17 / 1.7) and "Ramos, Cindy" (0.85; 0.14 / 1.1): faint thin Courier list lines 1.3 box heights apart; `en_089_kyc` p0 "Sean Cook" (0.62; 0.19 / 1.9); `es_021_memo` p1 "Alfonso de la Cruz Soto" (0.73; 0.22 / 1.6): table rows above and below; `pt_089_minutes` p0 "INÊS CONCEIÇÃO" (0.95; 0.39 / 1.8): capital accents and cedilla of the line and the lines around it |
+| name split across lines | 0 | |
+| rendering difference between pdf.js and PDFium | 0 | see below |
+
+**pdf.js against PDFium.** The 100 pages with boxes rendered by PDFium (the service's renderer) at the canvas's size, against pdf.js's canvas: mean absolute difference per page median 0.66, maximum 1.65 grey levels, no pixel differs by more than 32 levels on any page; the ink decision is the same for 804 of 805 boxes, the exception (`de_058_memo` "ANDRES FERNÁNDEZ GOMEZ", ratio 2.11 against 2.09) sits on the threshold (`render_diff.py`).
+
+**Fixable causes (measured and partly fixed in section 21).** The three false positives and the too-wide box come from low-confidence OCR words: Tesseract's confidence under the boxes (the service's rendering, flattening and command, `confcheck/conf.py`) is "VACANA" 0, "LAY" 0, "Co" 18, "Jrrao" 9 and the stray "a" 13, while under 5 % of each page's words are below 50 (24 % on the `hard` `es_021_memo` page). The service keeps every word with a confidence of 0 or more (`app/adapters/ocr/tesseract.py`, `parse_tsv`); dropping words below a minimum confidence before NER, or not letting them start or extend a name span, would remove these four, but its cost in recall on real low-confidence names is unmeasured: it needs the paired name-recall / precision comparison on the 600-document corpus (sections 4.5 and 5.3) before adoption. Section 21 made it: dropping words costs recall, and the adopted rule (a name whose every word is below 20 is not reported) removes "Co Jrrao" but not the two signatures or the stray "a" (KNOWN_LIMITATIONS N9). The six correct boxes in class 3 are a limit of the ink measure, not of the service (KNOWN_LIMITATIONS V1).
+
+### 20.4 Viewer performance in headless Chromium (task 6.2)
+
+`perf.py`, three runs per size, each in a fresh browser context of one browser process; PDFs made of the sample's pages concatenated with pypdfium2 (1 page: 232 KB, 18 boxes; 10 pages: 2.5 MB, 85 boxes; 50 pages: 13.4 MB, 444 boxes); zoom `fit` (scale about 1.5) unless stated. Times from the page's own clock: navigation timing for DOMContentLoaded, the `ready` promise, the `/api/extract` resource timing (start to response end: the extraction, reported separately), then a `MutationObserver` for `body[data-state=done]` (every box element and list item is in the DOM) and the first `data-rendered="true"`. Memory: CDP `Performance.getMetrics` (JS heap of the page) and the PSS of every Chromium process from `/proc/<pid>/smaps_rollup` (after `scrollAllPages()`, and its peak sampled every 50 ms during it; the idle browser is 103 MB). Render time: for each of the first 10 pages, scrolled into view, the time from a zoom change to that page's `data-rendered="true"` at the new scale, to 100 % and to 200 %. Median (range) of the three runs.
+
+| measure | 1 page | 10 pages | 50 pages |
+|---|---|---|---|
+| DOMContentLoaded (ms) | 23.1 (22.7-27.3) | 16.8 (15.6-24.3) | 24.1 (23.8-24.3) |
+| viewer ready, pdf.js loaded (ms) | 46.9 (42.9-48.2) | 36.8 (34.3-43.6) | 44.8 (43.0-44.8) |
+| **extraction**, `/api/extract` (ms, server and transfer) | 3,530 (3,519-3,549) | 8,438 (8,415-8,532) | 42,506 (42,170-42,799) |
+| all boxes in the DOM, after the response (ms) | 3.8 (3.6-4.4) | 6.3 (6.2-6.4) | 21.1 (21.0-21.5) |
+| first page rendered, after the response (ms) | 62.4 (51.7-66.0) | 62.7 (55.9-63.0) | 79.8 (77.5-80.3) |
+| `scrollAllPages()` total (ms) | 0.1 (already rendered) | 360 (343-360) | 2,195 (2,178-2,209) |
+| ... per page (ms) | | 36.0 (34.3-36.0) | 43.9 (43.6-44.2) |
+| page rendered after a zoom change to 100 % (ms, median of 10 pages) | 25.2 (24.4-25.9) | 30.0 (29.3-33.1) | 32.0 (30.2-32.5) |
+| ... to 200 % (ms) | 31.3 (31.2-31.3) | 43.9 (42.9-47.4) | 54.0 (50.4-58.1) |
+| JS heap used / total after the scroll (MB) | 7.5 / 11.2 | 6.3 / 31.5 | 21.1 / 23.7 |
+| Chromium PSS after the scroll (MB) | 280 (279-281) | 419 (419-427) | 541 (458-554) |
+| Chromium PSS peak during the scroll (MB) | 272 (270-272) | 473 (443-481) | 554 (548-564) |
+| pages holding a rendered canvas after the scroll | 1 | 4 | 4 |
+
+Over all 63 page renders: 100 % median 30.2 ms (18.8-313.4), 200 % median 48.6 ms (29.1-65.1). The slow 100 % renders are always the same two pages (pages 6 and 9 of the concatenation: 106-144 and 180-313 ms) while at 200 % they take 55-65 ms; at 100 % more pages are near the viewport and render at the same time, which is the likely cause (not isolated). The viewer adds well under 0.1 s to a response that takes 3.5-43 s to compute; the lazy rendering keeps four canvases alive whatever the length, so the 50-page document costs about 120 MB more than the 10-page one (box elements, pdf.js's parsed document and the worker), not 40 more canvases. A zoom change re-renders the page in view and its near neighbours at once, so the per-page times include that concurrency.
+
+### 20.5 Image sizes
+
+`docker image inspect` sizes of the images built from this tree; the `e2e` stage before the change is `docintel-e2e:v7a`, built earlier the same day from the tree before it (full `playwright install --with-deps chromium`).
+
+| image | size | difference |
+|---|---|---|
+| `docintel` (runtime) | 5,764,346,535 B (5.76 GB) | not changed by these tasks (the `e2e` stage is not in it); `docintel:v7a` from the earlier tree 5,764,324,123 B |
+| `docintel-test` (test) | 5,753,166,624 B (5.75 GB) | |
+| `e2e`, full Chromium and headless shell (before) | 7,412,150,086 B (7.41 GB) | +1.66 GB over the test image; layer 1.18 GB; `/ms-playwright` 681 MB (`chromium-1248` 403 MB, `chromium_headless_shell-1248` 273 MB, `ffmpeg` 5 MB) |
+| `e2e`, `--only-shell` (after) | 6,801,559,338 B (6.80 GB) | +1.05 GB over the test image; layer 758 MB: `/ms-playwright` 278 MB, Playwright's Python package 137 MB, the system libraries and fonts of `--with-deps` the rest |
+| `e2e`, headless shell from the `chromium` stage, sha256-pinned (review fixes, 20.7; adopted) | 6,800,474,090 B (6.80 GB) | +1.05 GB over the test image (`docintel-test:fx7` 5,753,256,021 B); `/ms-playwright` 285,084,594 B in its own 286 MB layer (the headless shell only: no ffmpeg, which only video recording uses), Playwright's Python package and the 73 apt packages of `playwright install-deps` 471 MB |
+
+The headless shell is what Playwright's `chromium.launch(headless=True)` starts, so the full browser was never used by the tests; leaving it out saves 403 MB of browser and 0.61 GB of image. The runtime and test images contain neither Playwright nor a browser (hygiene check). The runtime image of the review fixes (`docintel:fx7`) is 5,764,357,319 B.
+
+### 20.6 Findings and caveats
+
+- **Frames:** with upright displayed text the service finds every name on `/Rotate` 90, 180 and 270 pages, on an offset crop box (alone and with `/Rotate 90`) and on mixed page sizes, with boxes at IoU 0.92-0.99 of the drawn glyphs, and pdf.js draws them on the glyphs. No frame error was found.
+- **No page bug was found**; `app/web/` is unchanged by these tasks.
+- **Ink-check limits:** it proves that a box sits on ink in the page's displayed frame, not that the ink is the name: 56.5 % of boxes moved onto the next word still pass (KNOWN_LIMITATIONS V1), and 0.9 % of the truth-matched boxes fail (7 of 770: 6 correct boxes on dense degraded pages, where neighbouring lines fall in the ring, and one OCR box reaching the line above).
+- **False positives** from low-confidence OCR words (signatures, noise in shaded cells): measured in section 21; the adopted rule removes names read with a confidence below 20 throughout (14 spurious names on the corpus, "Co Jrrao" among the calibration cases); signatures with one word read above 20 remain (KNOWN_LIMITATIONS N9).
+- One host, one browser build, synthetic corpus pages only; the timings are for a background-free machine and headless rendering (no GPU compositing), so a desktop browser will differ.
+- **No hold-out set for the ink thresholds:** `T_in` 0.16 and `R` 2.1 were chosen on the same 770 truth-matched boxes of the 60-document sample whose pass share they produce (99.1 %), so that share is an in-sample figure. The pages not used for the choice keep a wide margin: the frame pages' lowest inside share and ratio were 0.32 and 18 (20.2; with the review's three new pages 0.29 and 18, 20.7) and the sample PDFs' 0.39 and 11, against thresholds of 0.16 and 2.1.
+
+### 20.7 Review fixes (`add-audit-viewer` task 8.1)
+
+The independent review's findings fixed in the viewer, its routes, its tests and the e2e image, and verified here. A copy of the tree without `.env` (`benchmarks/fx7/stack/`, local), projects `fx7t` (test suite) and `fx7s` (stack), `BACKEND_NETWORK_PREFIX=10.213.77`, `APP_PORT=18087`, no language model; images `docintel:fx7`, `docintel-test:fx7` and `docintel-test:fx7-e2e` built from it on 2026-10-29. The reviewer's probes (`benchmarks/review7/scripts`, local) were rerun against this stack (`benchmarks/fx7/review/out/probe`).
+
+| finding | fix | verified by |
+|---|---|---|
+| `/UserUnit` (pdf.js applies it, PDFium ignores it) | pypdfium2 cannot read it (no page-dictionary call; every size and box call reports user units), so the service side is left as KNOWN_LIMITATIONS V4. The viewer renders each page at the zoom scale divided by `page.userUnit` (the service's frame) and shows a page audit warning | the reviewer's `userunit2.pdf`: ink 0.000 on both boxes before, 0.470 / 0.419 (ratios 118 / 12) after, with the warning; a `/UserUnit 2` page in the frame PDF (A5 landscape in user units): both names found (IoU 0.95, 0.97), at position, ink 0.378 / 0.351, exactly one page warning with the expected text, `data-user-unit` 2 |
+| `/Rotate` not a number multiple of 90 | pdf.js passes a non-number through as `page.rotate`: the viewer flags it; `135` and `100` (pdf.js 0, PDFium 90) cannot be seen (KNOWN_LIMITATIONS V5) | e2e: a `/Rotate (90)` page is flagged (PDFium reads 0, pdf.js 90); the reviewer's `rotate135.pdf` still misses (ink 0.000, no warning), as recorded |
+| no test of the 50-page scenario | e2e: the frame PDF six times over (60 pages, 120 names), canned response | every list item and box present at once (at most 8 pages rendered), `scrollAllPages()` rendered all 60 pages in 2.12-2.16 s (two runs), 4 canvases hold pixels afterwards; four extractions in one page: DOM nodes 1,895 and JS listeners 44 after every run (forced GC), JS heap 3.23, 3.30, 3.32, 3.34 MB |
+| canvas size not checked | every rendered canvas's rectangle equals its page element's within 1 px, at zoom 2, at `deviceScaleFactor` 2 (zoom 1.5) and on the sample PDFs | e2e ink tests |
+| JPX and CCITT never exercised | a JPEG 2000 page and a CCITT G4 page in the frame PDF | names found (IoU 0.94-0.97), ink 0.352 / 0.359 (JPX) and 0.289 / 0.353 (CCITT; bitonal, the lowest of the suite), `openjpeg_nowasm_fallback.js` and `jbig2_nowasm_fallback.js` requested, no CSP violation |
+| the 250 ms timer announced | the live status is set at start, end, error and cancel only; the time ticks in `#elapsed`, outside any live region; the names' problems are shown at once and announced in a visually hidden polite region 1 s after typing stops, when they change | e2e: during a 1.3 s held request the status region changed twice (start, end) while `#elapsed` ticked; typing "Madonna" announced nothing until the pause, then once; completing the name announced "Names: no problems" |
+| inputs live while loading, no cancel | file, names and language disabled while loading, the result line names the file, Cancel (`AbortController`) returns to idle with "Cancelled after ..." | e2e: all four controls disabled during a held request, the result names `first.pdf` after a second file was set; cancel: idle, no page or box, controls enabled, a late answer ignored, a new extraction works |
+| CSP `img-src 'self' blob: data:` | `img-src 'self'` | the reviewer's strict-CSP probe (frames, memo, JPX, CCITT) and text probe (standard and embedded fonts): no violation; the whole e2e suite: no violation |
+| no HEAD, `/audit/` redirect built from `Host` | GET and HEAD on every viewer route; the page also at `/audit/`; any other `/audit/...` path a 404 with the viewer's headers | `tests/viewer/test_routes.py`: HEAD has GET's headers and no body; with `Host: attacker.example`, `/audit/`, `/audit/static`, `/audit/vendor/pdfjs` and others get no `Location`. `redirect_slashes` stays on: it also serves the API (`POST /api/extract/` is redirected), outside the viewer |
+| no conditional requests | `If-None-Match` (strong, weak, lists, `*`) answered 304 with the same headers on every viewer file | route tests; e2e: a reload gets 304 for every `/audit/static/` file and 200 for the `no-store` page |
+| 422 `detail` and `request_id` of unexpected types | `Array.isArray` for `detail` and `loc`, text only from strings (other values as JSON), `request_id` only a string or finite number | e2e, canned 422 with mixed entries and a numeric id: "invalid_names: 5; plain text; body.3.names: bad", id 12345, download `extract-12345.json`; canned 500 with an object `detail` and id: "HTTP 500", no id shown, download `extract-response.json`; no page error |
+| `deploy/pdfjs.lock` parsing, download deadline | values limited to letters, digits and `. _ : / -`; unknown or repeated names refused; a 300 s deadline over the whole download (read in pieces with `read1`); `http.client` errors reported cleanly | `tests/viewer/test_fetch_pdfjs.py` (40 tests) |
+| e2e browser not hash-checked | the `chromium` stage downloads Chrome Headless Shell 156.0.8078.4 (`chrome-headless-shell-linux64.zip`, 125,797,539 B, sha256 `c3e50596...ba20`) from Playwright's own CDN path, checks it and unpacks it into Playwright's layout; the `e2e` stage runs only `playwright install-deps` and one launch | the archive's executable has the sha256 of the one `playwright install` had written (`4fa61f0b...f9d6`), 285,084,594 B in both; the build's launch check passed; e2e `test_the_installed_browser_is_the_one_this_playwright_pins` |
+
+**Suites on this stack.** Browser suite 48 passed (35 before; added: 3 frame tests, 2 response-shape tests, 1 reload test, 2 long-document tests, 4 loading tests, 1 browser-pin test), 48.5 s on the final images (the same on the first build); smoke 12 passed, 2 skipped (no language model); hygiene all `ok`. The frame PDF is now ten pages (465 KB) with 20 names, all found, lowest ink inside share 0.289 and ratio 18.3 at zoom 2 (0.291 / 50.1 at `deviceScaleFactor` 2); samples 0.386 / 11.0.
+
+---
+
+## 21. Low-confidence OCR names (`add-audit-viewer` task 9, design D9)
+
+**Question.** The viewer calibration (20.3) traced three false-positive names and one too-wide box to words Tesseract read with a low confidence (signature scribbles and noise in a shaded cell read as letters). Can the service use Tesseract's word confidence to drop them without losing real names?
+
+**Method.** The 600-document corpus (1,045 pages, 7,489 truth mentions). Each document read once by the production OCR engine (`TesseractOcrEngine`, default configuration, true-language hint as in 4.5; 6 documents at once, 2 Tesseract processes each), keeping the TSV of every page; the production `ExtractNames` with the real XLM-R recogniser then ran on each variant of the same pages. Scoring with the benchmark's own `score_doc` (IoU >= 0.5, greedy one-to-one, trap rule; 4.5), paired by document against the unchanged chain (T = 0, which drops nothing: `parse_tsv` already drops confidences below 0), bootstrap over documents, 1,000 resamples, seed 0. `*` marks a CI that excludes 0. Persons (box) = distinct persons with at least one correctly boxed mention. The unchanged chain is the benchmark default within noise: dF1 -0.2 [-0.4, +0.1] against `stageB` OCR words on the same 600 documents.
+
+**A. Dropping low-confidence words before recognition** (the words below T removed from the page, so from the recogniser's text and from every later step):
+
+| T | words kept | P | R | F1 | dR | dF1 | FP trap / boundary / spurious | d persons (box) |
+|---|---|---|---|---|---|---|---|---|
+| 0 (unchanged) | 100.0 % | 93.9 [93.0-94.7] | 89.9 [88.8-90.9] | 91.8 [91.0-92.6] | | | 194 / 99 / 147 | |
+| 10 | 99.0 % | 94.1 | 89.1 | 91.5 | -0.8 [-1.1, -0.4] * | -0.3 [-0.6, -0.0] * | 189 / 104 / 127 | -0.3 [-0.6, +0.1] |
+| 20 | 98.6 % | 94.0 | 88.8 | 91.3 | -1.1 [-1.5, -0.7] * | -0.5 [-0.8, -0.2] * | 189 / 110 / 125 | -0.6 [-0.9, -0.1] * |
+| 30 | 98.0 % | 94.0 | 88.1 | 90.9 | -1.8 [-2.3, -1.3] * | -0.9 [-1.3, -0.5] * | 185 / 116 / 119 | -0.9 [-1.4, -0.5] * |
+| 40 | 97.3 % | 94.1 | 87.4 | 90.6 | -2.5 [-3.1, -1.9] * | -1.2 [-1.7, -0.8] * | 187 / 124 / 101 | -1.7 [-2.3, -1.2] * |
+| 60 | 95.5 % | 93.6 | 84.9 | 89.0 | -5.0 [-5.8, -4.1] * | -2.8 [-3.4, -2.2] * | 183 / 152 / 101 | -3.2 [-4.0, -2.5] * |
+
+It removes the four calibration cases at every T, but costs recall from T = 10: removing a word also changes the recogniser's context and the line structure around it (93 true positives lost at T = 10, although only 0.7 % of the true-positive mentions contain a word below 10). **Not adopted.**
+
+**B. Rules on candidate names, text unchanged** (simulated on the T = 0 output: a mention's words are those whose centre lies in its box):
+
+| rule | dP | dR | dF1 | spurious FP | d persons (box) | worst group dF1 |
+|---|---|---|---|---|---|---|
+| drop when every word < 10 | +0.1 [+0.1, +0.2] * | -0.0 [-0.1, +0.0] | +0.0 [+0.0, +0.1] * | 137 | +0.0 | hard -0.0 [-0.2, +0.1] |
+| **drop when every word < 20** | **+0.2 [+0.1, +0.2] \*** | **-0.0 [-0.1, +0.0]** | **+0.1 [+0.0, +0.1] \*** | **135** | **+0.0** | hard -0.0 [-0.2, +0.1] |
+| drop when every word < 30 | +0.2 [+0.1, +0.3] * | -0.1 [-0.1, -0.0] * | +0.1 [+0.0, +0.1] * | 130 | -0.0 [-0.1, +0.0] | hard -0.1 [-0.3, +0.1] |
+| drop when every word < 40 | +0.3 [+0.2, +0.4] * | -0.1 [-0.2, -0.1] * | +0.1 [+0.0, +0.1] * | 127 | -0.0 [-0.1, +0.0] | es -0.1 [-0.3, +0.0] |
+| drop when the mean < 20 | +0.3 [+0.2, +0.4] * | -0.1 [-0.1, -0.0] * | +0.1 [+0.0, +0.2] * | 128 | +0.0 | hard -0.0 [-0.2, +0.2] |
+| drop when the mean < 30 | +0.4 [+0.2, +0.5] * | -0.2 [-0.3, -0.1] * | +0.1 [-0.0, +0.1] | 122 | -0.2 [-0.3, -0.1] * | hard -0.4 [-0.7, -0.0] * |
+| trim leading / trailing words < 10 | -0.4 [-0.6, -0.2] * | -0.5 [-0.7, -0.3] * | -0.5 [-0.7, -0.3] * | 137 | -0.2 [-0.4, -0.1] * | hard -2.3 [-3.3, -1.4] * |
+| trim leading / trailing one-letter words < 20 | -0.0 [-0.1, +0.0] | -0.0 [-0.1, +0.0] | -0.0 [-0.1, +0.0] | 147 | | |
+
+Trimming edge words cuts real names, whose accented or degraded words are often read with a low confidence (the hard level loses most); trimming only one-letter words changes nothing measurable. The largest threshold whose recall CI includes 0 is 20 for the "every word" rule; at 20 it removes 12 spurious names and 3 true positives ("Grof", "Figueiredo", "Vasconcelos", each a person boxed elsewhere in its document) in the simulation. **Adopted:** Dconf, `MIN_NAME_CONFIDENCE = 20` (`app/domain/names.py`), the last span rule; words now carry their confidence (`PageWord.confidence`, from `parse_tsv`).
+
+**C. End to end with the rule** (`docintel-test:conf`, built from a copy of the tree without `.env`; the production chain on the 600 documents, paired against the unchanged chain of A):
+
+| run | P | R | F1 | trapFP | FP trap / boundary / spurious | persons (box) | persons (full name) |
+|---|---|---|---|---|---|---|---|
+| unchanged chain | 93.9 [93.0-94.7] | 89.9 [88.8-90.9] | 91.8 [91.0-92.6] | 7.3 [5.9-8.8] | 194 / 99 / 147 | 93.7 [92.4-94.8] | 88.1 [86.6-89.5] |
+| **with Dconf** | **94.0 [93.1-94.9]** | **89.8 [88.7-90.9]** | **91.9 [91.1-92.6]** | 7.3 [5.9-8.8] | 194 / 99 / **133** | 93.7 [92.4-94.8] | 88.1 [86.6-89.5] |
+
+Paired: dP **+0.2 [+0.1, +0.3] \***, dR -0.0 [-0.1, +0.0], dF1 +0.1 [+0.0, +0.1] *, trapFP +0.0 [+0.0, +0.0], persons (box, full name and text) +0.0 [+0.0, +0.0]. By language dF1 en +0.1 [+0.0, +0.2], es +0.0, pt +0.1 [-0.1, +0.3], fr +0.1 [+0.0, +0.2], de +0.0 [+0.0, +0.1]; by noise clean +0.1 [+0.0, +0.1] *, medium +0.1 [+0.0, +0.2] *, hard +0.0 [-0.2, +0.2]; every recall CI includes 0. 7,153 mentions are identical (page, name and box), 17 are removed and none is added: 14 spurious names (signature scribbles such as "PIV WVIY", "LAVAVES TIVAVAN", "VAVAVA YNAV", noise such as "Co Jrrao" and "BERNER EIHENHEIEBEEEEREENEN Bun", and "Some") and the 3 true positives of B. The rule is a pass over the words of each candidate: no measurable cost.
+
+**Calibration cases of 20.3.** "Co Jrrao" (confidences 18 and 9) is removed. The two signatures keep one readable-looking word ("VACANA WAV AN A": 0, 63, 60, 69; "LAY NAL": 0, 60), and "karina Ávila" with the stray "a" (23, 48, 13) has a word above 20; a rule that removes them costs recall (A, and the mean and trim rows of B): KNOWN_LIMITATIONS N9.
+
+**Reproduce:** `benchmarks/ocr_conf/` (local): `run_conf.py` (A, and the T = 0 output for B), `score_conf.py`, `sim_guard.py` (B), `run_verify.py` and `score_verify.py` (C); results in `out/report.md`, `out/sim_guard.md` and `out/verify_report.md`.
