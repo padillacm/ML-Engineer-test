@@ -23,6 +23,17 @@ Each request SHALL produce one access line with method, route template, status a
 - **WHEN** a document is extracted
 - **THEN** one access line records the route template and status 200, and one outcome line records pages, names found and stage durations
 
+### Requirement: Successful health probes are logged at DEBUG
+The access line of a successful liveness or readiness probe SHALL be written at DEBUG, so periodic healthchecks do not flood the log at the default level; every other request, a failing probe included, SHALL be logged at INFO.
+
+#### Scenario: Healthcheck probes
+- **WHEN** `/health` and `/health/ready` answer 200 and the log level is INFO
+- **THEN** no access line is written for them, while a client request in between is logged
+
+#### Scenario: Failing readiness probe
+- **WHEN** `/health/ready` answers 503
+- **THEN** its access line is written at INFO with status 503
+
 ### Requirement: Errors are logged with their code
 Errors SHALL be logged with their code and category; unexpected exceptions with their stack trace, exception messages redacted.
 
