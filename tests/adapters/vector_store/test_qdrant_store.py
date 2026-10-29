@@ -4,9 +4,11 @@ import dataclasses
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import pytest
@@ -25,6 +27,7 @@ from app.domain.types import Chunk, EmbeddingIdentity
 from tests.adapters.vector_store.conftest import memory_store
 from tests.adapters.vector_store.flaky_client import (
     FlakyClient,
+    SerializedClient,
     connect_error,
     http_status,
     read_timeout,
@@ -182,6 +185,182 @@ def test_a_failed_create_that_is_not_a_conflict_propagates() -> None:
 
     with pytest.raises(DependencyUnavailable):
         store.ensure_collection(IDENTITY)
+
+
+# --- concurrent first use ----------------------------------------------------------------------
+
+
+def _initialising() -> Exception:
+    """What ``get_collection`` answers while another client's new collection has no live shards."""
+    body = b'{"status":{"error":"Service internal error: 0 of 0 read operations failed"}}'
+    return http_status(500, body)
+
+
+def _created_elsewhere(client: QdrantClient) -> Callable[[], Exception]:
+    """A scripted create: another process creates the collection first, so this one gets 409."""
+
+    def create() -> Exception:
+        _precreate(client, 8, {IDENTITY_METADATA_KEY: canonical_identity(IDENTITY)})
+        return http_status(409, b'{"status":{"error":"Wrong input: Collection already exists!"}}')
+
+    return create
+
+
+def _concurrently(calls: list[Callable[[], object]]) -> list[BaseException | None]:
+    """Start every call at the same moment in its own thread; what each raised, or ``None``."""
+    barrier = threading.Barrier(len(calls))
+    outcomes: list[BaseException | None] = [None] * len(calls)
+
+    def run(index: int) -> None:
+        barrier.wait()
+        try:
+            calls[index]()
+        except BaseException as error:  # noqa: BLE001 - reported to the test
+            outcomes[index] = error
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(len(calls))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return outcomes
+
+
+class _SlowExists(FlakyClient):
+    """The existence check takes a while, so concurrent callers all pass it before any create."""
+
+    def collection_exists(self, name: str) -> bool:
+        self.calls["collection_exists"] = self.calls.get("collection_exists", 0) + 1
+        time.sleep(0.05)
+        return bool(self.inner.collection_exists(name))
+
+
+def test_concurrent_first_calls_on_one_store_check_and_create_the_collection_once() -> None:
+    flaky = _SlowExists(SerializedClient(QdrantClient(location=":memory:")).as_client())
+    store = store_on(flaky)
+
+    outcomes = _concurrently([lambda: store.ensure_collection(IDENTITY)] * 8)
+
+    assert outcomes == [None] * 8
+    assert flaky.calls["collection_exists"] == 1
+    assert flaky.calls["create_collection"] == 1
+    assert store.collection == collection_name("chunks", IDENTITY)
+
+
+def test_a_bound_store_does_not_take_the_binding_lock() -> None:
+    store, _ = ready_store()
+
+    with store._lock:  # held by "another thread": a bound store must not wait for it
+        store.ensure_collection(IDENTITY)
+        with pytest.raises(IncompatibleEmbedding):
+            store.ensure_collection(dataclasses.replace(IDENTITY, model_id="model-b"))
+
+
+def test_a_create_that_loses_to_another_process_waits_for_the_collection_and_verifies_it() -> None:
+    inner = QdrantClient(location=":memory:")
+    flaky = FlakyClient(
+        inner,
+        {
+            "create_collection": [_created_elsewhere(inner)],
+            "get_collection": [_initialising(), _initialising()],
+        },
+    )
+    store = store_on(flaky)
+
+    store.ensure_collection(IDENTITY)
+
+    assert flaky.calls["create_collection"] == 1
+    assert flaky.calls["get_collection"] == 3
+    assert store.count() == 1  # the point the other process stored
+
+
+def test_a_collection_found_while_another_process_creates_it_is_waited_for() -> None:
+    inner = QdrantClient(location=":memory:")
+    _precreate(inner, 8, {IDENTITY_METADATA_KEY: canonical_identity(IDENTITY)})
+    flaky = FlakyClient(inner, {"get_collection": [_initialising()]})
+    store = store_on(flaky)
+
+    store.ensure_collection(IDENTITY)
+
+    assert flaky.calls["get_collection"] == 2
+    assert "create_collection" not in flaky.calls
+
+
+def test_a_collection_created_elsewhere_with_another_identity_is_refused() -> None:
+    inner = QdrantClient(location=":memory:")
+
+    def create() -> Exception:
+        _precreate(inner, 16, {IDENTITY_METADATA_KEY: "other"})
+        return http_status(409)
+
+    store = store_on(FlakyClient(inner, {"create_collection": [create]}))
+
+    with pytest.raises(IncompatibleEmbedding):
+        store.ensure_collection(IDENTITY)
+    assert store.collection is None
+
+
+def test_a_collection_that_never_becomes_readable_fails_after_the_settle_attempts() -> None:
+    inner = QdrantClient(location=":memory:")
+    _precreate(inner, 8, {IDENTITY_METADATA_KEY: canonical_identity(IDENTITY)})
+    flaky = FlakyClient(inner, {"get_collection": [_initialising] * 20})
+    store = store_on(flaky)
+
+    with pytest.raises(DependencyUnavailable) as raised:
+        store.ensure_collection(IDENTITY)
+
+    assert raised.value.code == "vector_store_unavailable"
+    assert flaky.calls["get_collection"] == 10
+    assert store.collection is None
+
+
+def test_another_server_error_while_verifying_fails_at_once() -> None:
+    inner = QdrantClient(location=":memory:")
+    _precreate(inner, 8, {IDENTITY_METADATA_KEY: canonical_identity(IDENTITY)})
+    flaky = FlakyClient(inner, {"get_collection": [http_status(500)]})
+    store = store_on(flaky)
+
+    with pytest.raises(DependencyUnavailable):
+        store.ensure_collection(IDENTITY)
+    assert flaky.calls["get_collection"] == 1
+
+
+def test_a_failed_first_binding_can_be_retried() -> None:
+    flaky = FlakyClient(
+        QdrantClient(location=":memory:"), {"collection_exists": [http_status(500)]}
+    )
+    store = store_on(flaky)
+
+    with pytest.raises(DependencyUnavailable):
+        store.ensure_collection(IDENTITY)
+    store.ensure_collection(IDENTITY)
+
+    assert store.collection == collection_name("chunks", IDENTITY)
+
+
+def test_a_lost_collection_recreated_elsewhere_first_is_waited_for_and_verified() -> None:
+    store, flaky = ready_store()
+    assert store.collection is not None
+    flaky.inner.delete_collection(store.collection)
+    flaky.failures["create_collection"] = [_created_elsewhere(flaky.inner)]
+    flaky.failures["get_collection"] = [_initialising()]
+
+    assert store.count() == 1  # the point the other process stored
+
+    assert flaky.calls["create_collection"] == 2  # binding, then the recreation that lost
+
+
+def test_concurrent_calls_on_a_lost_collection_recreate_it_once() -> None:
+    flaky = FlakyClient(SerializedClient(QdrantClient(location=":memory:")).as_client())
+    store = store_on(flaky)
+    store.ensure_collection(IDENTITY)
+    assert store.collection is not None
+    flaky.inner.delete_collection(store.collection)
+
+    outcomes = _concurrently([store.count] * 6)
+
+    assert outcomes == [None] * 6
+    assert flaky.calls["create_collection"] == 2  # binding, then one recreation
 
 
 def test_a_metric_other_than_cosine_is_incompatible() -> None:
@@ -665,5 +844,47 @@ def test_a_collection_lost_on_the_server_is_recreated_with_its_index(
     assert server_store.document_chunk_count("doc") == 1
     info = admin.get_collection(server_store.collection)
     admin.close()
+    assert info.config.metadata == {IDENTITY_METADATA_KEY: canonical_identity(IDENTITY)}
+    assert info.payload_schema["document_id"].data_type == models.PayloadSchemaType.KEYWORD
+
+
+def _prefixed_collections(prefix: str) -> list[str]:
+    admin = QdrantClient(url=os.environ["QDRANT_URL"])
+    names = [c.name for c in admin.get_collections().collections if c.name.startswith(prefix)]
+    admin.close()
+    return names
+
+
+@pytest.mark.qdrant_server
+def test_simultaneous_first_calls_on_one_store_all_bind_one_collection(
+    server_store: QdrantVectorStore,
+) -> None:
+    # The service's case: one store per process, twelve request threads binding it at once.
+    outcomes = _concurrently([lambda: server_store.ensure_collection(IDENTITY)] * 12)
+
+    assert outcomes == [None] * 12
+    assert _prefixed_collections(f"{server_store.config.collection_prefix}_") == [
+        server_store.collection
+    ]
+
+
+@pytest.mark.qdrant_server
+def test_simultaneous_first_calls_from_separate_stores_all_bind_one_collection(
+    server_store: QdrantVectorStore,
+) -> None:
+    # Replicas: each store has its own client, so only the server orders the creates (Qdrant
+    # answers the losers 409 and, until the new collection's shards serve reads, 500).
+    stores = [QdrantVectorStore(server_store.config) for _ in range(12)]
+    try:
+        outcomes = _concurrently([partial(store.ensure_collection, IDENTITY) for store in stores])
+    finally:
+        for store in stores:
+            store.close()
+
+    assert outcomes == [None] * 12
+    expected = collection_name(server_store.config.collection_prefix, IDENTITY)
+    assert _prefixed_collections(f"{server_store.config.collection_prefix}_") == [expected]
+    server_store.ensure_collection(IDENTITY)
+    info = QdrantClient(url=os.environ["QDRANT_URL"]).get_collection(expected)
     assert info.config.metadata == {IDENTITY_METADATA_KEY: canonical_identity(IDENTITY)}
     assert info.payload_schema["document_id"].data_type == models.PayloadSchemaType.KEYWORD

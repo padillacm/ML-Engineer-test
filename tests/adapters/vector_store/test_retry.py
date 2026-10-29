@@ -1,12 +1,21 @@
 """Classification of qdrant-client, httpx and gRPC exceptions, and the backoff schedule."""
 
+import logging
+
 import grpc  # type: ignore[import-untyped]
 import httpx
 import pytest
 from qdrant_client.common.client_exceptions import ResourceExhaustedResponse
 from qdrant_client.http.exceptions import ResponseHandlingException
 
-from app.adapters.vector_store.retry import Failure, Retrier, RetryPolicy, classify
+from app.adapters.vector_store.retry import (
+    NO_SPACE_MESSAGE,
+    Failure,
+    Retrier,
+    RetryPolicy,
+    classify,
+    is_out_of_space,
+)
 from app.domain.errors import DependencyTimeout, DependencyUnavailable
 from tests.adapters.vector_store.flaky_client import http_status
 
@@ -169,3 +178,84 @@ def test_the_deadline_is_measured_per_call() -> None:
     clock.advance(100.0)  # time passing between calls does not count against the next one
 
     assert retrier.call(lambda: "ok") == "ok"
+
+
+def test_errors_marked_transient_are_retried_and_others_still_fail_at_once() -> None:
+    marked = http_status(500, b"still starting")
+    retrier = Retrier(
+        RetryPolicy(attempts=3),
+        transient=lambda error: error is marked,
+        sleep=lambda _: None,
+    )
+    script: list[Exception | None] = [marked, marked, None]
+    calls = [0]
+
+    def operation() -> str:
+        calls[0] += 1
+        error = script.pop(0)
+        if error is not None:
+            raise error
+        return "ok"
+
+    assert retrier.call(operation) == "ok"
+    assert calls == [3]
+
+    def rejected() -> str:
+        calls[0] += 1
+        raise http_status(500)
+
+    calls[0] = 0
+    with pytest.raises(DependencyUnavailable):
+        retrier.call(rejected)
+    assert calls == [1]
+
+
+QDRANT_DISK_FULL = (
+    b'{"status":{"error":"Service internal error: No space left on device: WAL buffer size '
+    b'exceeds available disk space"},"time":0.012}'
+)
+
+
+def test_a_full_disk_says_so_and_logs_one_error(caplog: pytest.LogCaptureFixture) -> None:
+    """Qdrant 1.20's answer when its storage is full (measured on a 40 MB tmpfs volume)."""
+    retrier = Retrier(RetryPolicy(attempts=3), sleep=lambda _: None)
+    calls = [0]
+
+    def full() -> str:
+        calls[0] += 1
+        raise http_status(500, QDRANT_DISK_FULL)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(DependencyUnavailable) as caught:
+        retrier.call(full)
+
+    assert calls == [1]  # a full disk is not retried
+    assert caught.value.code == "vector_store_unavailable"
+    assert caught.value.message == NO_SPACE_MESSAGE == "the vector store has no disk space left"
+    assert [record.getMessage() for record in caplog.records] == [NO_SPACE_MESSAGE]
+    assert "WAL" not in caught.value.message
+
+
+def test_other_rejections_keep_the_generic_message(caplog: pytest.LogCaptureFixture) -> None:
+    retrier = Retrier(RetryPolicy(attempts=1), sleep=lambda _: None)
+
+    def rejected() -> str:
+        raise http_status(500, b'{"status":{"error":"Service internal error: other"}}')
+
+    with caplog.at_level(logging.ERROR), pytest.raises(DependencyUnavailable) as caught:
+        retrier.call(rejected)
+
+    assert caught.value.message == "the vector store rejected the request"
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (http_status(500, QDRANT_DISK_FULL), True),
+        (http_status(500, b""), False),
+        (http_status(400), False),
+        (httpx.ConnectError("No space left on device"), False),
+    ],
+)
+def test_is_out_of_space(error: Exception, expected: bool) -> None:
+    assert is_out_of_space(error) is expected

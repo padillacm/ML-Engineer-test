@@ -23,9 +23,13 @@ the deadline has passed (counting the backoff before it), and running out of tim
 ``DependencyTimeout``. A call therefore ends no later than the deadline plus one request timeout.
 
 Service errors carry fixed messages; the original exception (which may quote a request or a
-response body) is kept only as ``__cause__``.
+response body) is kept only as ``__cause__``. One rejection gets its own message: Qdrant answers
+500 ``No space left on device`` when its storage is full (readiness still passes, since the
+server is up), so the error says so (``NO_SPACE_MESSAGE``) and one error line is logged; the
+code stays ``vector_store_unavailable``.
 """
 
+import logging
 import random
 import time
 from collections.abc import Callable
@@ -49,7 +53,11 @@ TIMEOUT_CODE = "vector_store_timeout"
 _UNREACHABLE_MESSAGE = "the vector store could not be reached"
 _TIMEOUT_MESSAGE = "the vector store did not answer in time"
 _REJECTED_MESSAGE = "the vector store rejected the request"
+NO_SPACE_MESSAGE = "the vector store has no disk space left"
+_NO_SPACE_MARKER = b"No space left on device"
 _TRANSIENT_STATUSES = frozenset({502, 503, 504})
+
+_logger = logging.getLogger(__name__)
 
 
 class Failure(Enum):
@@ -74,6 +82,18 @@ def classify(error: BaseException) -> Failure:
     if isinstance(error, grpc.RpcError):
         return _classify_grpc(error)
     return _classify_transport(error)
+
+
+def is_out_of_space(error: BaseException) -> bool:
+    """Whether ``error`` is Qdrant's answer that its storage is full."""
+    return isinstance(error, UnexpectedResponse) and _NO_SPACE_MARKER in (error.content or b"")
+
+
+def _rejected(error: BaseException) -> DependencyUnavailable:
+    if is_out_of_space(error):
+        _logger.error(NO_SPACE_MESSAGE)
+        return DependencyUnavailable(NO_SPACE_MESSAGE, UNAVAILABLE_CODE)
+    return DependencyUnavailable(_REJECTED_MESSAGE, UNAVAILABLE_CODE)
 
 
 def _classify_transport(error: BaseException) -> Failure:
@@ -112,17 +132,23 @@ class RetryPolicy:
 
 
 class Retrier:
-    """Runs a call under a ``RetryPolicy`` and maps its failures to service errors."""
+    """Runs a call under a ``RetryPolicy`` and maps its failures to service errors.
+
+    ``transient`` marks further exceptions as retryable connection failures (for example an
+    answer that only a state about to change explains); by default only ``classify`` decides.
+    """
 
     def __init__(
         self,
         policy: RetryPolicy,
         *,
+        transient: Callable[[BaseException], bool] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         uniform: Callable[[], float] = random.random,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._policy = policy
+        self._transient = transient
         self._sleep = sleep
         self._uniform = uniform
         self._clock = clock
@@ -141,12 +167,12 @@ class Retrier:
             try:
                 return operation()
             except Exception as error:
-                kind = classify(error)
+                kind = self._classify(error)
                 if kind is Failure.OTHER:
                     raise
                 attempt += 1
                 if kind is Failure.REJECTED:
-                    raise DependencyUnavailable(_REJECTED_MESSAGE, UNAVAILABLE_CODE) from error
+                    raise _rejected(error) from error
                 if attempt >= self._policy.attempts:
                     if kind is Failure.TIMEOUT:
                         raise DependencyTimeout(_TIMEOUT_MESSAGE, TIMEOUT_CODE) from error
@@ -155,3 +181,8 @@ class Retrier:
                 if self._clock() + delay >= deadline:
                     raise DependencyTimeout(_TIMEOUT_MESSAGE, TIMEOUT_CODE) from error
                 self._sleep(delay)
+
+    def _classify(self, error: BaseException) -> Failure:
+        if self._transient is not None and self._transient(error):
+            return Failure.CONNECTION
+        return classify(error)

@@ -7,6 +7,15 @@ when the adapter creates it; ``ensure_collection`` refuses a collection whose re
 vector size or distance differs, without modifying it. A store instance binds to the first
 identity it is opened with, like the port's fakes.
 
+Concurrent first use: the first binding runs under a lock, so simultaneous first calls in one
+process check and create the collection once; later calls read the binding without the lock.
+Separate processes (replicas) still race on the creation. Qdrant 1.20 then answers the losing
+create with 409, and for some milliseconds after a create is accepted the collection exists but
+``get_collection`` answers 500 ``0 of 0 read operations failed`` (its shards serve no reads yet).
+A 409 is therefore taken for "created elsewhere" and the collection verified, and the
+``get_collection`` calls of the binding wait that 500 out (``_SETTLE_*``: up to 10 tries, backoff
+0.05-0.5 s, within the deadline). Creating the existing ``document_id`` index again succeeds.
+
 Point ids: ``uuid5(CHUNK_ID_NAMESPACE, f"{document_id}:{sequence}")``. The namespace is a fixed
 constant (itself ``uuid5(NAMESPACE_URL, "urn:docintel:vector-store:chunk-id")``); changing it
 would orphan every stored point, so it must never change.
@@ -31,10 +40,11 @@ server returns within about that time.
 
 Lost collection: when a call on the bound collection fails because the collection no longer
 exists (the server lost its storage, or someone dropped it), the collection is recreated once
-with the bound identity and the call is retried once.
+with the bound identity (under the same lock, and verified like a first binding if another
+client recreated it first) and the call is retried once.
 
-Thread safety: the REST client may be shared by threads; the ``:memory:`` local mode is meant
-for single-threaded tests.
+Thread safety: one store may be shared by threads, as the REST client may; the ``:memory:``
+local mode is meant for single-threaded tests.
 """
 
 import dataclasses
@@ -43,6 +53,7 @@ import json
 import logging
 import math
 import random
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -65,7 +76,13 @@ CHUNK_TOTAL_FIELD = "chunk_total"
 _HASH_LENGTH = 12
 _HTTP_CONFLICT = 409
 _HTTP_NOT_FOUND = 404
+_HTTP_SERVER_ERROR = 500
 _MISSING_COLLECTION_MARKER = b"Not found: Collection"
+_INITIALISING_MARKER = b"read operations failed"
+# get_collection while binding: waits out a collection that another client is still creating.
+_SETTLE_ATTEMPTS = 10
+_SETTLE_BACKOFF_BASE_S = 0.05
+_SETTLE_BACKOFF_CAP_S = 0.5
 _SUPPORTED_METRIC = "cosine"
 
 _logger = logging.getLogger(__name__)
@@ -122,8 +139,18 @@ class QdrantVectorStore:
         self._probe = Retrier(
             RetryPolicy(1, 0.0, 0.0, config.deadline_s), sleep=sleep, uniform=uniform, clock=clock
         )
-        self._identity: EmbeddingIdentity | None = None
-        self._collection: str | None = None
+        self._settle = Retrier(
+            RetryPolicy(
+                _SETTLE_ATTEMPTS, _SETTLE_BACKOFF_BASE_S, _SETTLE_BACKOFF_CAP_S, config.deadline_s
+            ),
+            transient=_is_initialising,
+            sleep=sleep,
+            uniform=uniform,
+            clock=clock,
+        )
+        # Serialises binding and recreation; the binding is one tuple, so readers never see half.
+        self._lock = threading.Lock()
+        self._binding: tuple[EmbeddingIdentity, str] | None = None
 
     @property
     def config(self) -> QdrantStoreConfig:
@@ -133,12 +160,14 @@ class QdrantVectorStore:
     @property
     def identity(self) -> EmbeddingIdentity | None:
         """The bound embedding identity, ``None`` before ``ensure_collection``."""
-        return self._identity
+        binding = self._binding
+        return None if binding is None else binding[0]
 
     @property
     def collection(self) -> str | None:
         """Name of the bound collection, ``None`` before ``ensure_collection``."""
-        return self._collection
+        binding = self._binding
+        return None if binding is None else binding[1]
 
     def close(self) -> None:
         """Release the connections of the client and of the probe client."""
@@ -159,21 +188,20 @@ class QdrantVectorStore:
         self._probe.call(self._probe_client.get_collections)
 
     def ensure_collection(self, identity: EmbeddingIdentity) -> None:
-        if self._identity is not None:
-            if self._identity != identity:
-                raise IncompatibleEmbedding("the store is bound to another embedding identity")
-            return
-        if identity.metric != _SUPPORTED_METRIC:
-            raise IncompatibleEmbedding("the vector store supports only the cosine metric")
-        name = collection_name(self._config.collection_prefix, identity)
-        expected = canonical_identity(identity)
-        if self._call(lambda: self._client.collection_exists(name)):
-            self._verify(name, identity, expected)
-        else:
-            self._create(name, identity, expected)
-        self._ensure_document_index(name)
-        self._identity = identity
-        self._collection = name
+        """Bind to the collection of ``identity``, verifying or creating it (see the port).
+
+        The first binding holds the lock (double-checked), so concurrent first calls reach the
+        server once; once bound, a call only compares identities.
+        """
+        binding = self._binding
+        if binding is None:
+            with self._lock:
+                binding = self._binding
+                if binding is None:
+                    binding = self._bind(identity)
+                    self._binding = binding
+        if binding[0] != identity:
+            raise IncompatibleEmbedding("the store is bound to another embedding identity")
 
     def upsert(
         self,
@@ -285,9 +313,8 @@ class QdrantVectorStore:
             if not _is_missing_collection(error, name):
                 raise
         _logger.warning("vector store collection %s is missing; recreating it", name)
-        if not self._call(lambda: self._client.collection_exists(name)):
-            self._create(name, identity, canonical_identity(identity))
-        self._ensure_document_index(name)
+        with self._lock:
+            self._open(name, identity)
         return self._call(operation)
 
     def _count(self, name: str, count_filter: models.Filter) -> int:
@@ -302,9 +329,27 @@ class QdrantVectorStore:
         )
 
     def _bound(self) -> tuple[EmbeddingIdentity, str]:
-        if self._identity is None or self._collection is None:
+        binding = self._binding
+        if binding is None:
             raise RuntimeError("ensure_collection must be called before using the store")
-        return self._identity, self._collection
+        return binding
+
+    def _bind(self, identity: EmbeddingIdentity) -> tuple[EmbeddingIdentity, str]:
+        """Open the collection of ``identity``; the caller holds the lock."""
+        if identity.metric != _SUPPORTED_METRIC:
+            raise IncompatibleEmbedding("the vector store supports only the cosine metric")
+        name = collection_name(self._config.collection_prefix, identity)
+        self._open(name, identity)
+        return identity, name
+
+    def _open(self, name: str, identity: EmbeddingIdentity) -> None:
+        """Verify collection ``name`` if it exists, else create it; then ensure its index."""
+        expected = canonical_identity(identity)
+        if self._call(lambda: self._client.collection_exists(name)):
+            self._verify(name, identity, expected)
+        else:
+            self._create(name, identity, expected)
+        self._ensure_document_index(name)
 
     def _create(self, name: str, identity: EmbeddingIdentity, expected: str) -> None:
         params = models.VectorParams(size=identity.dimension, distance=models.Distance.COSINE)
@@ -318,12 +363,12 @@ class QdrantVectorStore:
             )
         except DependencyUnavailable as error:
             # Another process created it between the existence check and the create call.
-            if getattr(error.__cause__, "status_code", None) != _HTTP_CONFLICT:
+            if not _is_conflict(error):
                 raise
             self._verify(name, identity, expected)
 
     def _verify(self, name: str, identity: EmbeddingIdentity, expected: str) -> None:
-        info = self._call(lambda: self._client.get_collection(name))
+        info = self._settle.call(lambda: self._client.get_collection(name))
         metadata = info.config.metadata or {}
         if metadata.get(IDENTITY_METADATA_KEY) != expected:
             raise IncompatibleEmbedding("the collection records another embedding identity")
@@ -338,7 +383,7 @@ class QdrantVectorStore:
     def _ensure_document_index(self, name: str) -> None:
         if self._config.location is not None:
             return  # local mode: payload indexes have no effect (and qdrant-client warns)
-        info = self._call(lambda: self._client.get_collection(name))
+        info = self._settle.call(lambda: self._client.get_collection(name))
         if DOCUMENT_ID_FIELD in (info.payload_schema or {}):
             return
         self._call(
@@ -387,6 +432,25 @@ def _is_missing_collection(error: Exception, name: str) -> bool:
         isinstance(cause, UnexpectedResponse)
         and cause.status_code == _HTTP_NOT_FOUND
         and _MISSING_COLLECTION_MARKER in cause.content
+    )
+
+
+def _is_conflict(error: Exception) -> bool:
+    """Whether ``error`` is the 409 that creating an existing collection answers."""
+    cause = error.__cause__
+    return isinstance(cause, UnexpectedResponse) and cause.status_code == _HTTP_CONFLICT
+
+
+def _is_initialising(error: BaseException) -> bool:
+    """Whether ``error`` is the 500 of a collection whose shards serve no reads yet.
+
+    The server answers ``Service internal error: 0 of 0 read operations failed`` for some
+    milliseconds after another client's create was accepted.
+    """
+    return (
+        isinstance(error, UnexpectedResponse)
+        and error.status_code == _HTTP_SERVER_ERROR
+        and _INITIALISING_MARKER in error.content
     )
 
 
