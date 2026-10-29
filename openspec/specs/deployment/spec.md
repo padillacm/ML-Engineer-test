@@ -127,3 +127,60 @@ A smoke test suite SHALL check a running stack over HTTP: readiness, extraction 
 #### Scenario: Smoke run
 - **WHEN** the smoke suite runs against the stack started with the `gpu` profile
 - **THEN** every check passes
+
+### Requirement: The images carry the pinned viewer library
+The test and runtime images SHALL contain the pinned pdf.js library, worker and licence, fetched at build time with a sha256 check and read-only for the service user; nothing SHALL be downloaded at run time.
+
+#### Scenario: Image hygiene with the viewer
+- **WHEN** the runtime image is inspected
+- **THEN** the pdf.js files are present with the pinned hash, owned by root and not writable by uid 10001
+
+### Requirement: The browser of the e2e image is pinned by hash
+The e2e test image SHALL contain the Chrome Headless Shell that its Playwright version pins, fetched at build time with a sha256 check; the runtime and test images SHALL contain no browser.
+
+#### Scenario: Tampered browser archive
+- **WHEN** the e2e stage is built with a browser archive whose sha256 differs from the pin
+- **THEN** the build fails
+
+### Requirement: Containers run with least privilege
+The service and vector-store containers SHALL run with a read-only root filesystem (writable scratch on tmpfs and the data volume only), every Linux capability dropped, no privilege escalation, a process-count limit and a memory limit, and the service SHALL work fully under them.
+
+#### Scenario: Hardened stack
+- **WHEN** the stack runs with the defaults
+- **THEN** the smoke suite passes, the service container reports a read-only root, no capabilities and `no-new-privileges`, and a write outside tmpfs and the volumes fails
+
+### Requirement: The detector model is built in with a secret
+The image SHALL include the detector model at a pinned revision with sha256-checked files and its licence notice, downloaded at build time with a build secret that never enters a layer; a build without the secret or with the model opted out SHALL succeed and produce an image whose service runs with injection detection off.
+
+#### Scenario: Build with the token
+- **WHEN** the image is built with the Hugging Face token secret
+- **THEN** the model files are present read-only under the models directory, their hashes match, the NOTICE carries the licence attribution, and no layer or environment variable contains the token
+
+#### Scenario: Build without the token
+- **WHEN** the image is built with the model opted out
+- **THEN** the build succeeds and the service starts with injection detection off
+
+### Requirement: Dependencies are audited before a push
+The known-vulnerability audit of the locked dependencies SHALL run as part of the pre-push checks, failing the push on a known vulnerability without an accepted exception.
+
+#### Scenario: Audit on push
+- **WHEN** the pre-push hooks run
+- **THEN** the audit runs against the lock file and its result decides the push
+
+### Requirement: The CUDA image is a build option
+The image SHALL be built with the CPU torch build by default and with the CUDA build when a build argument selects it; both SHALL contain the same service code and models, and the CPU image SHALL NOT contain CUDA libraries.
+
+#### Scenario: Default build
+- **WHEN** the image is built without the argument
+- **THEN** torch reports no CUDA support and no NVIDIA library is installed
+
+#### Scenario: CUDA build
+- **WHEN** the image is built with the CUDA variant and run with a GPU
+- **THEN** torch sees the GPU and the service starts on it
+
+### Requirement: The service shares the GPU under the gpu profile
+With the `gpu` profile the service SHALL be built with the CUDA variant and SHALL reserve the GPU next to the language model server, and the whole stack's GPU memory SHALL stay within the device with the measured margin recorded.
+
+#### Scenario: Stack on the GPU
+- **WHEN** the stack starts with `COMPOSE_PROFILES=gpu`
+- **THEN** readiness passes, the service reports the GPU as its device, and the smoke suite passes

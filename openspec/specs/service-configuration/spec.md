@@ -96,3 +96,32 @@ A key read from a file that a later check rejects (for example for its character
 #### Scenario: Invalid key from a file
 - **WHEN** the key read from `LLM_API_KEY_FILE` contains a space
 - **THEN** start-up fails naming `LLM_API_KEY_FILE`, without the key
+
+### Requirement: The audit viewer can be turned off
+`AUDIT_VIEWER_ENABLED` SHALL control whether the viewer page and its files are served; it SHALL default to enabled. When disabled, `/audit` and every file under it SHALL answer 404 and the API SHALL be unaffected.
+
+#### Scenario: Disabled viewer
+- **WHEN** the service starts with `AUDIT_VIEWER_ENABLED=false`
+- **THEN** `GET /audit` answers 404 and `POST /api/extract` works as before
+
+### Requirement: The guardrail tunables have safe defaults
+The detector model path and threshold, the rate limits and per-client cap, the render time budget, the page text limit, the context share for support, the per-document chunk cap and the documentation switch SHALL be settings read like every other tunable, with defaults equal to the code defaults, and the detector path SHALL be optional (unset means no detector).
+
+#### Scenario: Defaults
+- **WHEN** the service starts with only the required variables
+- **THEN** the limiter, the render budget, the page limit and the support check are active with their defaults, documentation is off and no detector is loaded
+
+#### Scenario: Invalid value
+- **WHEN** the render budget is set to zero or the support share above one
+- **THEN** start-up fails naming the variable and the rule, not the value
+
+### Requirement: Concurrency defaults follow the device
+When the models run on the GPU, unset pool sizes SHALL be derived for the GPU (a measured small pool per model) rather than from the CPUs, and the CPU oversubscription warning and `TORCH_THREADS` SHALL apply only to the CPU path; set values SHALL still win, and the concurrency line at start-up SHALL name the device.
+
+#### Scenario: GPU defaults
+- **WHEN** the service starts on the GPU with no pool size set
+- **THEN** the NER, embedder and detector pools take the GPU defaults and the start-up line reports them with the device
+
+#### Scenario: CPU unchanged
+- **WHEN** the service starts on the CPU
+- **THEN** the derived sizes are those of the CPU rule, as before

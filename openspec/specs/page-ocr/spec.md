@@ -180,3 +180,36 @@ The engine SHALL verify the declared page count without loading or parsing any p
 #### Scenario: Damaged middle page
 - **WHEN** page 2 of a 3-page PDF cannot be loaded while page 3 can
 - **THEN** `pdf_unreadable` is raised and nothing is recognised
+
+### Requirement: Words carry their recognition confidence
+Each recognised word SHALL carry the confidence the recognition engine reports for it, from 0 to 100. An engine output with a word confidence that is not a number, not finite or above 100 SHALL fail as an OCR failure; words with a negative confidence SHALL be dropped as before.
+
+#### Scenario: Confidence kept
+- **WHEN** Tesseract reports the word "Ramírez" with confidence 96.5
+- **THEN** the recognised word "Ramírez" carries confidence 96.5
+
+#### Scenario: Confidence above the scale
+- **WHEN** the engine output gives a word the confidence 100.5
+- **THEN** recognition of the page fails with an OCR failure
+
+### Requirement: A page render has a time budget
+Rendering one page SHALL be stopped once a configurable time budget (default 10 s) is spent, and the document SHALL then fail with `pdf_unreadable` naming the page, so no page can hold the renderer for longer than the budget; a page that renders within the budget SHALL render exactly as before.
+
+#### Scenario: Hostile page
+- **WHEN** a page whose content takes longer than the budget to draw is rendered
+- **THEN** rendering stops within the budget plus one progress step, the error is `pdf_unreadable`, and another document's rendering proceeds afterwards
+
+#### Scenario: Ordinary page
+- **WHEN** a sample page is rendered with the default budget
+- **THEN** the pixels equal those of an unbounded render
+
+### Requirement: Page text is limited
+The recognised text of one page SHALL be limited to a configurable number of characters (default 30,000); a page with more SHALL fail the document as invalid input coded `too_large`, naming the page, before any name recognition, chunking or embedding of the document runs.
+
+#### Scenario: Page over the limit
+- **WHEN** a page's recognised text has one character more than the limit
+- **THEN** the request fails 413 `too_large` and neither the recogniser nor the embedder is called
+
+#### Scenario: Dense but legitimate page
+- **WHEN** the densest page of the sample corpus is recognised with the default limit
+- **THEN** it is accepted

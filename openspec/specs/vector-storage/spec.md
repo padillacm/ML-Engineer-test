@@ -76,3 +76,18 @@ When the vector store rejects a write because its storage has no space left, the
 #### Scenario: Qdrant volume full
 - **WHEN** an ingestion's upsert is answered with Qdrant's "No space left on device" error
 - **THEN** the request gets 503 `vector_store_unavailable` with the message "the vector store has no disk space left", and the log holds that line
+
+### Requirement: Search excludes flagged chunks
+Each stored chunk SHALL carry a flagged mark in its payload (absent means not flagged, so existing collections keep working), and search SHALL never return a flagged chunk, whatever its similarity; counting and deleting a document's chunks SHALL include flagged ones.
+
+#### Scenario: Flagged best match
+- **WHEN** the vector closest to the query belongs to a flagged chunk
+- **THEN** the search returns the closest unflagged chunks only
+
+#### Scenario: Collection written before the mark existed
+- **WHEN** a collection whose points have no flagged field is searched
+- **THEN** every point is searchable, as before
+
+#### Scenario: Chunk count includes flagged
+- **WHEN** a document with 10 chunks, 2 of them flagged, is counted
+- **THEN** the count is 10

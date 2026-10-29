@@ -141,3 +141,57 @@ After an early 413, the service SHALL read and discard a bounded amount of the r
 #### Scenario: Slowly sent rejected body
 - **WHEN** a client keeps sending a rejected body a few bytes at a time on a keep-alive connection
 - **THEN** the connection is closed within 5 s of the 413
+
+### Requirement: The audit page is served besides the API
+When the audit viewer is enabled, the service SHALL serve the viewer page at `GET /audit` and its own files under `/audit/`, from fixed directories, with the Content-Security-Policy of the viewer, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. Unknown file names SHALL answer 404 without touching paths outside those directories. The four API endpoints and their shapes SHALL be unchanged.
+
+#### Scenario: Page and files
+- **WHEN** `GET /audit` and the page's script and the pdf.js files are requested
+- **THEN** each answers 200 with its content type and the security headers
+
+#### Scenario: Path outside the viewer
+- **WHEN** `GET /audit/static/..%2F..%2Fsettings.py` is requested
+- **THEN** it answers 404
+
+### Requirement: Viewer routes answer HEAD, conditional requests and unknown paths safely
+Each viewer route SHALL answer GET and HEAD. A file response SHALL carry an ETag and answer a matching If-None-Match with 304 and the same headers. A path under `/audit/` without a route SHALL answer 404 with the viewer's headers, never a redirect.
+
+#### Scenario: Conditional request
+- **WHEN** a viewer file is requested again with the ETag of the first answer in `If-None-Match`
+- **THEN** it answers 304 with the viewer's headers and no body
+
+#### Scenario: No redirect under /audit
+- **WHEN** `GET /audit/static` is requested with `Host: evil.example`
+- **THEN** it answers 404 with the viewer's headers and no `Location` header
+
+### Requirement: API documentation is served only when enabled
+The interactive documentation and the OpenAPI document SHALL be served only when the corresponding setting is enabled; by default they SHALL answer 404 like any unknown path, and the audit viewer SHALL be unaffected.
+
+#### Scenario: Default
+- **WHEN** `/docs`, `/redoc` or `/openapi.json` is requested with the default configuration
+- **THEN** the response is 404 `not_found`, while the API routes and the audit viewer answer as usual
+
+#### Scenario: Enabled
+- **WHEN** the documentation setting is enabled
+- **THEN** `/docs` and `/openapi.json` answer 200
+
+### Requirement: API responses carry protective headers
+Every response of an API route (`/api/*` and the health routes) SHALL carry `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`; the audit viewer keeps its own headers.
+
+#### Scenario: Extraction response headers
+- **WHEN** `/api/extract` answers, successfully or with an error
+- **THEN** the three headers are present with those values
+
+### Requirement: Rate limits are reported like other errors
+A 429 from the rate limiter SHALL use the uniform error body with code `rate_limited` and the request id, SHALL be logged once with its code like any failed request, and SHALL be counted in the access line.
+
+#### Scenario: Limited request
+- **WHEN** a request is answered 429
+- **THEN** the body is `{"detail": ..., "code": "rate_limited", "request_id": ...}`, `Retry-After` is a positive number of seconds, and the access line records 429
+
+### Requirement: Connections are bounded by the server
+The server SHALL limit the number of open connections it accepts at once and SHALL close idle keep-alive connections after a short timeout, so a client holding connections open cannot exhaust it.
+
+#### Scenario: Idle connections
+- **WHEN** a client opens connections and sends nothing
+- **THEN** each is closed by the server after the keep-alive timeout
