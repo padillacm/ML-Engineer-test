@@ -1,0 +1,21 @@
+- **Start here**
+  - [Overview](README.md)
+  - [Getting started](getting-started.md)
+- **Design deliverables**
+  - [Design](../DESIGN.md)
+  - [Decisions](../DECISIONS.md)
+  - [Evolving the solution](evolution.md)
+- **Reference**
+  - [Architecture](architecture.md)
+  - [HTTP API](api.md)
+  - [Configuration](configuration.md)
+  - [Running the stack](operations.md)
+  - [Audit viewer](audit-viewer.md)
+  - [Testing](testing.md)
+- **Evidence**
+  - [Benchmarks](benchmark-summary.md)
+  - [Security audit](SECURITY.md)
+  - [Known limitations](KNOWN_LIMITATIONS.md)
+  - [Benchmark record (full)](BENCHMARKS.md)
+- **Background**
+  - [The assignment](assignment.md)

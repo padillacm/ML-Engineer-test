@@ -76,7 +76,7 @@ All from `BENCHMARKS.md` section 22, with the before-and-after table of times an
 | New prompt, raw model replies on identical contexts | -0.8 points of accuracy [-2.0, +0.4] |
 | Service accuracy with every guardrail | 71.0 against 72.3, paired -1.3 [-2.8, +0.0] |
 | Correct answers refused by the output checks | 0.47 % (2 of 428) |
-| Detector cost on CPU, ingestion | -38 % throughput sequential, -59 % with 12 clients (about 1.3 s per page) |
+| Detector cost on CPU, ingestion | -38 % throughput sequential, -59 % with 12 clients (about 1.3 s per page in this run; 1.5 s in the CPU-against-GPU comparison of section 23) |
 | Patterns cost | about 1.5 ms per page, no measurable throughput loss |
 | Detector cost per question | about 130 ms |
 | Detector memory, start-up and image | +230-300 MiB of RAM, +1.0-1.6 s to ready, +1.1 GB of image layer |

@@ -41,7 +41,7 @@ NER_MEAN_MS, NER_MEDIAN_MS = 416.7, 373.8
 NER_THREADS = 4
 
 # ---------------------------------------------------------------- embeddings
-# Source: C:/eb/out/tables/cpu_table.md; cpu_bench.jsonl.
+# Source: the public embedding benchmark's cpu_table.md and cpu_bench.jsonl (BENCHMARKS 6).
 # multilingual-e5-base, fp32, CPU, 4 threads, batch 16, median of 5 timed runs.
 E5_MS_AT_120, E5_TOK_AT_120 = 106.2, 122  # "ms/passage @~120 tok", measured tokens 122
 E5_MS_AT_400, E5_TOK_AT_400 = 356.2, 402  # "ms/passage @~400 tok", measured tokens 402

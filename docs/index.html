@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Document Intelligence Service · Docs</title>
+<meta name="description" content="Documentation of the Document Intelligence Service: onboarding, architecture, design, decisions, benchmarks and security.">
+<!--
+  docsify site. Serve it with `uv run python scripts/serve_docs.py` and open
+  http://127.0.0.1:3000/docs/ (the script serves docs/ and the two root deliverables only).
+  Every asset is pinned to an exact version and checked by its Subresource Integrity hash
+  (tests/docs/test_site.py keeps both in place).
+-->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/themes/vue.css" integrity="sha384-jCK82M2ExfkqAO/MYBKMjP1qC4AvZ4/Duf2gVWOy3RPn26uz+KW5I+9S39za1Fqv" crossorigin="anonymous">
+<style>
+  :root { --theme-color: #2f6f8f; --content-max-width: 60em; }
+  .markdown-section table { display: table; width: 100%; }
+  .markdown-section td, .markdown-section th { vertical-align: top; }
+  .markdown-section .mermaid { text-align: center; margin: 1.5em 0; }
+  .markdown-section blockquote { border-left-color: var(--theme-color); }
+</style>
+</head>
+<body>
+<div id="app">Loading the documentation…</div>
+<script>
+  // Links are written to work on GitHub too: docs pages link the root deliverables as
+  // ../DESIGN.md and the deliverables link docs pages as docs/<page>.md. This plugin maps them
+  // onto the site's routes before rendering; the aliases fetch the two root files.
+  function rootLinks(markdown) {
+    return markdown
+      .replace(/\]\(\.\.\/(DESIGN|DECISIONS)\.md/g, "](/$1.md")
+      .replace(/\]\(docs\//g, "](/");
+  }
+
+  function escapeHtml(text) {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  window.$docsify = {
+    name: "Document Intelligence Service",
+    repo: "",
+    loadSidebar: true,
+    subMaxLevel: 2,
+    maxLevel: 3,
+    auto2top: true,
+    homepage: "README.md",
+    alias: {
+      "/DESIGN": "../DESIGN.md",
+      "/DECISIONS": "../DECISIONS.md",
+      "/.*/_sidebar.md": "/_sidebar.md",
+    },
+    search: { depth: 3, placeholder: "Search", noData: "No results" },
+    markdown: {
+      renderer: {
+        code(code, lang) {
+          if (lang === "mermaid") return `<div class="mermaid">${escapeHtml(code)}</div>`;
+          return this.origin.code.apply(this, arguments);
+        },
+      },
+    },
+    plugins: [
+      (hook) => {
+        hook.beforeEach(rootLinks);
+        hook.doneEach(() => {
+          if (window.mermaid) window.mermaid.run({ querySelector: ".markdown-section .mermaid" });
+        });
+      },
+    ],
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/docsify.min.js" integrity="sha384-KaHhgnx/OTLoJ4J33SSJsF4x1pk4I7q3s5ZOfIDHJYl6IG7Oyn2vNDsHiWJe46fD" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/plugins/search.min.js" integrity="sha384-LthJPBJ4RGco78kBY+EmKz5rmISZ5vrtAu3+l2ALQ2mrZHOe6Wyf6knyKjeC4cL6" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.3/dist/mermaid.min.js" integrity="sha384-R63zfMfSwJF4xCR11wXii+QUsbiBIdiDzDbtxia72oGWfkT7WHJfmD/I/eeHPJyT" crossorigin="anonymous"></script>
+<script>
+  window.mermaid.initialize({ startOnLoad: false, theme: "neutral", securityLevel: "strict" });
+</script>
+</body>
+</html>
