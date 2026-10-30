@@ -44,15 +44,44 @@ Candidates are named so they can be compared, **not measured unless the row says
 
 | If the measurement shows | Try | Candidates (licence) | What it needs | Adopt when |
 |---|---|---|---|---|
-| Answer-in-context well below the model's accuracy in context (today 74.7 % against 95.5 %) | Hybrid retrieval, then a reranker | BM25 sparse vectors in Qdrant (no model); `BAAI/bge-reranker-v2-m3` (Apache-2.0) | Code in the retrieval adapter; the reranker adds a model call per question | Paired answer-in-context gain whose interval excludes zero, p95 within budget |
+| Answer-in-context well below the model's accuracy in context (today 74.7 % against 95.5 %) | A reranker on the `gpu` profile (**measured on the corpus and the samples, section 4.1**), then hybrid retrieval | `BAAI/bge-reranker-v2-m3` (Apache-2.0); BM25 sparse vectors in Qdrant (no model) | Code in the retrieval adapter; the reranker adds a model call per question | Paired answer-in-context gain whose interval excludes zero, p95 within budget |
 | A large cross-lingual gap on real questions | A cross-lingual embedder | `Snowflake/snowflake-arctic-embed-m-v2.0` (Apache-2.0, runs code shipped with the model), `BAAI/bge-m3` (MIT); both measured in section 6 | Re-ingestion of every document (a new collection) | Overall recall@5 not worse on same-language questions |
-| Many answerable questions under 0.808 | Recalibrate first; a reranker score as the gate if the cosines stay compressed | as above | A setting; a reranker as above | 95 % of answerable kept on real questions |
+| Many answerable questions under 0.808 | Recalibrate first on the CPU image; on the `gpu` profile the reranker's score as the gate (**measured, section 4.1**: on the samples no cosine threshold separates) | as above | A setting; a reranker as above | 95 % of answerable kept on real questions |
 | Correct paraphrased answers refused by the support check (S4) | An entailment check instead of word overlap | `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7` (MIT) | A fourth in-process model | Fewer wrong refusals with no rise in unsupported answers |
 | Real hard scans are frequent and lose names | Stronger OCR, first for low-confidence pages only | `tessdata_best` (Apache-2.0, same engine); PaddleOCR or docTR (Apache-2.0; check their dependencies' licences) | A new OCR adapter and image layer; a GPU helps the neural engines | Name recall gain on hard pages, cost per page known |
 | Organisations or signatures reported as people (N1, N9) | Fine-tune the current NER on the real labels | `Davlan/xlm-roberta-base-ner-hrl` fine-tuned; GLiNER multi v2.1 (Apache-2.0) was behind on public data (section 3) | Labelled real pages; a training pipeline | Precision gain without recall loss, on a held-out split |
 | Real injections that the detector misses | Tune the threshold, then a second detector or a review queue | Granite Guardian (Apache-2.0; 2-8B parameters, a GPU) | A GPU budget, or a person reading flagged pages | Higher flag rate on real attacks, false flags acceptable to reviewers |
 | Multi-document or comparative questions fail | The router of [Design](../DESIGN.md) section 5 | Gemma 4 12B (measured: no gain on this corpus) or a hosted model | Logged route signals | The router's paired accuracy within the larger model's interval at lower cost |
 | Throughput short of the traffic | Replicas, OCR workers, then faster runtimes | ONNX or quantised versions of the current models | Measurement of a GPU-bound load (P18) | Measured on the target hardware |
+
+### 4.1 Measured: a reranker on the `gpu` profile
+
+Two cross-encoder rerankers were run over the first 20 candidates of e5-base, with the protocol of [record](BENCHMARKS.md) sections 6-8: the 600-document corpus, `s800_o12` chunks, one global index, paired bootstrap with 95 % intervals. They were also run on the three sample PDFs, chunked by the service's own OCR and chunker. The dense baseline reproduces the record's numbers. The scripts are kept outside the repository, and the run is not yet a section of the record.
+
+| | Dense today (e5-base) | + `BAAI/bge-reranker-v2-m3` | + `Qwen/Qwen3-Reranker-0.6B` |
+|---|---|---|---|
+| Answer in the first chunk (2,871 same-language questions) | 38.4 % | 52.8 % (+14.4 [+12.7, +16.1]) | 47.3 % (+8.9 [+7.1, +10.6]) |
+| Answer on the pages sent to the model | 77.0 % | 84.0 % (+6.9 [+5.7, +8.3]) | 79.7 % (+2.7 [+1.2, +4.4]) |
+| Same, 600 cross-lingual questions | 58.0 % | 66.5 % (+8.5 [+5.2, +12.0]) | 66.0 % (+8.0 [+4.5, +11.5]) |
+| Same, the 578 English questions (30 candidates) | 83.4 % | 87.0 % (+3.6 [+0.9, +6.7]) | 72.5 % (-10.9 [-14.5, -7.1]) |
+| Unanswerable refused by a gate that keeps 95 % of answerable, cross-document items left out (200) | 66.0 % (cosine 0.808) | 92.0 % (score -2.31) | 95.5 % (score 3.03) |
+| Absent-entity questions refused (100) | 38 % | 87 % | 91 % |
+| Answerable questions kept with the answer in context | 73.7 % | 80.0 % (+6.3 [+4.8, +7.8]) | 75.9 % (+2.2 [+0.6, +3.8]) |
+| Sample PDFs: answerable questions kept, of 25 | 11 | 24 | 18 |
+| Sample PDFs: unanswerable questions refused, of 12 | 11 | 12 | 12 |
+| Added time per question on the RTX 4070 Ti, p50 / p95 | - | 56 / 67 ms | 249 / 344 ms |
+| Peak GPU memory of the reranker | - | 1.2 GB | 2.6 GB |
+
+- **The gate is the strongest reason.** On the sample PDFs the answerable questions score 0.755-0.887 and the unanswerable ones up to 0.815, so no cosine threshold separates them: 0.78 keeps 21 of 25 and refuses 9 of 12, 0.75 keeps 25 and refuses 6. With bge the lowest answerable question scores -3.34 and the highest unanswerable one -3.73. Its threshold was set on the corpus, not on the samples. This addresses [R1](KNOWN_LIMITATIONS.md) and [R2](KNOWN_LIMITATIONS.md) on the `gpu` profile.
+- **bge gains in every language and noise tier** (with 30 candidates: clean +8.3, hard scans +3.1 points of answer in context). Its 20, 30 and 50 candidates give results inside each other's intervals, so 20 is enough.
+- **Qwen3 was not chosen.** It gains less, loses 10.9 points on English questions, is 4-5 times slower, and needs twice the memory.
+- **Not for the CPU image.** On 8 CPU threads bge takes about 6 s per question (p95 7.5 s), so the CPU image keeps the cosine gate, recalibrated (section 6, step 2).
+- **Not measured yet.**
+  - **Memory:** the GPU memory with Gemma and 12-client ingestion running. The worst measured case left 2.91 GB free ([record](BENCHMARKS.md) 23.11); about 1.6 GB would remain, which is an estimate.
+  - **End to end:** the answer accuracy on the 600 questions of [record](BENCHMARKS.md) section 16.
+  - **Real questions.** The corpus is synthetic. The 37 sample questions were written after reading the OCR text, before any score was seen.
+
+**Next step.** On the `gpu` profile, add `bge-reranker-v2-m3` in the retrieval adapter: rerank the top 20 of e5 and gate on the reranker's top-1 score instead of the cosine. Adopt it once the two unmeasured checks pass: GPU memory under the worst-case load, and end-to-end accuracy not worse than today within its interval.
 
 ## 5. Privacy trade-off of each choice
 
@@ -72,7 +101,7 @@ The service today keeps every document on the host: models run in process, the `
 
 1. **Real data and a delete endpoint.** Every later decision rests on the data (section 2), and the delete endpoint is the privacy precondition for holding it.
 2. **Recalibrate the thresholds.** It is a setting, with no code change, and R1 already shows that real documents move it.
-3. **Retrieval.** It is the largest measured loss (section 1), and a larger model did not help.
+3. **Retrieval.** It is the largest measured loss (section 1), and a larger model did not help. On the `gpu` profile the first change is the reranker of section 4.1, already measured on the corpus and the samples.
 4. **OCR on hard scans and names,** in the order the real share of hard scans and the real error types put them.
 5. **Guardrails,** sized by what the flagged real pages show.
 6. **Capacity,** when measured traffic approaches the measured capacity.
