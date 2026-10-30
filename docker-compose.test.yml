@@ -51,9 +51,10 @@ services:
       context: .
       target: test
       # The detector model, as for the app's build in docker-compose.yml (the test image carries
-      # it too; the `injection_model` tests need it). INJECTION_MODEL=0 builds without it.
+      # it too; the `injection_model` tests need it). Built without it when HF_TOKEN is unset
+      # or INJECTION_MODEL=0 (docker-compose.yml explains).
       args:
-        INJECTION_MODEL: ${INJECTION_MODEL:-1}
+        INJECTION_MODEL: ${INJECTION_MODEL:-${HF_TOKEN:+1}}
       secrets:
         - source: hf_token${HF_TOKEN:+_from_env}
           target: hf_token

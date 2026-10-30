@@ -169,7 +169,9 @@ def test_each_build_passes_the_opt_out_argument_and_the_token_secret(
 ) -> None:
     build = _service(service, compose)["build"]
 
-    assert build["args"] == {"INJECTION_MODEL": "${INJECTION_MODEL:-1}"}
+    # With HF_TOKEN set the detector is built in; without it the argument is empty
+    # (base-detector, the same as base-detector0).
+    assert build["args"] == {"INJECTION_MODEL": "${INJECTION_MODEL:-${HF_TOKEN:+1}}"}
     assert build["secrets"] == [{"source": "hf_token${HF_TOKEN:+_from_env}", "target": "hf_token"}]
 
 
@@ -185,19 +187,27 @@ def test_the_token_value_is_never_interpolated_or_passed_to_a_container() -> Non
     for compose in BUILDING:
         text = (ROOT / compose).read_text(encoding="utf-8")
         uses = re.findall(r"\$\{HF_TOKEN([^}]*)\}", text)
-        assert set(uses) <= {":+_from_env"}, compose
+        # Only `:+` forms, which put a fixed text in place of a set variable, never its value.
+        assert set(uses) <= {":+_from_env", ":+1"}, compose
         assert not re.search(r"^\s+HF_TOKEN:", text, re.MULTILINE), compose
 
 
 def test_the_model_path_comes_from_the_image_not_from_env() -> None:
     """The image sets it only when built with the model, so the opt-out image has it unset."""
     assert "INJECTION_MODEL_PATH" not in _service("app")["environment"]
-    assert "ENV INJECTION_MODEL_PATH=/models/prompt-guard" in _stage("base-1")
-    assert "INJECTION_MODEL_PATH" not in _stage("base-0")
+    assert "ENV INJECTION_MODEL_PATH=/models/prompt-guard" in _stage("base-detector1")
+    assert "INJECTION_MODEL_PATH" not in _stage("base-detector0")
     assert "INJECTION_MODEL_PATH" not in _stage("base-common")
-    assert re.search(r"^FROM base-\$\{INJECTION_MODEL\} AS base$", _dockerfile(), re.MULTILINE)
+    assert re.search(
+        r"^FROM base-detector\$\{INJECTION_MODEL\} AS base$", _dockerfile(), re.MULTILINE
+    )
     assert re.search(r"^ARG INJECTION_MODEL=1$", _dockerfile(), re.MULTILINE)
-    assert "COPY --from=prompt-guard /models/prompt-guard /models/prompt-guard" in _stage("base-1")
+    # The empty argument compose passes without HF_TOKEN names the stage without the detector.
+    assert re.search(r"^FROM base-detector0 AS base-detector$", _dockerfile(), re.MULTILINE)
+    assert not _stage("base-detector").strip()
+    assert "COPY --from=prompt-guard /models/prompt-guard /models/prompt-guard" in _stage(
+        "base-detector1"
+    )
 
 
 def test_the_token_is_a_build_secret_of_the_download_step_only() -> None:

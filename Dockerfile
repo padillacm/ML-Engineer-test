@@ -12,8 +12,8 @@
 #           deploy/pdfjs.lock) and keeps only the files the lock lists
 #   base  - Python 3.12 on Debian 13 (trixie) + Tesseract 5 with eng/spa/por/fra/deu
 #           + the models at /models (read-only; Hugging Face offline mode). Chosen by the
-#           INJECTION_MODEL build argument: `base-1` adds the detector and sets
-#           INJECTION_MODEL_PATH, `base-0` has neither (the service then runs with injection
+#           INJECTION_MODEL build argument: `base-detector1` adds the detector and sets
+#           INJECTION_MODEL_PATH, `base-detector0` (and `base-detector`, an empty argument) has neither (the service then runs with injection
 #           detection off); `base` is the one selected
 #   test    - project + dev dependencies + uv; runs the full pytest suite (incl. `tesseract` tests)
 #   chromium - downloads the Chrome Headless Shell that Playwright pins, checked against its sha256
@@ -41,7 +41,8 @@ ARG PYTHON_IMAGE=python:3.12-slim-trixie@sha256:12316debbfb86890f6b2d82582061274
 ARG E5_MODEL_REVISION=d128750597153bb5987e10b1c3493a34e5a4502a
 # 1: download the Prompt Guard 2 model (needs the `hf_token` build secret) and set
 # INJECTION_MODEL_PATH in the images; 0: skip the `prompt-guard` stage and leave the variable
-# unset, so the service runs with injection detection off. Any other value fails the build.
+# unset, so the service runs with injection detection off; empty (what the compose files pass
+# when HF_TOKEN is unset) is the same as 0. Any other value fails the build.
 ARG INJECTION_MODEL=1
 # huggingface_hub of the download stages, pinned by version only: --require-hashes would need
 # every transitive dependency hashed too, and the downloaded model files are hash-checked anyway.
@@ -232,7 +233,7 @@ RUN chmod -R a=rX /models
 # and copy its ARG lines here. Only what AutoModelForSequenceClassification + AutoTokenizer load
 # (config, safetensors weights, the fast tokenizer and its two small configs) plus the model
 # card, the licence and the use policy; nothing else of the repository is downloaded.
-# Stage referenced by `base-1` only: with INJECTION_MODEL=0 it is never built.
+# Stage referenced by `base-detector1` only: with INJECTION_MODEL=0 (or empty) it is never built.
 FROM ${PYTHON_IMAGE} AS prompt-guard
 
 ARG HF_HUB_VERSION
@@ -404,7 +405,7 @@ COPY --from=model /models /models
 
 # `base` with the injection detector: its files next to the other models (read-only, owner root,
 # as copied) and INJECTION_MODEL_PATH pointing at them, so the service loads it at start-up.
-FROM base-common AS base-1
+FROM base-common AS base-detector1
 
 COPY --from=prompt-guard /models/prompt-guard /models/prompt-guard
 ENV INJECTION_MODEL_PATH=/models/prompt-guard
@@ -412,13 +413,18 @@ ENV INJECTION_MODEL_PATH=/models/prompt-guard
 
 # `base` without it: no detector files and no INJECTION_MODEL_PATH (the setting stays unset, the
 # service logs "injection detection off"). Nothing to add.
-FROM base-common AS base-0
+FROM base-common AS base-detector0
 
 
-# The variant the INJECTION_MODEL build argument names (1 or 0; another value names no stage and
-# the build fails). BuildKit builds only the stages the target depends on, so with 0 the
+# An empty INJECTION_MODEL: the compose files pass it empty when HF_TOKEN is unset, so a stack
+# built without a token builds without the detector instead of failing on the gated download.
+FROM base-detector0 AS base-detector
+
+
+# The variant the INJECTION_MODEL build argument names (1, 0 or empty; another value names no
+# stage and the build fails). BuildKit builds only the stages the target depends on, so with 0 the
 # `prompt-guard` stage never runs and no token is needed.
-FROM base-${INJECTION_MODEL} AS base
+FROM base-detector${INJECTION_MODEL} AS base
 
 
 FROM base AS test

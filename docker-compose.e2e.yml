@@ -42,7 +42,7 @@ services:
       target: e2e
       # The detector model, as for the test image (docker-compose.test.yml explains).
       args:
-        INJECTION_MODEL: ${INJECTION_MODEL:-1}
+        INJECTION_MODEL: ${INJECTION_MODEL:-${HF_TOKEN:+1}}
       secrets:
         - source: hf_token${HF_TOKEN:+_from_env}
           target: hf_token

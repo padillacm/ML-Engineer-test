@@ -22,7 +22,8 @@
 # Only the app publishes a port, on 127.0.0.1 by default: the service has no authentication, so
 # exposing it beyond this host belongs behind a reverse proxy with TLS and auth.
 # The build downloads the gated Prompt Guard 2 model with HF_TOKEN (.env or the shell) as a
-# build secret, in no layer; INJECTION_MODEL=0 builds without it (detection off).
+# build secret, in no layer. Without HF_TOKEN the image is built without it (detection off, the
+# instruction patterns stay on); INJECTION_MODEL=1 or 0 in .env forces either.
 # torch: the CPU build by default; with COMPOSE_PROFILES=gpu (or TORCH_VARIANT=cuda) the app is
 # built with the CUDA build and reserves the GPU next to Ollama (docker-compose.torch.yml).
 # The app and Qdrant run with least privilege: read-only root filesystem (scratch on tmpfs and
@@ -58,10 +59,11 @@ services:
       context: .
       target: runtime
       args:
-        INJECTION_MODEL: ${INJECTION_MODEL:-1}
+        # 1 with HF_TOKEN set, empty without it (the Dockerfile's `base-detector`, as 0).
+        INJECTION_MODEL: ${INJECTION_MODEL:-${HF_TOKEN:+1}}
       # The Hugging Face token of the `prompt-guard` stage, from HF_TOKEN; the empty placeholder
-      # without one, so a build with INJECTION_MODEL=0 needs no token (with 1 it fails, naming
-      # the secret). Same scheme as the keys below.
+      # without one, so a build without the detector needs no token (INJECTION_MODEL=1 without
+      # a token fails, naming the secret). Same scheme as the keys below.
       secrets:
         - source: hf_token${HF_TOKEN:+_from_env}
           target: hf_token

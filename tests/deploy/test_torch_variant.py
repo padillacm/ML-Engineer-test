@@ -231,7 +231,8 @@ def _compose_config(env: dict[str, str], tmp_path: Path) -> dict[str, Any]:
     clean = {
         key: value
         for key, value in os.environ.items()
-        if key not in {"TORCH_VARIANT", "COMPOSE_PROFILES", "COMPOSE_FILE"}
+        if key
+        not in {"TORCH_VARIANT", "COMPOSE_PROFILES", "COMPOSE_FILE", "HF_TOKEN", "INJECTION_MODEL"}
     }
     result = subprocess.run(
         ["docker", "compose", "--env-file", str(empty), "-f", str(COMPOSE), "config"],
@@ -254,7 +255,8 @@ def test_compose_merges_the_variant_into_the_hardened_app(
     app = _compose_config(env, tmp_path)["services"]["app"]
 
     assert app["build"]["args"]["TORCH_VARIANT"] == variant
-    assert app["build"]["args"]["INJECTION_MODEL"] == "1"
+    # No HF_TOKEN in the environment: the image is built without the detector.
+    assert app["build"]["args"]["INJECTION_MODEL"] == ""
     resources = app["deploy"]["resources"]
     assert ("reservations" in resources) == (variant == "cuda")
     assert set(resources["limits"]) == {"pids", "memory"}
@@ -295,3 +297,23 @@ def test_torch_sees_the_gpu() -> None:
 
     assert torch.cuda.is_available()
     assert torch.cuda.get_device_name(0)
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="needs the docker command")
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({}, ""),
+        ({"HF_TOKEN": "hf_placeholder"}, "1"),
+        ({"HF_TOKEN": "hf_placeholder", "INJECTION_MODEL": "0"}, "0"),
+        ({"INJECTION_MODEL": "1"}, "1"),
+    ],
+)
+def test_the_detector_is_built_in_only_with_a_token_unless_forced(
+    env: dict[str, str], expected: str, tmp_path: Path
+) -> None:
+    """Without HF_TOKEN the stack builds without the gated model (empty argument, the
+    Dockerfile's ``base-detector``); INJECTION_MODEL set in the environment always wins."""
+    app = _compose_config(env, tmp_path)["services"]["app"]
+
+    assert app["build"]["args"]["INJECTION_MODEL"] == expected
