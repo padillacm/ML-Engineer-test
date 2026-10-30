@@ -1,0 +1,73 @@
+# Continuous integration: the checks the pre-commit and pre-push hooks run locally, on every push
+# and pull request. The container suites (Tesseract 5.5, the baked models, Qdrant, the browser
+# tests) need the images and are run with the compose files (docs/testing.md).
+#
+# Actions are pinned by commit sha (the tag in the comment), each release at least two weeks old
+# when pinned. uv is the version the Dockerfile pins.
+
+name: ci
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: lint, types, tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.19"
+          python-version: "3.12"
+          enable-cache: true
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --check
+      - name: install (dev tools and the CPU build of torch)
+        run: uv sync --frozen --extra dev --extra cpu
+      - name: ruff
+        run: |
+          uv run --no-sync ruff check app tests scripts
+          uv run --no-sync ruff format --check app tests scripts
+      - name: mypy
+        run: uv run --no-sync mypy app tests scripts
+      - name: pytest with the coverage gate
+        run: uv run --no-sync pytest -q --cov
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.19"
+      - name: known vulnerabilities in uv.lock
+        run: uv audit --locked
+
+  specs:
+    name: openspec validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: validate every spec and change (strict)
+        run: npx --yes @fission-ai/openspec@1.15.0 validate --all --strict --no-interactive
